@@ -89,11 +89,13 @@ def main_orchestrator():
         # Spawn worker in a fresh Python interpreter. EngineCore subprocess
         # gets cleanly torn down on worker exit.
         cmd = [sys.executable, "-u", __file__, MODEL_PATH, "--worker", str(B)]
+        # vllm-metal at B>=32 can take 5-15 minutes per concurrency level
+        # (slow Python scheduler + uncached EngineCore startup ~30s each).
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=1800,
         )
         if proc.returncode != 0:
             print(f"  WORKER FAILED (exit {proc.returncode})")
