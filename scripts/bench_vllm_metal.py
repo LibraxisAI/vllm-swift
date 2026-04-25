@@ -8,6 +8,22 @@ Usage:
   cd /Users/tom/dev/vllm-metal
   source .venv-vllm-metal/bin/activate
   python3 /Users/tom/dev/vllm-swift/scripts/bench_vllm_metal.py [model_path]
+
+KNOWN BUG (2026-04-25):
+  `del llm` does NOT tear down the vLLM EngineCore subprocess. After the first
+  concurrency level completes, subsequent levels hang or run with stale
+  contention. Multiple zombie EngineCores accumulate (~3GB each).
+
+  Symptom: only B=1 returns valid numbers. B=8/32/64 hang or report misleading
+  values. We saw 57→103 tok/s variance on B=1 across runs because of leftover
+  contention from prior runs.
+
+  Fix: spawn a fresh subprocess per concurrency level (subprocess.run with
+  isolated args), don't try to delete LLM in-process. Each level runs in a
+  fully clean Python interpreter with its own EngineCore lifecycle.
+
+  Until fixed, baselines for B>1 are unreliable. Phase 2 (paged) needs these
+  numbers as targets — fix this script BEFORE Phase 2 measurement starts.
 """
 
 import gc
