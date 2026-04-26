@@ -446,10 +446,13 @@ public func vsm_engine_decode_all(
 
             let lastLogits = logitsBatch[0..., -1, 0...]  // [B, vocab]
 
-            // Check if all requests use greedy sampling
+            // Check if all requests use greedy sampling. Missing session is
+            // treated as greedy (default) — happens when init_batched freed
+            // the per-request session after copying its KV into batchedCaches,
+            // or when prefill_batched_uniform skipped session creation.
             let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
             let allGreedy = sortedSlots.allSatisfy { (rid, _) in
-                engine.sessions[rid]?.temperature == 0
+                (engine.sessions[rid]?.temperature ?? 0) == 0
             }
 
             // Match TokenIterator.next() pattern: return previousY, advance to next
@@ -671,18 +674,15 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
               let firstKeys = firstCache.peek()?.0 else { return Int32(0) }
         let kvHeads = firstKeys.dim(1)
         let headDim = firstKeys.dim(3)
-        // Size cache from longest actual prefill + decode margin. Hardcoded 2048
-        // overflowed at long prompts: a 2048-token prompt would copy into a
-        // 2048-slot cache (offsets[i]=2048), then the first decode write at
-        // index 2048 overflows. Symptom: `broadcast_shapes (1,h,2049,d) and
-        // (1,h,2048,d)` from the per-step mask vs clamped cache slice.
+        // Size cache from longest actual prefill + decode margin. Single flat
+        // tensor per layer; per-slot lazy allocation was tried and regressed
+        // decode by ~46% (see BatchedKVCache.swift).
         let maxPrefillOffset = rids.compactMap {
             engine.sessions[$0]?.iterator.cache.first?.offset
         }.max() ?? 0
-        let decodeMargin = 512  // generous headroom for typical bench/serve workloads
+        let decodeMargin = 512
         let maxSeq = max(2048, maxPrefillOffset + decodeMargin)
 
-        // Create BatchedKVCache per layer
         var bCaches = [BatchedKVCache]()
         for _ in 0..<numLayers {
             bCaches.append(BatchedKVCache(
@@ -691,7 +691,11 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
             ))
         }
 
-        // Copy each request's cache into the batched cache
+        // Copy each request's cache into the batched cache. Free the per-request
+        // KVCacheSimple immediately after copying — they hold full prompt-length
+        // K/V per layer (∼1 GB/req at 4B/8K) and otherwise stay alive in
+        // engine.sessions, doubling KV memory during init_batched (the
+        // 4B/p8K/B=64 OOM lived here).
         engine.batchSlots.removeAll()
         engine.batchTokens = Array(repeating: 0, count: max(B, 64))
 
@@ -699,25 +703,34 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
             guard let session = engine.sessions[rid] else { continue }
             engine.batchSlots[rid] = slotIdx
 
-            // Copy last generated token
             let tokenId = session.iterator.y.tokens.item(Int.self)
             engine.batchTokens[slotIdx] = tokenId
 
-            // Copy KV cache data per layer
             for layerIdx in 0..<numLayers {
                 let cache = session.iterator.cache[layerIdx]
                 let offset = cache.offset
                 if let (k, v) = cache.peek() {
-                    // k, v: [1, kvHeads, offset, headDim]
                     bCaches[layerIdx].keys[slotIdx, 0..., ..<offset, 0...] = k[0]
                     bCaches[layerIdx].values[slotIdx, 0..., ..<offset, 0...] = v[0]
                 }
                 bCaches[layerIdx].offsets[slotIdx] = offset
                 bCaches[layerIdx].active = max(bCaches[layerIdx].active, slotIdx + 1)
             }
+
+            // Materialize this slot's writes and drop the per-request cache
+            // before moving to the next. Without this the per-req K/V tensors
+            // accumulate while BatchedKVCache fills, peaking at 2× total KV
+            // memory and OOM-killing the process at long-ctx high-B cells.
+            var slotEval = [MLXArray]()
+            for c in bCaches {
+                slotEval.append(c.keys)
+                slotEval.append(c.values)
+            }
+            eval(slotEval)
+            engine.sessions[rid] = nil
         }
 
-        // Materialize the cache copies
+        // Materialize the final cache state.
         var toEval = [MLXArray]()
         for c in bCaches {
             toEval.append(c.keys)
@@ -770,10 +783,12 @@ public func vsm_engine_add_batch_slot(
             bCaches[layerIdx].active = max(bCaches[layerIdx].active, slotIdx + 1)
         }
 
-        // Materialize
+        // Materialize, then drop this request's per-layer prefill cache to
+        // avoid doubled KV memory during multi-add scenarios.
         var toEval = [MLXArray]()
         for c in bCaches { toEval.append(c.keys); toEval.append(c.values) }
         eval(toEval)
+        engine.sessions[rid] = nil
 
         engine.batchedCaches = bCaches
         return Int32(slotIdx)
@@ -1175,22 +1190,29 @@ public func vsm_engine_prefill_batched_uniform(
         let maxSeq = max(2048, cacheLen + decodeMargin)
         var bCaches = [BatchedKVCache]()
         bCaches.reserveCapacity(numLayers)
+        // Use a wrapped caches array we can nil out per-layer — drops the
+        // [B, kvHeads, cacheLen, headDim] KVCacheSimple as soon as its layer
+        // is copied into the BatchedKVCache slot. Without this, both caches
+        // are alive across all 36 layers (≈ 144 GB at 4B/p8K/B=64) and OOM.
+        var transientCaches: [KVCache?] = caches.map { $0 }
         for layer in 0..<numLayers {
             let bc = BatchedKVCache(
                 maxBatch: max(B, 64), kvHeads: kvHeads, headDim: headDim,
                 maxSeq: maxSeq, dtype: firstPeek.0.dtype
             )
-            guard let simple = caches[layer] as? KVCacheSimple,
+            guard let simple = transientCaches[layer] as? KVCacheSimple,
                   let (k, v) = simple.peek() else { return -6 }
-            // k, v: [B, kvHeads, cacheLen, headDim]
             bc.keys[..<B, 0..., ..<cacheLen, 0...] = k
             bc.values[..<B, 0..., ..<cacheLen, 0...] = v
             for i in 0..<B { bc.offsets[i] = cacheLen }
             bc.active = B
+            // Materialize this layer's copy, then drop the prefill cache.
+            eval(bc.keys, bc.values)
+            transientCaches[layer] = nil
             bCaches.append(bc)
         }
 
-        // Materialize copies and free the per-layer prefill caches.
+        // Final eval to ensure all bCaches are materialized before bench timing.
         var toEval = [MLXArray]()
         for c in bCaches {
             toEval.append(c.keys)
