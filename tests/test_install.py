@@ -119,9 +119,9 @@ def test_metallib_exists_alongside_dylib(install_dir: Path, metallib_path: Path)
     """
     dylib_path = install_dir / DYLIB_NAME
     assert dylib_path.is_file(), f"Sanity check failed — dylib missing at {dylib_path}"
-    assert (
-        metallib_path.is_file()
-    ), f"mlx.metallib missing next to {DYLIB_NAME}. Re-run scripts/install.sh."
+    assert metallib_path.is_file(), (
+        f"mlx.metallib missing next to {DYLIB_NAME}. Re-run scripts/install.sh."
+    )
 
 
 def test_metallib_is_non_empty(metallib_path: Path) -> None:
@@ -175,8 +175,7 @@ def test_metallib_contains_gated_delta_kernel(metallib_path: Path) -> None:
     )
     if result.returncode != 0:
         pytest.skip(
-            "xcrun metal-objdump failed (Xcode toolchain may be missing): "
-            f"{result.stderr.strip()}"
+            f"xcrun metal-objdump failed (Xcode toolchain may be missing): {result.stderr.strip()}"
         )
     symbols = result.stdout
     assert "gated_delta_step_fused" in symbols, (
