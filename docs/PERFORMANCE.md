@@ -127,7 +127,3 @@ DYLD_LIBRARY_PATH=swift/.build/arm64-apple-macosx/release \
 - [benchmarks/baseline-2026-04-25.md](../benchmarks/baseline-2026-04-25.md) — original short-ctx + long-ctx matrix, methodology, vs-README diff, attention microbench (long-ctx cells superseded by 2026-04-26)
 - Raw JSON cell data: [benchmarks/baseline-2026-04-25-*.json](../benchmarks/)
 
-## Related
-
-- [PAGED_ATTENTION_TESTPLAN.md](PAGED_ATTENTION_TESTPLAN.md) — paged attention design and Phase 3 success criteria
-- [MLX_SWIFT_API_SPIKE.md](MLX_SWIFT_API_SPIKE.md) — answers to MLX-Swift API capability questions for kernel work

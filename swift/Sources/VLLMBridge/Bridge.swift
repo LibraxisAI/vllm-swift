@@ -153,16 +153,11 @@ public func vsm_engine_create(
 
     Task {
         do {
-            // Try LLM factory FIRST, then fall back to VLM. The shared
-            // `loadModel(from:using:)` walks `ModelFactoryRegistry`, which
-            // registers the VLM trampoline before the LLM one — so for
-            // dual-registered model types (e.g. `qwen3_5`, registered in
-            // BOTH factories), the VLM `Qwen35` wrapper wins. That wrapper
-            // does NOT conform to `BatchedHybridLLM`, so the bridge's
-            // batched-decode dispatch falls through and we lose the entire
-            // issue #8 fix. Explicit ordering here keeps the LLM-only
-            // `Qwen35Model` (and `Qwen35MoEModel`) — which DO conform —
-            // as the preferred type for text-only inference.
+            // Load via LLM factory first; the shared `loadModel(from:using:)`
+            // walks `ModelFactoryRegistry` which registers VLM before LLM, so
+            // dual-registered types (e.g. `qwen3_5`) would resolve to the VLM
+            // wrapper that doesn't conform to `BatchedHybridLLM` and bypass
+            // the batched-decode fast path. Fall back to VLM only on failure.
             do {
                 result.context = try await MLXLLM.LLMModelFactory.shared.load(
                     from: modelURL,
