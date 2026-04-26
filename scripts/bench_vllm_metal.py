@@ -7,9 +7,14 @@ EngineCores accumulate (~3GB each) and contaminate subsequent runs. The
 only reliable cleanup is process exit. Hence: subprocess.run per level.
 
 Usage:
-  cd /Users/tom/dev/vllm-metal
-  source .venv-vllm-metal/bin/activate
+  source ~/.venv-vllm-metal/bin/activate   # NOT vllm-metal/.venv-vllm-metal — that has vllm-swift
   python3 /Users/tom/dev/vllm-swift/scripts/bench_vllm_metal.py [model_path]
+
+CRITICAL: only ~/.venv-vllm-metal has vllm-metal installed. The venv inside the
+vllm-metal repo dir (/Users/tom/dev/vllm-metal/.venv-vllm-metal) has vllm-swift
+installed — running through it benchmarks vllm-swift via the vLLM offline API,
+NOT vllm-metal. Look for "Platform plugin metal is activated" in stderr to
+confirm you're hitting the right backend.
 
   # Worker mode (called recursively by orchestrator):
   python3 .../bench_vllm_metal.py [model_path] --worker B
