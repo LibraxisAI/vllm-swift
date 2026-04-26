@@ -72,7 +72,11 @@ final class InferenceEngine {
     /// Batched KV caches: one per layer, shared across all requests.
     /// Used by fullyBatchedDecode when model is Qwen3.
     var batchedCaches: [BatchedKVCache]?
-    /// Maps request ID → batch slot index in batchedCaches.
+    /// Polymorphic batched cache for hybrid models (attention + GDN/Mamba),
+    /// used when model conforms to `BatchedHybridLLM` (e.g. Qwen3Next).
+    /// Mutually exclusive with `batchedCaches` for a given engine instance.
+    var batchedHybridCaches: BatchedHybridCache?
+    /// Maps request ID → batch slot index in batchedCaches / batchedHybridCaches.
     var batchSlots: [String: Int] = [:]
     /// Last token per batch slot for batched decode.
     var batchTokens: [Int] = []
@@ -149,9 +153,13 @@ public func vsm_engine_create(
 
     Task {
         do {
-            // Try LLM first, then VLM
+            // Load via LLM factory first; the shared `loadModel(from:using:)`
+            // walks `ModelFactoryRegistry` which registers VLM before LLM, so
+            // dual-registered types (e.g. `qwen3_5`) would resolve to the VLM
+            // wrapper that doesn't conform to `BatchedHybridLLM` and bypass
+            // the batched-decode fast path. Fall back to VLM only on failure.
             do {
-                result.context = try await loadModel(
+                result.context = try await MLXLLM.LLMModelFactory.shared.load(
                     from: modelURL,
                     using: StubTokenizerLoader()
                 )
@@ -423,9 +431,19 @@ public func vsm_engine_decode_all(
         guard let engine = engines[handle] else { return Int32(0) }
 
         let start = CFAbsoluteTimeGetCurrent()
-        let rids = Array(engine.sessions.keys.prefix(Int(maxReqs)))
+        // Pull active rids from sessions, falling back to batchSlots when the
+        // batched-prefill path was used (it skips per-request session setup
+        // because RequestSession requires a TokenIterator we don't have).
+        var rids = Array(engine.sessions.keys.prefix(Int(maxReqs)))
+        if rids.isEmpty && !engine.batchSlots.isEmpty {
+            rids = Array(engine.batchSlots.keys.prefix(Int(maxReqs)))
+        }
         guard !rids.isEmpty else { return Int32(0) }
 
+        // Cast ordering: Qwen3 fast path FIRST so the verified hot path
+        // stays bit-identical (no extra protocol cast in the inner loop).
+        // Qwen3Model and BatchedHybridLLM are disjoint conformances —
+        // ordering is correctness-neutral, only perf-motivated.
         // Fully batched path for Qwen3 with BatchedKVCache
         if let qwenModel = engine.model as? Qwen3Model,
            let bCaches = engine.batchedCaches,
@@ -440,10 +458,13 @@ public func vsm_engine_decode_all(
 
             let lastLogits = logitsBatch[0..., -1, 0...]  // [B, vocab]
 
-            // Check if all requests use greedy sampling
+            // Check if all requests use greedy sampling. Missing session is
+            // treated as greedy (default) — happens when init_batched freed
+            // the per-request session after copying its KV into batchedCaches,
+            // or when prefill_batched_uniform skipped session creation.
             let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
             let allGreedy = sortedSlots.allSatisfy { (rid, _) in
-                engine.sessions[rid]?.temperature == 0
+                (engine.sessions[rid]?.temperature ?? 0) == 0
             }
 
             // Match TokenIterator.next() pattern: return previousY, advance to next
@@ -474,6 +495,67 @@ public func vsm_engine_decode_all(
                 // Return the INPUT token (previousY pattern)
                 let returnToken = engine.batchTokens[slotIdx]
                 // Advance to the model's output for next step
+                let nextToken = sampledTokens[slotIdx].item(Int.self)
+                engine.batchTokens[slotIdx] = nextToken
+
+                reqIds[Int(count)] = strdup(rid)
+                outTokens[Int(count)] = Int32(returnToken)
+                count += 1
+            }
+
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            engine.totalDecodeTokens += count
+            engine.totalDecodeTime += elapsed
+            return count
+        }
+
+        // Fully batched path for hybrid models (Qwen3Next, etc.) with
+        // BatchedHybridCache. Mirrors the Qwen3 path — same sampling /
+        // temperature plumbing, just dispatches through the protocol.
+        if let hybridModel = engine.model as? any BatchedHybridLLM,
+           let hCaches = engine.batchedHybridCaches,
+           !engine.batchSlots.isEmpty
+        {
+            let B = engine.batchSlots.count
+            let tokens = engine.batchTokens
+
+            // Single batched forward: [B, 1] → [B, 1, vocab]
+            let inputBatch = MLXArray(tokens[0..<B]).reshaped(B, 1)
+            let logitsBatch = hybridModel.fullyBatchedDecode(inputBatch, caches: hCaches)
+
+            let lastLogits = logitsBatch[0..., -1, 0...]  // [B, vocab]
+
+            // Same greedy / per-request temperature split as the Qwen3 path.
+            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
+            let allGreedy = sortedSlots.allSatisfy { (rid, _) in
+                (engine.sessions[rid]?.temperature ?? 0) == 0
+            }
+
+            // TODO: per-request temperature sampling could share a helper
+            // with the Qwen3 path once we add it (gap #7).
+            let sampledTokens: MLXArray
+            if allGreedy {
+                sampledTokens = argMax(lastLogits, axis: -1)
+            } else {
+                var tokenList = [Int]()
+                for (rid, slotIdx) in sortedSlots {
+                    let temp = engine.sessions[rid]?.temperature ?? 0
+                    let logits = lastLogits[slotIdx]
+                    if temp > 0 {
+                        let scaled = logits / temp
+                        let sampled = MLXRandom.categorical(scaled)
+                        tokenList.append(sampled.item(Int.self))
+                    } else {
+                        tokenList.append(argMax(logits, axis: -1).item(Int.self))
+                    }
+                }
+                sampledTokens = MLXArray(tokenList)
+            }
+            eval(sampledTokens)
+
+            var count: Int32 = 0
+            for (rid, slotIdx) in sortedSlots {
+                let returnToken = engine.batchTokens[slotIdx]
                 let nextToken = sampledTokens[slotIdx].item(Int.self)
                 engine.batchTokens[slotIdx] = nextToken
 
@@ -649,11 +731,21 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
 
     return engineQueue.sync { () -> Int32 in
         guard let engine = engines[handle] else { return Int32(0) }
-        guard engine.model is Qwen3Model else { return Int32(-1) }
 
         let rids = Array(engine.sessions.keys)
         let B = rids.count
         guard B > 0 else { return Int32(0) }
+
+        // Cast ordering: try Qwen3 first (preserves the verified hot path),
+        // then BatchedHybridLLM. Qwen3Model and BatchedHybridLLM are disjoint
+        // so order is correctness-neutral. Models that match neither return -1.
+        if engine.model is Qwen3Model {
+            // Fall through to the existing Qwen3 init path below.
+        } else if let hybridModel = engine.model as? any BatchedHybridLLM {
+            return initBatchedHybrid(engine: engine, model: hybridModel, rids: rids)
+        } else {
+            return Int32(-1)
+        }
 
         // Get model dimensions from first session's cache
         guard let firstSession = engine.sessions[rids[0]] else { return Int32(0) }
@@ -665,9 +757,15 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
               let firstKeys = firstCache.peek()?.0 else { return Int32(0) }
         let kvHeads = firstKeys.dim(1)
         let headDim = firstKeys.dim(3)
-        let maxSeq = 2048
+        // Size cache from longest actual prefill + decode margin. Single flat
+        // tensor per layer; per-slot lazy allocation was tried and regressed
+        // decode by ~46% (see BatchedKVCache.swift).
+        let maxPrefillOffset = rids.compactMap {
+            engine.sessions[$0]?.iterator.cache.first?.offset
+        }.max() ?? 0
+        let decodeMargin = 512
+        let maxSeq = max(2048, maxPrefillOffset + decodeMargin)
 
-        // Create BatchedKVCache per layer
         var bCaches = [BatchedKVCache]()
         for _ in 0..<numLayers {
             bCaches.append(BatchedKVCache(
@@ -676,7 +774,10 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
             ))
         }
 
-        // Copy each request's cache into the batched cache
+        // Copy per-request cache into batched cache, then free the session.
+        // Per-request KVCacheSimples hold full prompt-length K/V (~1 GB/req at
+        // 4B/8K). Holding them across the copy doubles KV memory and OOMs at
+        // long-ctx high-B cells.
         engine.batchSlots.removeAll()
         engine.batchTokens = Array(repeating: 0, count: max(B, 64))
 
@@ -684,25 +785,33 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
             guard let session = engine.sessions[rid] else { continue }
             engine.batchSlots[rid] = slotIdx
 
-            // Copy last generated token
             let tokenId = session.iterator.y.tokens.item(Int.self)
             engine.batchTokens[slotIdx] = tokenId
 
-            // Copy KV cache data per layer
             for layerIdx in 0..<numLayers {
                 let cache = session.iterator.cache[layerIdx]
                 let offset = cache.offset
                 if let (k, v) = cache.peek() {
-                    // k, v: [1, kvHeads, offset, headDim]
                     bCaches[layerIdx].keys[slotIdx, 0..., ..<offset, 0...] = k[0]
                     bCaches[layerIdx].values[slotIdx, 0..., ..<offset, 0...] = v[0]
                 }
                 bCaches[layerIdx].offsets[slotIdx] = offset
                 bCaches[layerIdx].active = max(bCaches[layerIdx].active, slotIdx + 1)
             }
+
+            // Materialize this slot's writes, then drop the per-req cache.
+            // Otherwise per-req K/V accumulate alongside the growing batched
+            // cache, peaking at 2× total KV memory.
+            var slotEval = [MLXArray]()
+            for c in bCaches {
+                slotEval.append(c.keys)
+                slotEval.append(c.values)
+            }
+            eval(slotEval)
+            engine.sessions[rid] = nil
         }
 
-        // Materialize the cache copies
+        // Materialize the final cache state.
         var toEval = [MLXArray]()
         for c in bCaches {
             toEval.append(c.keys)
@@ -729,8 +838,17 @@ public func vsm_engine_add_batch_slot(
 
     return engineQueue.sync { () -> Int32 in
         guard let engine = engines[handle],
-              let session = engine.sessions[rid],
-              let bCaches = engine.batchedCaches else { return Int32(-1) }
+              let session = engine.sessions[rid] else { return Int32(-1) }
+
+        // Hybrid path: copy per-layer cache (KVCacheSimple OR MambaCache) into
+        // the matching BatchedHybridCache layer, then addSlot() to advance
+        // active counts in lockstep across all layers.
+        if let hCaches = engine.batchedHybridCaches {
+            return addBatchSlotHybrid(
+                engine: engine, hCaches: hCaches, rid: rid, session: session)
+        }
+
+        guard let bCaches = engine.batchedCaches else { return Int32(-1) }
 
         // Find next available slot
         let slotIdx = engine.batchSlots.count
@@ -755,10 +873,11 @@ public func vsm_engine_add_batch_slot(
             bCaches[layerIdx].active = max(bCaches[layerIdx].active, slotIdx + 1)
         }
 
-        // Materialize
+        // Materialize and drop per-req cache — avoid doubled KV memory.
         var toEval = [MLXArray]()
         for c in bCaches { toEval.append(c.keys); toEval.append(c.values) }
         eval(toEval)
+        engine.sessions[rid] = nil
 
         engine.batchedCaches = bCaches
         return Int32(slotIdx)
@@ -777,8 +896,25 @@ public func vsm_engine_remove_batch_slot(
 
     return engineQueue.sync { () -> Int32 in
         guard let engine = engines[handle],
-              let bCaches = engine.batchedCaches,
               let slotIdx = engine.batchSlots[rid] else { return Int32(-1) }
+
+        // Hybrid path: delegate the swap-from-end to BatchedHybridCache.
+        if let hCaches = engine.batchedHybridCaches {
+            let lastSlot = engine.batchSlots.count - 1
+            if slotIdx < lastSlot {
+                guard let lastRid = engine.batchSlots.first(where: { $0.value == lastSlot })?.key
+                else { return Int32(-1) }
+                hCaches.removeSlot(slotIdx)
+                engine.batchTokens[slotIdx] = engine.batchTokens[lastSlot]
+                engine.batchSlots[lastRid] = slotIdx
+            } else {
+                hCaches.removeSlot(slotIdx)
+            }
+            engine.batchSlots.removeValue(forKey: rid)
+            return Int32(0)
+        }
+
+        guard let bCaches = engine.batchedCaches else { return Int32(-1) }
 
         let lastSlot = engine.batchSlots.count - 1
 
@@ -846,6 +982,42 @@ public func vsm_engine_decode_all_logprobs(
 
             // Greedy sample
             let sampledTokens = argMax(lastLogits, axis: -1)  // [B]
+            eval(sampledTokens, logSoftmax)
+
+            var count: Int32 = 0
+            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
+            for (rid, slotIdx) in sortedSlots {
+                let tokenId = sampledTokens[slotIdx].item(Int.self)
+                let logprob = logSoftmax[slotIdx, tokenId].item(Float.self)
+
+                engine.batchTokens[slotIdx] = tokenId
+                reqIds[Int(count)] = strdup(rid)
+                outTokens[Int(count)] = Int32(tokenId)
+                outLogprobs[Int(count)] = logprob
+                count += 1
+            }
+
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            engine.totalDecodeTokens += count
+            engine.totalDecodeTime += elapsed
+            return count
+        }
+
+        // Mirror of the Qwen3 path for hybrid models (Qwen3Next, etc.).
+        if let hybridModel = engine.model as? any BatchedHybridLLM,
+           let hCaches = engine.batchedHybridCaches,
+           !engine.batchSlots.isEmpty
+        {
+            let B = engine.batchSlots.count
+            let tokens = engine.batchTokens
+
+            let inputBatch = MLXArray(tokens[0..<B]).reshaped(B, 1)
+            let logitsBatch = hybridModel.fullyBatchedDecode(inputBatch, caches: hCaches)
+            let lastLogits = logitsBatch[0..., -1, 0...]  // [B, vocab]
+
+            let logSoftmax = lastLogits - MLX.logSumExp(lastLogits, axis: -1, keepDims: true)
+
+            let sampledTokens = argMax(lastLogits, axis: -1)
             eval(sampledTokens, logSoftmax)
 
             var count: Int32 = 0
@@ -950,6 +1122,643 @@ public func vsm_engine_reset(_ handle: UnsafeMutableRawPointer?) {
         guard let engine = engines[handle] else { return }
         engine.sessions.removeAll()
     }
+}
+
+/// Test-only: run B sequential single-prompt prefills and capture the top-K
+/// logits from the last prefill forward of each. Mirrors the chunked
+/// `prepare` + `step` pattern that `TokenIterator` uses, but NOT the extra
+/// `iterator.next()` advance — we want the prefill-exit logits, not the
+/// next-decode-step logits, so the comparison vs `prefill_batched_uniform`
+/// is at the same conceptual point in the model's compute graph.
+///
+/// Buffer layout: `outIndices`/`outValues` are flat `[B*K]` row-major
+/// (slot i's top-K starts at `i*K`). `outValues` is float32 logits.
+@_cdecl("vsm_engine_prefill_seq_uniform_topk")
+public func vsm_engine_prefill_seq_uniform_topk(
+    _ handle: UnsafeMutableRawPointer?,
+    promptTokens: UnsafePointer<Int32>?,
+    numReqs: Int32,
+    promptLen: Int32,
+    K: Int32,
+    outIndices: UnsafeMutablePointer<Int32>?,
+    outValues: UnsafeMutablePointer<Float>?
+) -> Int32 {
+    guard let handle, let promptTokens, let outIndices, let outValues else { return -1 }
+    let B = Int(numReqs)
+    let T = Int(promptLen)
+    let k = Int(K)
+    guard B > 0, T > 0, k > 0 else { return -1 }
+
+    return engineQueue.sync { () -> Int32 in
+        guard let engine = engines[handle] else { return -1 }
+        // Same dual-cast as the batched variant — hybrid models route
+        // through their LanguageModel surface. See note above.
+        let lmModel: any LanguageModel
+        let cacheSource: (GenerateParameters?) -> [KVCache]
+        if let qwenModel = engine.model as? Qwen3Model {
+            lmModel = qwenModel
+            cacheSource = qwenModel.newCache
+        } else if let hybridModel = engine.model as? any BatchedHybridLLM,
+                  let lm = hybridModel as? any LanguageModel {
+            lmModel = lm
+            cacheSource = lm.newCache
+        } else {
+            return -2
+        }
+
+        let intArr = UnsafeBufferPointer(start: promptTokens, count: B * T)
+
+        for slot in 0..<B {
+            let slotTokens: [Int] = (0..<T).map { Int(intArr[slot * T + $0]) }
+            let slotInput = MLXArray(slotTokens).reshaped(1, T)
+            let caches = cacheSource(nil)
+            if T > 1 {
+                let prefillChunk = slotInput[0..., ..<(T - 1)]
+                _ = lmModel(LMInput.Text(tokens: prefillChunk), cache: caches, state: nil)
+            }
+            let lastTok = slotInput[0..., (T - 1)..<T]
+            let stepOut = lmModel(LMInput.Text(tokens: lastTok), cache: caches, state: nil)
+            let lastLogits = stepOut.logits[0..., -1, 0...]  // [1, V]
+
+            let sorted = MLX.argSort(lastLogits, axis: -1)
+            let vocab = lastLogits.dim(1)
+            let topIdx = sorted[0..., (vocab - k)..<vocab]   // [1, K]
+            let topVal = takeAlong(lastLogits, topIdx, axis: -1)  // [1, K]
+            eval(topIdx, topVal)
+
+            for j in 0..<k {
+                outIndices[slot * k + j] = topIdx[0, j].item(Int32.self)
+                outValues[slot * k + j] = topVal[0, j].item(Float.self)
+            }
+        }
+        return Int32(B)
+    }
+}
+
+/// Test-only batched analogue of `prefill_seq_uniform_topk`. Same chunked
+/// `[B, T-1]` + `[B, 1]` pattern, single forward per chunk for all B
+/// requests. Captures top-K logits at the same prefill-exit point so the
+/// two functions can be compared apples-to-apples.
+@_cdecl("vsm_engine_prefill_batched_uniform_topk")
+public func vsm_engine_prefill_batched_uniform_topk(
+    _ handle: UnsafeMutableRawPointer?,
+    promptTokens: UnsafePointer<Int32>?,
+    numReqs: Int32,
+    promptLen: Int32,
+    K: Int32,
+    outIndices: UnsafeMutablePointer<Int32>?,
+    outValues: UnsafeMutablePointer<Float>?
+) -> Int32 {
+    guard let handle, let promptTokens, let outIndices, let outValues else { return -1 }
+    let B = Int(numReqs)
+    let T = Int(promptLen)
+    let k = Int(K)
+    guard B > 0, T > 0, k > 0 else { return -1 }
+
+    return engineQueue.sync { () -> Int32 in
+        guard let engine = engines[handle] else { return -1 }
+        // Accept either Qwen3Model (dense) or any BatchedHybridLLM
+        // (Qwen3Next/3.5/3.6). Both support batched [B, T] forward through
+        // standard `callAsFunction` with a fresh per-layer cache. The test
+        // harness uses this function as the batched correctness oracle for
+        // the prefill_batched_uniform path, so it has to match the model
+        // gating in that function.
+        let lmModel: any LanguageModel
+        let cacheSource: (GenerateParameters?) -> [KVCache]
+        if let qwenModel = engine.model as? Qwen3Model {
+            lmModel = qwenModel
+            cacheSource = qwenModel.newCache
+        } else if let hybridModel = engine.model as? any BatchedHybridLLM,
+                  let lm = hybridModel as? any LanguageModel {
+            lmModel = lm
+            cacheSource = lm.newCache
+        } else {
+            return -2
+        }
+
+        let intArr = UnsafeBufferPointer(start: promptTokens, count: B * T)
+        let tokens: [Int] = intArr.map { Int($0) }
+        let inputBatch = MLXArray(tokens).reshaped(B, T)
+
+        let caches = cacheSource(nil)
+        if T > 1 {
+            let prefillChunk = inputBatch[0..., ..<(T - 1)]
+            _ = lmModel(LMInput.Text(tokens: prefillChunk), cache: caches, state: nil)
+        }
+        let lastTok = inputBatch[0..., (T - 1)..<T]  // [B, 1]
+        let stepOut = lmModel(LMInput.Text(tokens: lastTok), cache: caches, state: nil)
+        let lastLogits = stepOut.logits[0..., -1, 0...]  // [B, V]
+
+        let sorted = MLX.argSort(lastLogits, axis: -1)
+        let vocab = lastLogits.dim(1)
+        let topIdx = sorted[0..., (vocab - k)..<vocab]   // [B, K]
+        let topVal = takeAlong(lastLogits, topIdx, axis: -1)  // [B, K]
+        eval(topIdx, topVal)
+
+        for slot in 0..<B {
+            for j in 0..<k {
+                outIndices[slot * k + j] = topIdx[slot, j].item(Int32.self)
+                outValues[slot * k + j] = topVal[slot, j].item(Float.self)
+            }
+        }
+        return Int32(B)
+    }
+}
+
+/// Batched prefill — uniform prompt length only (M1).
+///
+/// Replaces the sequential pattern of `B × prefill_req` + `init_batched`
+/// with a single `[B, T]` forward through the model. The mlx-lm Python
+/// equivalent and vllm-swift sequential both take ~23-27s for B=64/T=2048
+/// on 4B (compute-bound on per-request prefill). This path collapses the
+/// 64 sequential forwards into one batched forward.
+///
+/// `reqIds`: array of B null-terminated request ID strings.
+/// `promptTokens`: flattened [B*T] int32 buffer, row-major (request i at offset i*T).
+/// All requests use the same prompt length T (variable-length deferred to M4).
+///
+/// Returns 0 on success, negative on failure.
+@_cdecl("vsm_engine_prefill_batched_uniform")
+public func vsm_engine_prefill_batched_uniform(
+    _ handle: UnsafeMutableRawPointer?,
+    reqIds: UnsafePointer<UnsafePointer<CChar>?>?,
+    promptTokens: UnsafePointer<Int32>?,
+    numReqs: Int32,
+    promptLen: Int32,
+    temperature: Float,
+    topP: Float
+) -> Int32 {
+    guard let handle, let reqIds, let promptTokens else { return -1 }
+    let B = Int(numReqs)
+    let T = Int(promptLen)
+    guard B > 0, T > 0 else { return -1 }
+
+    return engineQueue.sync { () -> Int32 in
+        guard let engine = engines[handle] else { return -1 }
+
+        // Read req IDs out before any compute (clearer error path).
+        var rids = [String]()
+        rids.reserveCapacity(B)
+        for i in 0..<B {
+            guard let cstr = reqIds[i] else { return -3 }
+            rids.append(String(cString: cstr))
+        }
+
+        // Build [B, T] input from flattened prompt buffer.
+        let totalTokens = B * T
+        let intArr = UnsafeBufferPointer(start: promptTokens, count: totalTokens)
+        let tokens: [Int] = intArr.map { Int($0) }
+        let inputBatch = MLXArray(tokens).reshaped(B, T)
+
+        // Cast ordering: Qwen3 fast path FIRST so the verified hot path
+        // stays bit-identical (no extra protocol cast / branch in the hot
+        // section). Qwen3Model and BatchedHybridLLM are disjoint, so order
+        // is correctness-neutral; perf-motivated only.
+        if let qwenModel = engine.model as? Qwen3Model {
+            return prefillBatchedUniformQwen3(
+                engine: engine, model: qwenModel,
+                inputBatch: inputBatch, rids: rids, B: B, T: T)
+        } else if let hybridModel = engine.model as? any BatchedHybridLLM {
+            return prefillBatchedUniformHybrid(
+                engine: engine, model: hybridModel,
+                inputBatch: inputBatch, rids: rids, B: B, T: T)
+        }
+        return -2
+    }
+}
+
+/// Qwen3 (dense, all-attention) batched prefill — bit-identical to the
+/// pre-P5 hot path. Pulled into its own function so the hybrid variant
+/// can sit alongside without reordering casts in the inner loop.
+private func prefillBatchedUniformQwen3(
+    engine: InferenceEngine,
+    model: Qwen3Model,
+    inputBatch: MLXArray,
+    rids: [String],
+    B: Int,
+    T: Int
+) -> Int32 {
+    // Fresh per-layer caches. KVCacheSimple holds [B, kvHeads, T, headDim]
+    // after a single batched forward — same shape as the existing
+    // BatchedKVCache layout, so the copy step below is a slice assign.
+    guard let caches = model.newCache(parameters: nil) as [KVCache]? else { return -4 }
+    let numLayers = caches.count
+
+    // Mirror TokenIterator's prepare + step + iterator.next() so batchTokens
+    // matches sequential prefill_req: forward [B, T-1] for prefill, [B, 1]
+    // for the last prompt token (first sampled), then [B, 1] of the first
+    // sampled token (second sampled — what init_batched stashes).
+    let lmModel: any LanguageModel = model
+    if T > 1 {
+        let prefillChunk = inputBatch[0..., ..<(T - 1)]
+        _ = lmModel(LMInput.Text(tokens: prefillChunk), cache: caches, state: nil)
+    }
+    let lastPromptTokens = inputBatch[0..., (T - 1)..<T]  // [B, 1]
+    let firstStepOut = lmModel(
+        LMInput.Text(tokens: lastPromptTokens), cache: caches, state: nil)
+    let firstLogits = firstStepOut.logits[0..., -1, 0...]  // [B, V]
+    let firstSampled = argMax(firstLogits, axis: -1)       // [B]
+    eval(firstSampled)
+    // iterator.next() equivalent — second sampled token is what init_batched stashes.
+    let secondInput = firstSampled.reshaped(B, 1)
+    let secondStepOut = lmModel(
+        LMInput.Text(tokens: secondInput), cache: caches, state: nil)
+    let secondLogits = secondStepOut.logits[0..., -1, 0...]
+    let firstTokens = argMax(secondLogits, axis: -1)        // [B]
+    eval(firstTokens)
+
+    // Read K/V from prefilled caches and pull dimensions for BatchedKVCache.
+    // After prepare + step + iterator.next() equivalent, the cache holds
+    // T+1 tokens (prompt + first sampled token).
+    guard let firstSimple = caches[0] as? KVCacheSimple,
+          let firstPeek = firstSimple.peek() else { return -5 }
+    let kvHeads = firstPeek.0.dim(1)
+    let headDim = firstPeek.0.dim(3)
+    let cacheLen = firstSimple.offset  // = T + 1
+
+    // Allocate BatchedKVCache sized for prefill + decode margin.
+    let decodeMargin = 512
+    let maxSeq = max(2048, cacheLen + decodeMargin)
+    var bCaches = [BatchedKVCache]()
+    bCaches.reserveCapacity(numLayers)
+    // Use a wrapped caches array we can nil out per-layer — drops the
+    // [B, kvHeads, cacheLen, headDim] KVCacheSimple as soon as its layer
+    // is copied into the BatchedKVCache slot. Without this, both caches
+    // are alive across all 36 layers (≈ 144 GB at 4B/p8K/B=64) and OOM.
+    var transientCaches: [KVCache?] = caches.map { $0 }
+    for layer in 0..<numLayers {
+        let bc = BatchedKVCache(
+            maxBatch: max(B, 64), kvHeads: kvHeads, headDim: headDim,
+            maxSeq: maxSeq, dtype: firstPeek.0.dtype
+        )
+        guard let simple = transientCaches[layer] as? KVCacheSimple,
+              let (k, v) = simple.peek() else { return -6 }
+        bc.keys[..<B, 0..., ..<cacheLen, 0...] = k
+        bc.values[..<B, 0..., ..<cacheLen, 0...] = v
+        for i in 0..<B { bc.offsets[i] = cacheLen }
+        bc.active = B
+        // Materialize this layer's copy, then drop the prefill cache.
+        eval(bc.keys, bc.values)
+        transientCaches[layer] = nil
+        bCaches.append(bc)
+    }
+
+    // Final eval to ensure all bCaches are materialized before bench timing.
+    var toEval = [MLXArray]()
+    for c in bCaches {
+        toEval.append(c.keys)
+        toEval.append(c.values)
+    }
+    eval(toEval)
+
+    // Set up engine state for batched decode. Mirrors init_batched.
+    engine.batchedCaches = bCaches
+    engine.batchedHybridCaches = nil
+    engine.batchSlots.removeAll()
+    engine.batchTokens = Array(repeating: 0, count: max(B, 64))
+
+    // Stash sampled first tokens — they're returned by the first decode_all
+    // (same previousY pattern as sequential prefill_req).
+    let firstTokensArr: [Int32] = (0..<B).map { firstTokens[$0].item(Int32.self) }
+    for (slot, rid) in rids.enumerated() {
+        engine.batchSlots[rid] = slot
+        engine.batchTokens[slot] = Int(firstTokensArr[slot])
+    }
+    // Note: RequestSession requires a TokenIterator (sequential-prefill path
+    // produces one). Batched prefill skips that — decode_all's per-request
+    // temperature loop uses `?? 0` default for missing sessions, which is
+    // correct for greedy. Adding a TokenIterator-less session variant is
+    // M5 polish work, not a correctness issue here.
+
+    return 0
+}
+
+/// Hybrid (attention + GDN) batched prefill. Same chunked `[B, T-1]` + `[B, 1]`
+/// + `[B, 1]` pattern as the Qwen3 path — works because the hybrid model's
+/// standard `callAsFunction` accepts mixed `[KVCacheSimple, MambaCache, …]`
+/// caches and propagates the leading-B dimension through both attention and
+/// GDN layers. After the chunks land, copy each layer's cache into the right
+/// `BatchedHybridCache` slot range (attention → BatchedKVCache, GDN →
+/// BatchedMambaCache). Per-layer eager release mirrors the Qwen3 path's
+/// doubled-KV-peak fix from `00e7538` (extended to GDN state here too).
+private func prefillBatchedUniformHybrid(
+    engine: InferenceEngine,
+    model: any BatchedHybridLLM,
+    inputBatch: MLXArray,
+    rids: [String],
+    B: Int,
+    T: Int
+) -> Int32 {
+    // Hybrid models conform to LanguageModel by way of LLMModel — pull the
+    // protocol surface for the chunked forward calls.
+    guard let lmModel = model as? any LanguageModel else { return -7 }
+
+    // Fresh per-layer caches: mixed [KVCacheSimple, MambaCache, …]. The
+    // standard hybrid forward writes [B, ...] state into both kinds.
+    let caches = lmModel.newCache(parameters: nil)
+    let numLayers = caches.count
+
+    // Same chunked pattern as the Qwen3 path so batchTokens matches what
+    // sequential prefill_req would have stashed (second sampled token).
+    if T > 1 {
+        let prefillChunk = inputBatch[0..., ..<(T - 1)]
+        _ = lmModel(LMInput.Text(tokens: prefillChunk), cache: caches, state: nil)
+    }
+    let lastPromptTokens = inputBatch[0..., (T - 1)..<T]  // [B, 1]
+    let firstStepOut = lmModel(
+        LMInput.Text(tokens: lastPromptTokens), cache: caches, state: nil)
+    let firstLogits = firstStepOut.logits[0..., -1, 0...]  // [B, V]
+    let firstSampled = argMax(firstLogits, axis: -1)       // [B]
+    eval(firstSampled)
+    let secondInput = firstSampled.reshaped(B, 1)
+    let secondStepOut = lmModel(
+        LMInput.Text(tokens: secondInput), cache: caches, state: nil)
+    let secondLogits = secondStepOut.logits[0..., -1, 0...]
+    let firstTokens = argMax(secondLogits, axis: -1)        // [B]
+    eval(firstTokens)
+
+    // Build a fresh BatchedHybridCache sized for at least B (header room
+    // capped to 64 for parity with the Qwen3 path).
+    let maxBatch = max(B, 64)
+    let hCaches = model.newBatchedHybridCache(
+        maxBatch: maxBatch, parameters: engine.generateParams)
+
+    guard numLayers == hCaches.layers.count else {
+        print("[vsm] prefill_batched_uniform hybrid: layer count mismatch — req=\(numLayers) hybrid=\(hCaches.layers.count)")
+        return -8
+    }
+
+    // Per-layer copy + eager release. Mirrors the Qwen3 path's
+    // `transientCaches[layer] = nil` defense; doubled-state would otherwise
+    // pin both prefill caches and BatchedHybridCache across all layers.
+    var transientCaches: [KVCache?] = caches.map { $0 }
+    for layerIdx in 0..<numLayers {
+        let dstLayer = hCaches.layers[layerIdx]
+        switch dstLayer {
+        case .attention(let bkv):
+            guard let simple = transientCaches[layerIdx] as? KVCacheSimple,
+                  copyBatchedAttentionLayer(src: simple, dst: bkv, B: B)
+            else {
+                print("[vsm] prefill_batched_uniform hybrid: layer \(layerIdx) expected KVCacheSimple")
+                return -9
+            }
+            eval(bkv.keys, bkv.values)
+        case .gdn(let bma):
+            guard let mamba = transientCaches[layerIdx] as? MambaCache,
+                  copyBatchedMambaLayer(src: mamba, dst: bma, B: B)
+            else {
+                print("[vsm] prefill_batched_uniform hybrid: layer \(layerIdx) expected MambaCache")
+                return -10
+            }
+            eval(bma.convState, bma.recState)
+        }
+        transientCaches[layerIdx] = nil
+    }
+
+    // Final eval across all layers before returning.
+    var toEval = [MLXArray]()
+    for layer in hCaches.layers {
+        switch layer {
+        case .attention(let c):
+            toEval.append(c.keys); toEval.append(c.values)
+        case .gdn(let c):
+            toEval.append(c.convState); toEval.append(c.recState)
+        }
+    }
+    eval(toEval)
+
+    // Engine state mirrors init_batched hybrid path: batchedHybridCaches
+    // holds the polymorphic cache, batchedCaches stays nil.
+    engine.batchedHybridCaches = hCaches
+    engine.batchedCaches = nil
+    engine.batchSlots.removeAll()
+    engine.batchTokens = Array(repeating: 0, count: maxBatch)
+
+    let firstTokensArr: [Int32] = (0..<B).map { firstTokens[$0].item(Int32.self) }
+    for (slot, rid) in rids.enumerated() {
+        engine.batchSlots[rid] = slot
+        engine.batchTokens[slot] = Int(firstTokensArr[slot])
+    }
+
+    return 0
+}
+
+// MARK: - Hybrid (Qwen3Next-class) batched cache helpers
+
+/// Copy a single per-request `KVCacheSimple` layer into the matching
+/// `BatchedKVCache` slot. Mirrors the Qwen3 init path's per-layer copy.
+private func copyAttentionLayerIntoSlot(
+    src: KVCacheSimple, dst: BatchedKVCache, slot: Int
+) -> Bool {
+    let offset = src.offset
+    guard let (k, v) = src.peek() else { return false }
+    dst.keys[slot, 0..., ..<offset, 0...] = k[0]
+    dst.values[slot, 0..., ..<offset, 0...] = v[0]
+    dst.offsets[slot] = offset
+    dst.active = max(dst.active, slot + 1)
+    return true
+}
+
+/// Copy a single per-request `MambaCache` layer (conv + recurrent state)
+/// into the matching `BatchedMambaCache` slot. Per-request MambaCache holds
+/// `state[0]` as `[1, kernel-1, convDim]` conv state and `state[1]` as
+/// `[1, Hv, Dv, Dk]` fp32 recurrent state — slice off the leading 1-dim
+/// before writing into the batched [maxBatch, ...] tensors.
+private func copyMambaLayerIntoSlot(
+    src: MambaCache, dst: BatchedMambaCache, slot: Int
+) -> Bool {
+    let s = src.state
+    // src may be empty (zero-length prompt) — leave the destination zeroed.
+    if s.isEmpty {
+        dst.active = max(dst.active, slot + 1)
+        return true
+    }
+    guard s.count >= 2 else { return false }
+    let conv = s[0]   // [1, kernel-1, convDim]
+    let rec = s[1]    // [1, Hv, Dv, Dk] fp32
+    dst.convState[slot, 0..., 0...] = conv[0]
+    let recCast = (rec.dtype == .float32) ? rec[0] : rec[0].asType(.float32)
+    dst.recState[slot, 0..., 0..., 0...] = recCast
+    dst.active = max(dst.active, slot + 1)
+    return true
+}
+
+/// Copy a batched `KVCacheSimple` layer (already shaped `[B, kvHeads, T, headDim]`
+/// after a single batched forward) into `[..<B]` slots of a `BatchedKVCache`.
+/// Used by `vsm_engine_prefill_batched_uniform` hybrid path — the input is
+/// already batched, so we slice-assign the whole `[..<B]` range in one op
+/// instead of looping per-slot.
+private func copyBatchedAttentionLayer(
+    src: KVCacheSimple, dst: BatchedKVCache, B: Int
+) -> Bool {
+    let offset = src.offset
+    guard let (k, v) = src.peek() else { return false }
+    // k, v are [B, kvHeads, offset, headDim] from a batched forward.
+    dst.keys[..<B, 0..., ..<offset, 0...] = k
+    dst.values[..<B, 0..., ..<offset, 0...] = v
+    for i in 0..<B { dst.offsets[i] = offset }
+    dst.active = max(dst.active, B)
+    return true
+}
+
+/// Copy a batched `MambaCache` layer into `[..<B]` slots of a
+/// `BatchedMambaCache`. After a batched forward, the per-request
+/// `MambaCache.state` holds `state[0]: [B, kernel-1, convDim]` and
+/// `state[1]: [B, Hv, Dv, Dk]` (fp32) — same leading-B layout as the
+/// destination, so this is a single slice-assign per state tensor.
+private func copyBatchedMambaLayer(
+    src: MambaCache, dst: BatchedMambaCache, B: Int
+) -> Bool {
+    let s = src.state
+    if s.isEmpty {
+        // Fresh cache (zero-length input would not produce state); nothing
+        // to copy. Slot range stays at the BatchedMambaCache zero-init.
+        dst.active = max(dst.active, B)
+        return true
+    }
+    guard s.count >= 2 else { return false }
+    let conv = s[0]    // [B, kernel-1, convDim]
+    let rec = s[1]     // [B, Hv, Dv, Dk] (fp32 after gatedDeltaUpdate)
+    dst.convState[..<B, 0..., 0...] = conv
+    let recCast = (rec.dtype == .float32) ? rec : rec.asType(.float32)
+    dst.recState[..<B, 0..., 0..., 0...] = recCast
+    dst.active = max(dst.active, B)
+    return true
+}
+
+/// Hybrid analogue of `vsm_engine_init_batched`'s Qwen3 path. Walks each
+/// session's per-layer cache list and copies into the matching
+/// `BatchedHybridCache.layers[i]` (attention or GDN). Frees per-request
+/// caches eagerly after each slot so total KV memory doesn't double.
+private func initBatchedHybrid(
+    engine: InferenceEngine,
+    model: any BatchedHybridLLM,
+    rids: [String]
+) -> Int32 {
+    let B = rids.count
+
+    // Build the BatchedHybridCache. We size it for at least B but bump to 64
+    // for parity with the Qwen3 path (header-room for dynamic add/remove).
+    let maxBatch = max(B, 64)
+    let hCaches = model.newBatchedHybridCache(
+        maxBatch: maxBatch, parameters: engine.generateParams)
+
+    // Sanity: layer count must match the per-request cache layer count.
+    guard let firstSession = engine.sessions[rids[0]] else { return Int32(0) }
+    let numLayers = firstSession.iterator.cache.count
+    guard numLayers == hCaches.layers.count else {
+        print("[vsm] init_batched_hybrid: layer count mismatch — req=\(numLayers) hybrid=\(hCaches.layers.count)")
+        return Int32(-1)
+    }
+
+    engine.batchSlots.removeAll()
+    engine.batchTokens = Array(repeating: 0, count: maxBatch)
+
+    for (slotIdx, rid) in rids.enumerated() {
+        guard let session = engine.sessions[rid] else { continue }
+        engine.batchSlots[rid] = slotIdx
+
+        let tokenId = session.iterator.y.tokens.item(Int.self)
+        engine.batchTokens[slotIdx] = tokenId
+
+        for layerIdx in 0..<numLayers {
+            let srcCache = session.iterator.cache[layerIdx]
+            let dstLayer = hCaches.layers[layerIdx]
+            switch dstLayer {
+            case .attention(let bkv):
+                guard let simple = srcCache as? KVCacheSimple,
+                      copyAttentionLayerIntoSlot(src: simple, dst: bkv, slot: slotIdx)
+                else {
+                    print("[vsm] init_batched_hybrid: layer \(layerIdx) expected KVCacheSimple")
+                    return Int32(-1)
+                }
+            case .gdn(let bma):
+                guard let mamba = srcCache as? MambaCache,
+                      copyMambaLayerIntoSlot(src: mamba, dst: bma, slot: slotIdx)
+                else {
+                    print("[vsm] init_batched_hybrid: layer \(layerIdx) expected MambaCache")
+                    return Int32(-1)
+                }
+            }
+        }
+
+        // Materialize this slot's writes, then drop the per-req cache to
+        // avoid the doubled-KV peak the Qwen3 path also defends against.
+        var slotEval = [MLXArray]()
+        for layer in hCaches.layers {
+            switch layer {
+            case .attention(let c):
+                slotEval.append(c.keys); slotEval.append(c.values)
+            case .gdn(let c):
+                slotEval.append(c.convState); slotEval.append(c.recState)
+            }
+        }
+        eval(slotEval)
+        engine.sessions[rid] = nil
+    }
+
+    // Final eval to materialize the full batched cache before returning.
+    var toEval = [MLXArray]()
+    for layer in hCaches.layers {
+        switch layer {
+        case .attention(let c):
+            toEval.append(c.keys); toEval.append(c.values)
+        case .gdn(let c):
+            toEval.append(c.convState); toEval.append(c.recState)
+        }
+    }
+    eval(toEval)
+
+    engine.batchedHybridCaches = hCaches
+    print("[vsm] Batched hybrid cache initialized: B=\(B), layers=\(numLayers), maxBatch=\(maxBatch)")
+    return Int32(B)
+}
+
+/// Hybrid analogue of `vsm_engine_add_batch_slot`. Copies one new request's
+/// per-layer caches into the next free `BatchedHybridCache` slot, then evals
+/// + drops the per-request cache to avoid doubled KV memory.
+private func addBatchSlotHybrid(
+    engine: InferenceEngine,
+    hCaches: BatchedHybridCache,
+    rid: String,
+    session: RequestSession
+) -> Int32 {
+    let slotIdx = engine.batchSlots.count
+    let numLayers = session.iterator.cache.count
+    guard numLayers == hCaches.layers.count else { return Int32(-1) }
+
+    let tokenId = session.iterator.y.tokens.item(Int.self)
+    engine.batchTokens[slotIdx] = tokenId
+    engine.batchSlots[rid] = slotIdx
+
+    for layerIdx in 0..<numLayers {
+        let srcCache = session.iterator.cache[layerIdx]
+        let dstLayer = hCaches.layers[layerIdx]
+        switch dstLayer {
+        case .attention(let bkv):
+            guard let simple = srcCache as? KVCacheSimple,
+                  copyAttentionLayerIntoSlot(src: simple, dst: bkv, slot: slotIdx)
+            else { return Int32(-1) }
+        case .gdn(let bma):
+            guard let mamba = srcCache as? MambaCache,
+                  copyMambaLayerIntoSlot(src: mamba, dst: bma, slot: slotIdx)
+            else { return Int32(-1) }
+        }
+    }
+
+    var toEval = [MLXArray]()
+    for layer in hCaches.layers {
+        switch layer {
+        case .attention(let c):
+            toEval.append(c.keys); toEval.append(c.values)
+        case .gdn(let c):
+            toEval.append(c.convState); toEval.append(c.recState)
+        }
+    }
+    eval(toEval)
+    engine.sessions[rid] = nil
+
+    return Int32(slotIdx)
 }
 
 // Mirror of vsm_perf_stats_t from bridge.h

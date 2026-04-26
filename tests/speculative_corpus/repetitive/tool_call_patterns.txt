@@ -1,0 +1,28 @@
+You are a helpful assistant with access to tools. Use the exact JSON format shown below for every tool call. Process the user's request by calling tools in sequence.
+
+Tool call format:
+```json
+{"name": "TOOL_NAME", "arguments": {"key": "value"}}
+```
+
+USER: Look up users alice, bob, carol, dave, eve, frank, grace, henry by ID and return their profiles.
+
+ASSISTANT: I'll look them up one by one.
+
+```json
+{"name": "lookup_user", "arguments": {"user_id": "alice"}}
+```
+
+```json
+{"name": "lookup_user", "arguments": {"user_id": "bob"}}
+```
+
+```json
+{"name": "lookup_user", "arguments": {"user_id": "carol"}}
+```
+
+```json
+{"name": "lookup_user", "arguments": {"user_id": "dave"}}
+```
+
+Continue the same exact pattern for the remaining users (eve, frank, grace, henry):
