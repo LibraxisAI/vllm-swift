@@ -87,9 +87,6 @@ final class InferenceEngine {
     var totalDecodeTime: Double = 0
     var peakMemoryBytes: Int64 = 0
 
-    // Phase 6 debugging: trace which dispatch path the bridge picks. Reset on engine create.
-    var decodeAllCalls: Int = 0
-
     init(
         model: any LanguageModel,
         tokenizer: any Tokenizer,
@@ -453,10 +450,6 @@ public func vsm_engine_decode_all(
         // Qwen3Model and BatchedHybridLLM are disjoint conformances —
         // ordering is correctness-neutral, only perf-motivated.
         // Fully batched path for Qwen3 with BatchedKVCache
-        if engine.decodeAllCalls < 1 {
-            print("[vsm] decode_all dispatch check: model=\(type(of: engine.model)) batchedCaches=\(engine.batchedCaches != nil) batchedHybridCaches=\(engine.batchedHybridCaches != nil) batchSlots=\(engine.batchSlots.count)")
-            engine.decodeAllCalls = 1
-        }
         if let qwenModel = engine.model as? Qwen3Model,
            let bCaches = engine.batchedCaches,
            !engine.batchSlots.isEmpty
@@ -752,13 +745,10 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
         // then BatchedHybridLLM. Qwen3Model and BatchedHybridLLM are disjoint
         // so order is correctness-neutral. Models that match neither return -1.
         if engine.model is Qwen3Model {
-            print("[vsm] init_batched: dispatching Qwen3 path (model=\(type(of: engine.model)))")
             // Fall through to the existing Qwen3 init path below.
         } else if let hybridModel = engine.model as? any BatchedHybridLLM {
-            print("[vsm] init_batched: dispatching BatchedHybridLLM path (model=\(type(of: engine.model)))")
             return initBatchedHybrid(engine: engine, model: hybridModel, rids: rids)
         } else {
-            print("[vsm] init_batched: NO BATCHED PATH MATCHED for model=\(type(of: engine.model))")
             return Int32(-1)
         }
 
@@ -1136,7 +1126,6 @@ public func vsm_engine_reset(_ handle: UnsafeMutableRawPointer?) {
     engineQueue.sync {
         guard let engine = engines[handle] else { return }
         engine.sessions.removeAll()
-        engine.decodeAllCalls = 0
     }
 }
 
