@@ -34,18 +34,31 @@ MODEL_PATH = (
 MAX_TOKENS = 50
 CONCURRENCY_LEVELS = [1, 8, 32, 64]
 PROMPT_TOKENS = 0  # 0 = use short default; >0 = pad to N tokens
+PROMPTS_MODE = "identical"  # or "unique" — see bench_throughput.py for rationale
 for i, arg in enumerate(sys.argv):
     if arg == "--prompt-tokens" and i + 1 < len(sys.argv):
         PROMPT_TOKENS = int(sys.argv[i + 1])
+    if arg == "--prompts" and i + 1 < len(sys.argv):
+        PROMPTS_MODE = sys.argv[i + 1]
+        assert PROMPTS_MODE in ("identical", "unique"), PROMPTS_MODE
 
 
-def _build_prompt() -> str:
+SEEDS = [
+    "Explain the theory of relativity in detail, covering both special and general relativity:",
+    "Describe quantum mechanics, including wave-particle duality and the uncertainty principle:",
+    "Walk through the proof of the Pythagorean theorem step by step:",
+    "Summarize the causes and consequences of the French Revolution:",
+    "Outline how a transformer language model processes a sentence end to end:",
+    "Explain how photosynthesis converts sunlight into chemical energy:",
+    "Compare and contrast classical conditioning and operant conditioning:",
+    "Describe how plate tectonics shapes mountain ranges over geologic time:",
+]
+
+
+def _build_prompt(seed_text: str | None = None) -> str:
     """Short default, or padded prompt of approximately PROMPT_TOKENS length.
     Returns text — vLLM does its own tokenization."""
-    seed = (
-        "Explain the theory of relativity in detail, covering both "
-        "special and general relativity:"
-    )
+    seed = seed_text or SEEDS[0]
     if PROMPT_TOKENS == 0:
         return seed
     # ~3 chars per token rule of thumb for English. Pad with seed repetitions
@@ -55,6 +68,15 @@ def _build_prompt() -> str:
     while sum(len(s) for s in out) < target_chars:
         out.append(seed)
     return " ".join(out)
+
+
+def _build_prompts(B: int) -> list[str]:
+    """`identical` mode → [prompt] * B (vllm-metal's prefix cache will dedupe).
+    `unique` mode → B distinct prompts cycled from SEEDS so no two share a
+    prefix beyond a couple of tokens."""
+    if PROMPTS_MODE == "identical":
+        return [_build_prompt()] * B
+    return [_build_prompt(SEEDS[i % len(SEEDS)]) for i in range(B)]
 
 
 def run_worker(B: int) -> dict:
@@ -70,21 +92,25 @@ def run_worker(B: int) -> dict:
     """
     from vllm import LLM, SamplingParams
 
-    prompt = _build_prompt()
     max_model_len = max(2048, PROMPT_TOKENS + MAX_TOKENS + 256)
 
+    # Disable prefix caching for `unique` mode so the cross-engine comparison
+    # measures recompute speed, not dedupe coverage. `identical` mode keeps
+    # the engine default (prefix caching on) so vllm-metal can show its
+    # caching win — this is the production-relevant cell for chat workloads.
     llm = LLM(
         model=MODEL_PATH,
         dtype="float16",
         max_model_len=max_model_len,
         gpu_memory_utilization=0.9,
         disable_log_stats=False,  # need RequestStateStats for decode window
+        enable_prefix_caching=(PROMPTS_MODE == "identical"),
     )
 
     llm.generate(["Hello"], SamplingParams(temperature=0, max_tokens=5))
 
     params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
-    prompts = [prompt] * B
+    prompts = _build_prompts(B)
 
     t0 = time.perf_counter()
     outputs = llm.generate(prompts, params)
@@ -129,14 +155,19 @@ def main_orchestrator():
     print(f"Model: {MODEL_PATH}")
     print(f"Max tokens: {MAX_TOKENS}")
     print(f"Concurrency levels: {CONCURRENCY_LEVELS}")
+    print(f"Prompts mode: {PROMPTS_MODE}")
     print()
 
     results = []
     for B in CONCURRENCY_LEVELS:
         print(f"--- B={B} (fresh subprocess) ---")
         # Spawn worker in a fresh Python interpreter. EngineCore subprocess
-        # gets cleanly torn down on worker exit.
-        cmd = [sys.executable, "-u", __file__, MODEL_PATH, "--worker", str(B)]
+        # gets cleanly torn down on worker exit. Worker reads its own argv,
+        # so flags forwarded explicitly here.
+        cmd = [sys.executable, "-u", __file__, MODEL_PATH, "--worker", str(B),
+               "--prompts", PROMPTS_MODE]
+        if PROMPT_TOKENS > 0:
+            cmd += ["--prompt-tokens", str(PROMPT_TOKENS)]
         # vllm-metal at B>=32 can take 5-15 minutes per concurrency level
         # (slow Python scheduler + uncached EngineCore startup ~30s each).
         proc = subprocess.run(
