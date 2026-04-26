@@ -665,7 +665,16 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
               let firstKeys = firstCache.peek()?.0 else { return Int32(0) }
         let kvHeads = firstKeys.dim(1)
         let headDim = firstKeys.dim(3)
-        let maxSeq = 2048
+        // Size cache from longest actual prefill + decode margin. Hardcoded 2048
+        // overflowed at long prompts: a 2048-token prompt would copy into a
+        // 2048-slot cache (offsets[i]=2048), then the first decode write at
+        // index 2048 overflows. Symptom: `broadcast_shapes (1,h,2049,d) and
+        // (1,h,2048,d)` from the per-step mask vs clamped cache slice.
+        let maxPrefillOffset = rids.compactMap {
+            engine.sessions[$0]?.iterator.cache.first?.offset
+        }.max() ?? 0
+        let decodeMargin = 512  // generous headroom for typical bench/serve workloads
+        let maxSeq = max(2048, maxPrefillOffset + decodeMargin)
 
         // Create BatchedKVCache per layer
         var bCaches = [BatchedKVCache]()
