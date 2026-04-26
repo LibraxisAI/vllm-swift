@@ -43,25 +43,25 @@ Server running at `http://localhost:8000` (OpenAI-compatible API).
 
 ## Performance (M5 Max 128GB)
 
-Up to 2.6x higher throughput at low concurrency by removing Python from the inference hot path.
-
-Decode output tok/s. Prompt=18 tokens, generation=50 tokens (short-context decode benchmark), greedy.
-
-> Both measured via offline benchmark (no HTTP overhead). **vllm-swift** uses the Swift/Metal engine via ctypes. **vllm-metal** uses the Python/MLX engine via vLLM's offline API.
+Decode throughput, tok/s. Prompt = 18 tokens, generation = 50 tokens, greedy (temp=0). Both engines measured via offline benchmark (no HTTP overhead). **vllm-swift** uses the Swift/Metal engine via ctypes. **vllm-metal** uses the Python/MLX engine via vLLM's offline `LLM` API.
 
 ### Qwen3-0.6B
 
 | | Single | 8 concurrent | 32 concurrent | 64 concurrent |
 |---|:---:|:---:|:---:|:---:|
-| **vllm-swift** | **371** | **1,424** | **2,931** | **3,472** |
-| vllm-metal (Python/MLX) | 142 | 1,170 | 2,457 | 3,017 |
+| **vllm-swift** | **364** | **1,527** | **2,859** | **3,425** |
+| vllm-metal (Python/MLX) | 111 | 652 | 2,047 | 2,620 |
+| vllm-swift speedup | 3.30× | 2.34× | 1.40× | 1.31× |
 
 ### Qwen3-4B
 
 | | Single | 8 concurrent | 32 concurrent | 64 concurrent |
 |---|:---:|:---:|:---:|:---:|
-| **vllm-swift** | **143** | **470** | **1,184** | **1,511** |
-| vllm-metal (Python/MLX) | 105 | 408 | 1,067 | 1,387 |
+| **vllm-swift** | **147** | **477** | **1,194** | **1,518** |
+| vllm-metal (Python/MLX) | 104 | 396 | 1,065 | 1,375 |
+| vllm-swift speedup | 1.41× | 1.20× | 1.12× | 1.10× |
+
+> _Updated 2026-04-25._ Earlier numbers in this section were measured with a benchmark harness that re-used a single Python process across concurrency levels — `del LLM` does not reap vLLM's `EngineCore` subprocess (see [#19849](https://github.com/vllm-project/vllm/issues/19849), [#1908](https://github.com/vllm-project/vllm/issues/1908), [#17273](https://github.com/vllm-project/vllm/issues/17273), [#24885](https://github.com/vllm-project/vllm/issues/24885)), so each iteration accumulated zombie GPU subprocesses that contaminated subsequent measurements. The new numbers spawn a fresh subprocess per concurrency level. vllm-swift figures are stable vs. the previous publication (within ±3%); vllm-metal numbers shifted (mostly larger gap on the 0.6B model — fixed scheduling overhead matters more for smaller models). Full clean matrix and bench scripts in [benchmarks/baseline-2026-04-25.md](benchmarks/baseline-2026-04-25.md).
 
 ### [TurboQuant+](https://github.com/TheTom/turboquant_plus) KV Cache Compression
 
