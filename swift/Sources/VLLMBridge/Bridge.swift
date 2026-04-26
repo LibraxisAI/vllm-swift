@@ -691,11 +691,10 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
             ))
         }
 
-        // Copy each request's cache into the batched cache. Free the per-request
-        // KVCacheSimple immediately after copying — they hold full prompt-length
-        // K/V per layer (∼1 GB/req at 4B/8K) and otherwise stay alive in
-        // engine.sessions, doubling KV memory during init_batched (the
-        // 4B/p8K/B=64 OOM lived here).
+        // Copy per-request cache into batched cache, then free the session.
+        // Per-request KVCacheSimples hold full prompt-length K/V (~1 GB/req at
+        // 4B/8K). Holding them across the copy doubles KV memory and OOMs at
+        // long-ctx high-B cells.
         engine.batchSlots.removeAll()
         engine.batchTokens = Array(repeating: 0, count: max(B, 64))
 
@@ -717,10 +716,9 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
                 bCaches[layerIdx].active = max(bCaches[layerIdx].active, slotIdx + 1)
             }
 
-            // Materialize this slot's writes and drop the per-request cache
-            // before moving to the next. Without this the per-req K/V tensors
-            // accumulate while BatchedKVCache fills, peaking at 2× total KV
-            // memory and OOM-killing the process at long-ctx high-B cells.
+            // Materialize this slot's writes, then drop the per-req cache.
+            // Otherwise per-req K/V accumulate alongside the growing batched
+            // cache, peaking at 2× total KV memory.
             var slotEval = [MLXArray]()
             for c in bCaches {
                 slotEval.append(c.keys)
@@ -783,8 +781,7 @@ public func vsm_engine_add_batch_slot(
             bCaches[layerIdx].active = max(bCaches[layerIdx].active, slotIdx + 1)
         }
 
-        // Materialize, then drop this request's per-layer prefill cache to
-        // avoid doubled KV memory during multi-add scenarios.
+        // Materialize and drop per-req cache — avoid doubled KV memory.
         var toEval = [MLXArray]()
         for c in bCaches { toEval.append(c.keys); toEval.append(c.values) }
         eval(toEval)
@@ -1147,15 +1144,10 @@ public func vsm_engine_prefill_batched_uniform(
         guard let caches = qwenModel.newCache(parameters: nil) as [KVCache]? else { return -4 }
         let numLayers = caches.count
 
-        // Mirror TokenIterator's prepare + step + iterator.next() pattern so
-        // batchTokens here matches what sequential prefill_req leaves on the
-        // session. Sequential does:
-        //   1. prepare: forward [1, T-1] (populate cache)
-        //   2. step: forward [1, 1] (last prompt token) → first sampled token
-        //   3. iterator.next(): forward [1, 1] (first token) → SECOND token,
-        //      and init_batched reads `session.iterator.y` which is the second.
-        // Skip step 3 and the per-request first decode token differs from the
-        // sequential bench, so we'd report a divergence that isn't a real bug.
+        // Mirror TokenIterator's prepare + step + iterator.next() so batchTokens
+        // matches sequential prefill_req: forward [B, T-1] for prefill, [B, 1]
+        // for the last prompt token (first sampled), then [B, 1] of the first
+        // sampled token (second sampled — what init_batched stashes).
         let lmModel: any LanguageModel = qwenModel
         if T > 1 {
             let prefillChunk = inputBatch[0..., ..<(T - 1)]
@@ -1167,8 +1159,7 @@ public func vsm_engine_prefill_batched_uniform(
         let firstLogits = firstStepOut.logits[0..., -1, 0...]  // [B, V]
         let firstSampled = argMax(firstLogits, axis: -1)       // [B]
         eval(firstSampled)
-        // Advance one more step (iterator.next() equivalent) — the second
-        // sampled token is what init_batched ultimately stashes.
+        // iterator.next() equivalent — second sampled token is what init_batched stashes.
         let secondInput = firstSampled.reshaped(B, 1)
         let secondStepOut = lmModel(
             LMInput.Text(tokens: secondInput), cache: caches, state: nil)
