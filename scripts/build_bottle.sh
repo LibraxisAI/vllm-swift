@@ -10,12 +10,21 @@
 
 set -euo pipefail
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 SWIFT_DIR="$PROJECT_DIR/swift"
 BOTTLE_DIR="/tmp/vllm-swift-bottle/vllm-swift/$VERSION"
-BOTTLE_TAR="vllm-swift-${VERSION}.arm64_sequoia.bottle.tar.gz"
+
+# Map macOS major version to Homebrew bottle tag.
+MACOS_MAJOR=$(sw_vers -productVersion | cut -d. -f1)
+case "$MACOS_MAJOR" in
+    26) MACOS_TAG="arm64_tahoe" ;;
+    15) MACOS_TAG="arm64_sequoia" ;;
+    14) MACOS_TAG="arm64_sonoma" ;;
+    *)  echo "ERROR: unknown macOS major version $MACOS_MAJOR"; exit 1 ;;
+esac
+BOTTLE_TAR="vllm-swift-${VERSION}.${MACOS_TAG}.bottle.tar.gz"
 
 echo "=== Building vllm-swift bottle v${VERSION} ==="
 echo ""
@@ -130,7 +139,7 @@ print(f'Downloaded to {p}')
     echo "Update complete."
     ;;
   version)
-    echo "vllm-swift 0.2.1"
+    echo "vllm-swift 0.2.2"
     echo "dylib: $PREFIX/lib/libVLLMBridge.dylib"
     [ -d "$VENV_DIR" ] && "$VENV_DIR/bin/python3" -c "import vllm; print(f'vLLM: {vllm.__version__}')" 2>/dev/null
     ;;
@@ -174,5 +183,5 @@ echo "Add this to Formula/vllm-swift.rb after 'license' line:"
 echo ""
 echo "  bottle do"
 echo "    root_url \"https://github.com/TheTom/homebrew-tap/releases/download/bottles\""
-echo "    sha256 cellar: :any, arm64_sequoia: \"$SHA\""
+echo "    sha256 cellar: :any, ${MACOS_TAG}: \"$SHA\""
 echo "  end"
