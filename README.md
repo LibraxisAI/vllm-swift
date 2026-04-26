@@ -51,7 +51,6 @@ Decode throughput, tok/s. Prompt = 18 tokens, generation = 50 tokens, greedy (te
 |---|:---:|:---:|:---:|:---:|
 | **vllm-swift** | **364** | **1,527** | **2,859** | **3,425** |
 | vllm-metal (Python/MLX) | 111 | 652 | 2,047 | 2,620 |
-| vllm-swift speedup | 3.30× | 2.34× | 1.40× | 1.31× |
 
 ### Qwen3-4B
 
@@ -59,21 +58,20 @@ Decode throughput, tok/s. Prompt = 18 tokens, generation = 50 tokens, greedy (te
 |---|:---:|:---:|:---:|:---:|
 | **vllm-swift** | **147** | **477** | **1,194** | **1,518** |
 | vllm-metal (Python/MLX) | 104 | 396 | 1,065 | 1,375 |
-| vllm-swift speedup | 1.41× | 1.20× | 1.12× | 1.10× |
 
-> _Updated 2026-04-25._ Earlier numbers in this section were measured with a benchmark harness that re-used a single Python process across concurrency levels — `del LLM` does not reap vLLM's `EngineCore` subprocess (see [#19849](https://github.com/vllm-project/vllm/issues/19849), [#1908](https://github.com/vllm-project/vllm/issues/1908), [#17273](https://github.com/vllm-project/vllm/issues/17273), [#24885](https://github.com/vllm-project/vllm/issues/24885)), so each iteration accumulated zombie GPU subprocesses that contaminated subsequent measurements. The new numbers spawn a fresh subprocess per concurrency level. vllm-swift figures are stable vs. the previous publication (within ±3%); vllm-metal numbers shifted (mostly larger gap on the 0.6B model — fixed scheduling overhead matters more for smaller models). Full clean matrix and bench scripts in [benchmarks/baseline-2026-04-25.md](benchmarks/baseline-2026-04-25.md).
+> Full matrix, methodology, and long-context cells in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ### [TurboQuant+](https://github.com/TheTom/turboquant_plus) KV Cache Compression
 
-[TurboQuant+](https://github.com/TheTom/turboquant_plus) enables longer context by compressing KV cache with no measurable impact on throughput.
+[TurboQuant+](https://github.com/TheTom/turboquant_plus) compresses KV cache to fit longer context with modest throughput cost.
 
 **Qwen3.5 2B (4-bit weights)**
 
 | KV Cache | Compression | Prefill @1K | Decode @1K | Prefill @4K | Decode @4K |
 |----------|:-----------:|:----------:|:----------:|:----------:|:----------:|
-| FP16 | 1.0x | 1,252 tok/s | 259 tok/s | 1,215 tok/s | 249 tok/s |
-| turbo4v2 | 3.2x | 1,331 tok/s | 255 tok/s | 1,245 tok/s | 240 tok/s |
-| turbo3 | 4.6x | 1,346 tok/s | 174 tok/s | 1,276 tok/s | 241 tok/s |
+| FP16 | 1.0× | 1,252 tok/s | 259 tok/s | 1,215 tok/s | 249 tok/s |
+| turbo4v2 | 3.0× | 1,331 tok/s | 245 tok/s | 1,245 tok/s | 240 tok/s |
+| turbo3 | 4.6× | 1,346 tok/s | 174 tok/s | 1,276 tok/s | 241 tok/s |
 
 ## Architecture
 
@@ -161,7 +159,7 @@ vllm-swift serve ~/models/Qwen3-4B-4bit \
 
 ### Long context with [TurboQuant+](https://github.com/TheTom/turboquant_plus)
 
-Compress KV cache 3-5x to fit longer context with no measurable impact on throughput:
+Compress KV cache 3-5× to fit longer context with modest throughput cost:
 
 ```bash
 vllm-swift serve ~/models/Qwen3-4B-4bit \
@@ -172,8 +170,8 @@ vllm-swift serve ~/models/Qwen3-4B-4bit \
 
 | Scheme | Compression | Best for |
 |--------|:-----------:|----------|
-| `turbo4v2` | 3.2x | Recommended — best quality/compression balance |
-| `turbo3` | 4.6x | Maximum compression, higher PPL trade-off |
+| `turbo4v2` | ~3× | Recommended — best quality/compression balance |
+| `turbo3` | ~4.6× | Maximum compression, higher PPL trade-off |
 
 ### Full setup (agent + reasoning + TurboQuant+)
 
