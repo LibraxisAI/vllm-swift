@@ -67,45 +67,71 @@ fi
 echo "  Built: $DYLIB"
 echo ""
 
-# Find and copy MLX metallib
-echo "Setting up MLX metallib..."
-MLX_METALLIB=""
+# Build MLX metallib (custom kernels: GatedDelta, TurboFlash, etc.)
+#
+# SPM does not compile .metal sources, so the bottle pipeline (and we) must
+# invoke mlx-swift-lm's build-metallib.sh against the SPM-resolved checkouts.
+# The script discovers metal sources at ../mlx-swift/Source/Cmlx/mlx-generated/metal
+# relative to its own location, which lines up with the SPM checkout layout.
+#
+# Without this, custom kernels (gated_delta_step_fused_*, TurboFlash, etc.)
+# are missing at runtime and Qwen3Next-family / TurboFlash models fail to load.
+# See: https://github.com/TheTom/vllm-swift/issues/7
+echo "Building MLX metallib (custom kernels)..."
 
-# Check common locations for the metallib
-for candidate in \
-    "$BUILD_DIR/mlx.metallib" \
-    "$SWIFT_DIR/.build/artifacts/mlx-swift/mlxc.artifactbundle/"*"/mlx.metallib" \
-    "$(python3 -c 'import mlx; import os; print(os.path.join(os.path.dirname(mlx.__file__), "lib", "mlx.metallib"))' 2>/dev/null || echo '')" \
-    "$HOME/Library/Developer/Xcode/DerivedData/"*"/Build/Products/"*"/mlx.metallib"
-do
-    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
-        MLX_METALLIB="$candidate"
-        break
-    fi
-done
+MLX_LM_CHECKOUT="$SWIFT_DIR/.build/checkouts/mlx-swift-lm"
+METAL_BUILD_SCRIPT="$MLX_LM_CHECKOUT/scripts/build-metallib.sh"
+MLX_SWIFT_CHECKOUT="$SWIFT_DIR/.build/checkouts/mlx-swift"
 
-if [ -n "$MLX_METALLIB" ]; then
-    if [ "$MLX_METALLIB" != "$BUILD_DIR/mlx.metallib" ]; then
-        cp "$MLX_METALLIB" "$BUILD_DIR/mlx.metallib"
-        echo "  Copied metallib from: $MLX_METALLIB"
-    else
-        echo "  Metallib already in place: $MLX_METALLIB"
-    fi
-else
-    echo "  WARNING: mlx.metallib not found. Attempting to generate..."
-    # Force metallib generation by running a trivial Metal op
-    python3 -c "
-try:
-    import mlx.core as mx; mx.eval(mx.add(mx.array([1]), mx.array([2])))
-    import os; src = os.path.join(os.path.dirname(mx.__file__), 'lib', 'mlx.metallib')
-    if os.path.exists(src):
-        import shutil; shutil.copy(src, '$BUILD_DIR/mlx.metallib'); print('  Generated and copied metallib')
-except: pass
-" 2>/dev/null
-    if [ ! -f "$BUILD_DIR/mlx.metallib" ]; then
-        echo "  WARNING: Could not generate metallib. Some models (GDN/TurboFlash) may fail."
-        echo "  To fix: pip install mlx && python3 -c 'import mlx.core; mlx.core.eval(mlx.core.array([1]))'  "
-    fi
+if [ ! -f "$METAL_BUILD_SCRIPT" ]; then
+    echo "ERROR: mlx-swift-lm checkout missing build-metallib.sh at:"
+    echo "  $METAL_BUILD_SCRIPT"
+    echo "  swift build should have populated .build/checkouts/. Try: swift package resolve"
+    exit 1
+fi
+
+if [ ! -d "$MLX_SWIFT_CHECKOUT/Source/Cmlx/mlx-generated/metal" ]; then
+    echo "ERROR: mlx-swift checkout missing Metal sources at:"
+    echo "  $MLX_SWIFT_CHECKOUT/Source/Cmlx/mlx-generated/metal"
+    exit 1
+fi
+
+# Run the script — it writes to its own .build/arm64-apple-macosx/$CONFIG/mlx.metallib.
+# Tail output to keep installer noise low; full log on failure.
+METAL_LOG="$(mktemp)"
+trap 'rm -f "$METAL_LOG"' EXIT
+if ! bash "$METAL_BUILD_SCRIPT" "$CONFIG" >"$METAL_LOG" 2>&1; then
+    echo "ERROR: build-metallib.sh failed. Last 30 lines of output:"
+    tail -30 "$METAL_LOG"
+    exit 1
+fi
+tail -3 "$METAL_LOG"
+
+GENERATED_METALLIB="$MLX_LM_CHECKOUT/.build/arm64-apple-macosx/$CONFIG/mlx.metallib"
+if [ ! -f "$GENERATED_METALLIB" ]; then
+    echo "ERROR: build-metallib.sh ran but produced no metallib at:"
+    echo "  $GENERATED_METALLIB"
+    echo "Full log:"
+    cat "$METAL_LOG"
+    exit 1
+fi
+
+# Place the metallib next to the dylib — MLX's Metal device looks alongside
+# the loaded dylib for mlx.metallib at runtime.
+cp "$GENERATED_METALLIB" "$BUILD_DIR/mlx.metallib"
+echo "  Installed: $BUILD_DIR/mlx.metallib"
+echo ""
+
+# Verification — fail loudly if the metallib is missing or empty.
+# This is the exact condition that issue #7 was filed about: source builds
+# silently shipping without mlx.metallib and failing later at model load.
+if [ ! -s "$BUILD_DIR/mlx.metallib" ]; then
+    echo "ERROR: mlx.metallib was not installed alongside libVLLMBridge.dylib."
+    echo "  Expected: $BUILD_DIR/mlx.metallib"
+    echo "  Without this file, GatedDelta / TurboFlash kernels are missing and"
+    echo "  models like Qwen3Next-* will fail to load at runtime."
+    echo "  See: https://github.com/TheTom/vllm-swift/issues/7"
+    exit 1
 fi
 echo ""
 
