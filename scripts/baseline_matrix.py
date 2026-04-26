@@ -23,42 +23,75 @@ MODELS = ["Qwen3-0.6B-4bit", "Qwen3-4B-4bit"]
 CONCURRENCY = [1, 8, 32, 64]
 RUNS_PER_CELL = 1 if "--quick" in sys.argv else 3
 
+# Prompt-length sweep — 0 means default short prompt (~18 tokens).
+# >0 means pad to that many tokens. Long-context cells expose paged's
+# memory-packing wins that short-context cells hide.
+PROMPT_TOKEN_SETS = [0, 2048, 4096, 8192]
+if "--short-only" in sys.argv:
+    PROMPT_TOKEN_SETS = [0]
+if "--long-only" in sys.argv:
+    PROMPT_TOKEN_SETS = [2048, 4096, 8192]
+
+# `unique` is the apples-to-apples mode (B distinct prompts, prefix caching off
+# on vllm-metal). `identical` keeps the old behavior (prefix-cache hits) — useful
+# for shared-prefix workloads but not for cross-engine compute comparisons.
+PROMPTS_MODE = "unique"
+for i, a in enumerate(sys.argv):
+    if a == "--prompts" and i + 1 < len(sys.argv):
+        PROMPTS_MODE = sys.argv[i + 1]
+        assert PROMPTS_MODE in ("identical", "unique"), PROMPTS_MODE
+
 VLLM_SWIFT_LIB = REPO / "swift" / ".build" / "arm64-apple-macosx" / "release"
 VLLM_METAL_PYTHON = "/Users/tom/.venv-vllm-metal/bin/python3"
 
 
-def run_vllm_swift(model_path: str) -> dict[int, float]:
-    """Returns {B: tok/s} for vllm-swift bench across all concurrency levels."""
+def run_vllm_swift(model_path: str, prompt_tokens: int = 0) -> dict[int, dict]:
+    """Returns {B: {tps_e2e, tps_decode, prefill_ms}} for vllm-swift bench."""
     cmd = [
         sys.executable,
         str(REPO / "scripts" / "bench_throughput.py"),
         model_path,
         "--tokens", "50",
+        "--prompts", PROMPTS_MODE,
     ]
+    if prompt_tokens > 0:
+        cmd += ["--prompt-tokens", str(prompt_tokens)]
     env = os.environ.copy()
     env["DYLD_LIBRARY_PATH"] = str(VLLM_SWIFT_LIB)
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+    timeout = 600 if prompt_tokens <= 2048 else 1800
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
     out = proc.stdout
-    # Lines like "B=  1: 381.4 tok/s total ..."
+    # Lines like "B=  1: e2e=309.1 decode=309.1 tok/s [prefill=819ms, ...]"
     results = {}
+    pat = re.compile(
+        r"\s*B=\s*(\d+):\s*e2e=([\d,\.]+)\s+decode=([\d,\.]+)\s+tok/s\s*\[prefill=([\d,\.]+)ms"
+    )
     for line in out.splitlines():
-        m = re.match(r"\s*B=\s*(\d+):\s*([\d,\.]+)\s+tok/s", line)
+        m = pat.match(line)
         if m:
             B = int(m.group(1))
-            tps = float(m.group(2).replace(",", ""))
-            results[B] = tps
+            results[B] = {
+                "tps_e2e": float(m.group(2).replace(",", "")),
+                "tps_decode": float(m.group(3).replace(",", "")),
+                "prefill_ms": float(m.group(4).replace(",", "")),
+            }
     return results
 
 
-def run_vllm_metal_one(model_path: str, B: int, timeout: int = 600) -> float | None:
-    """Single B run for vllm-metal. Returns tps or None on failure/timeout."""
+def run_vllm_metal_one(
+    model_path: str, B: int, timeout: int = 600, prompt_tokens: int = 0,
+) -> dict | None:
+    """Single B run for vllm-metal. Returns dict with both metrics or None."""
     cmd = [
         VLLM_METAL_PYTHON,
         "-u",
         str(REPO / "scripts" / "bench_vllm_metal.py"),
         model_path,
         "--worker", str(B),
+        "--prompts", PROMPTS_MODE,
     ]
+    if prompt_tokens > 0:
+        cmd += ["--prompt-tokens", str(prompt_tokens)]
     env = os.environ.copy()
     env["PATH"] = "/Users/tom/.venv-vllm-metal/bin:" + env.get("PATH", "")
     try:
@@ -76,77 +109,112 @@ def run_vllm_metal_one(model_path: str, B: int, timeout: int = 600) -> float | N
     for line in proc.stdout.splitlines():
         if line.startswith("VSM_RESULT_JSON "):
             data = json.loads(line.removeprefix("VSM_RESULT_JSON "))
-            return float(data["tps"])
+            return {
+                "tps_e2e": float(data.get("tps_e2e", data["tps"])),
+                "tps_decode": float(data.get("tps_decode", data.get("tps_e2e", data["tps"]))),
+                "prefill_ms": float(data.get("ttft", 0.0)) * 1000.0,
+            }
     print(f"    [B={B}] no JSON result line", flush=True)
     return None
 
 
-def run_vllm_metal(model_path: str) -> dict[int, float]:
-    """Returns {B: tok/s} for vllm-metal — one subprocess per B, prints per-B."""
+def run_vllm_metal(model_path: str, prompt_tokens: int = 0) -> dict[int, dict]:
+    """Returns {B: {tps_e2e, tps_decode, prefill_ms}} per concurrency level."""
     results = {}
-    # Smaller B should finish in <2 min; large B can take 10+ min.
-    timeouts = {1: 180, 8: 300, 32: 900, 64: 1800}
+    base_timeouts = {1: 180, 8: 300, 32: 900, 64: 1800}
+    multiplier = 1 if prompt_tokens <= 2048 else (3 if prompt_tokens <= 4096 else 6)
     for B in CONCURRENCY:
         t0 = time.perf_counter()
-        tps = run_vllm_metal_one(model_path, B, timeout=timeouts.get(B, 1800))
+        cell = run_vllm_metal_one(
+            model_path, B,
+            timeout=base_timeouts.get(B, 1800) * multiplier,
+            prompt_tokens=prompt_tokens,
+        )
         dt = time.perf_counter() - t0
-        if tps is not None:
-            results[B] = tps
-            print(f"    [B={B}] {tps:,.1f} tok/s ({dt:.1f}s wall)", flush=True)
+        if cell is not None:
+            results[B] = cell
+            print(f"    [B={B}] e2e={cell['tps_e2e']:.1f} decode={cell['tps_decode']:.1f} "
+                  f"prefill={cell['prefill_ms']:.0f}ms ({dt:.1f}s wall)", flush=True)
     return results
 
 
-def main():
-    print(f"=== Baseline matrix (runs/cell={RUNS_PER_CELL}) ===\n")
+def median_of_dicts(samples: list[dict]) -> dict:
+    """Median per metric across a list of {tps_e2e, tps_decode, prefill_ms} dicts."""
+    if not samples:
+        return {}
+    keys = samples[0].keys()
+    return {k: statistics.median([s[k] for s in samples]) for k in keys}
 
-    grid = {}  # {(engine, model): {B: median_tps}}
-    raw = {}   # {(engine, model): {B: [tps...]}}  per-run samples for partial recovery
-    json_path = REPO / "benchmarks" / "baseline-2026-04-25-raw.json"
+
+def main():
+    print(f"=== Baseline matrix (runs/cell={RUNS_PER_CELL}, ctx={PROMPT_TOKEN_SETS}, "
+          f"prompts={PROMPTS_MODE}) ===\n")
+
+    grid = {}  # {(engine, model, p): {B: median_dict}}
+    raw = {}   # {(engine, model, p): {B: [sample_dicts]}}
+    has_long = any(p > 0 for p in PROMPT_TOKEN_SETS)
+    base = "baseline-2026-04-25"
+    suffix = "-unique" if PROMPTS_MODE == "unique" else ""
+    name = f"{base}-longctx{suffix}-raw.json" if has_long else f"{base}{suffix}-raw.json"
+    json_path = REPO / "benchmarks" / name
 
     def flush_json():
-        # Snapshot after every cell so partial data survives crashes.
         snapshot = {
             "runs_per_cell": RUNS_PER_CELL,
             "concurrency": CONCURRENCY,
-            "samples": {f"{e}|{m}": s for (e, m), s in raw.items()},
-            "median": {f"{e}|{m}": g for (e, m), g in grid.items()},
+            "prompt_token_sets": PROMPT_TOKEN_SETS,
+            "prompts_mode": PROMPTS_MODE,
+            "samples": {f"{e}|{m}|p{p}": s for (e, m, p), s in raw.items()},
+            "median": {f"{e}|{m}|p{p}": g for (e, m, p), g in grid.items()},
         }
         json_path.write_text(json.dumps(snapshot, indent=2))
 
     for model in MODELS:
         model_path = os.path.expanduser(f"~/models/{model}")
-        for engine, runner in (("vllm-swift", run_vllm_swift), ("vllm-metal", run_vllm_metal)):
-            print(f"\n[{engine}] {model}")
-            t0 = time.perf_counter()
-            samples: dict[int, list[float]] = {B: [] for B in CONCURRENCY}
-            for r in range(RUNS_PER_CELL):
-                print(f"  run {r+1}/{RUNS_PER_CELL}...", flush=True)
-                tr0 = time.perf_counter()
-                results = runner(model_path)
-                dtr = time.perf_counter() - tr0
-                print(f"    elapsed {dtr:.1f}s — {results}", flush=True)
-                for B, tps in results.items():
-                    samples[B].append(tps)
-                # Flush partial data after every individual run
-                raw[(engine, model)] = samples
+        for prompt_tokens in PROMPT_TOKEN_SETS:
+            for engine, runner in (("vllm-swift", run_vllm_swift), ("vllm-metal", run_vllm_metal)):
+                tag = f"p{prompt_tokens}" if prompt_tokens > 0 else "short"
+                print(f"\n[{engine}] {model} ctx={tag}")
+                t0 = time.perf_counter()
+                samples: dict[int, list[dict]] = {B: [] for B in CONCURRENCY}
+                for r in range(RUNS_PER_CELL):
+                    print(f"  run {r+1}/{RUNS_PER_CELL}...", flush=True)
+                    tr0 = time.perf_counter()
+                    results = runner(model_path, prompt_tokens=prompt_tokens)
+                    dtr = time.perf_counter() - tr0
+                    print(f"    elapsed {dtr:.1f}s — {results}", flush=True)
+                    for B, cell in results.items():
+                        samples[B].append(cell)
+                    raw[(engine, model, prompt_tokens)] = samples
+                    flush_json()
+                medians = {B: median_of_dicts(s) for B, s in samples.items() if s}
+                grid[(engine, model, prompt_tokens)] = medians
                 flush_json()
-            medians = {B: statistics.median(s) for B, s in samples.items() if s}
-            grid[(engine, model)] = medians
-            flush_json()
-            dt = time.perf_counter() - t0
-            print(f"  done in {dt:.1f}s — {medians}", flush=True)
+                dt = time.perf_counter() - t0
+                print(f"  done in {dt:.1f}s", flush=True)
 
-    # Markdown output
+    # Markdown output — emit both metrics
     print("\n\n## Results\n")
-    for model in MODELS:
-        print(f"### {model}\n")
-        print(f"| Engine | B=1 | B=8 | B=32 | B=64 |")
-        print(f"|---|---:|---:|---:|---:|")
-        for engine in ("vllm-swift", "vllm-metal"):
-            cells = grid.get((engine, model), {})
-            row = " | ".join(f"{cells[B]:,.1f}" if B in cells else "—" for B in CONCURRENCY)
-            print(f"| {engine} | {row} |")
-        print()
+    for metric_label, key in [("e2e tok/s", "tps_e2e"), ("decode tok/s", "tps_decode"),
+                              ("prefill ms", "prefill_ms")]:
+        print(f"\n### {metric_label}\n")
+        for model in MODELS:
+            for prompt_tokens in PROMPT_TOKEN_SETS:
+                tag = f"p={prompt_tokens}" if prompt_tokens > 0 else "short"
+                print(f"\n#### {model} ({tag})\n")
+                print("| Engine | B=1 | B=8 | B=32 | B=64 |")
+                print("|---|---:|---:|---:|---:|")
+                for engine in ("vllm-swift", "vllm-metal"):
+                    cells = grid.get((engine, model, prompt_tokens), {})
+                    row_cells = []
+                    for B in CONCURRENCY:
+                        if B in cells and key in cells[B]:
+                            v = cells[B][key]
+                            row_cells.append(f"{v:,.0f}" if key == "prefill_ms" else f"{v:,.1f}")
+                        else:
+                            row_cells.append("—")
+                    print(f"| {engine} | {' | '.join(row_cells)} |")
+            print()
 
 
 if __name__ == "__main__":
