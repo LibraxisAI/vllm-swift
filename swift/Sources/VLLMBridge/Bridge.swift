@@ -423,7 +423,13 @@ public func vsm_engine_decode_all(
         guard let engine = engines[handle] else { return Int32(0) }
 
         let start = CFAbsoluteTimeGetCurrent()
-        let rids = Array(engine.sessions.keys.prefix(Int(maxReqs)))
+        // Pull active rids from sessions, falling back to batchSlots when the
+        // batched-prefill path was used (it skips per-request session setup
+        // because RequestSession requires a TokenIterator we don't have).
+        var rids = Array(engine.sessions.keys.prefix(Int(maxReqs)))
+        if rids.isEmpty && !engine.batchSlots.isEmpty {
+            rids = Array(engine.batchSlots.keys.prefix(Int(maxReqs)))
+        }
         guard !rids.isEmpty else { return Int32(0) }
 
         // Fully batched path for Qwen3 with BatchedKVCache
@@ -958,6 +964,259 @@ public func vsm_engine_reset(_ handle: UnsafeMutableRawPointer?) {
     engineQueue.sync {
         guard let engine = engines[handle] else { return }
         engine.sessions.removeAll()
+    }
+}
+
+/// Test-only: run B sequential single-prompt prefills and capture the top-K
+/// logits from the last prefill forward of each. Mirrors the chunked
+/// `prepare` + `step` pattern that `TokenIterator` uses, but NOT the extra
+/// `iterator.next()` advance — we want the prefill-exit logits, not the
+/// next-decode-step logits, so the comparison vs `prefill_batched_uniform`
+/// is at the same conceptual point in the model's compute graph.
+///
+/// Buffer layout: `outIndices`/`outValues` are flat `[B*K]` row-major
+/// (slot i's top-K starts at `i*K`). `outValues` is float32 logits.
+@_cdecl("vsm_engine_prefill_seq_uniform_topk")
+public func vsm_engine_prefill_seq_uniform_topk(
+    _ handle: UnsafeMutableRawPointer?,
+    promptTokens: UnsafePointer<Int32>?,
+    numReqs: Int32,
+    promptLen: Int32,
+    K: Int32,
+    outIndices: UnsafeMutablePointer<Int32>?,
+    outValues: UnsafeMutablePointer<Float>?
+) -> Int32 {
+    guard let handle, let promptTokens, let outIndices, let outValues else { return -1 }
+    let B = Int(numReqs)
+    let T = Int(promptLen)
+    let k = Int(K)
+    guard B > 0, T > 0, k > 0 else { return -1 }
+
+    return engineQueue.sync { () -> Int32 in
+        guard let engine = engines[handle] else { return -1 }
+        guard let qwenModel = engine.model as? Qwen3Model else { return -2 }
+        let lmModel: any LanguageModel = qwenModel
+
+        let intArr = UnsafeBufferPointer(start: promptTokens, count: B * T)
+
+        for slot in 0..<B {
+            let slotTokens: [Int] = (0..<T).map { Int(intArr[slot * T + $0]) }
+            let slotInput = MLXArray(slotTokens).reshaped(1, T)
+            guard let caches = qwenModel.newCache(parameters: nil) as [KVCache]? else { return -3 }
+            if T > 1 {
+                let prefillChunk = slotInput[0..., ..<(T - 1)]
+                _ = lmModel(LMInput.Text(tokens: prefillChunk), cache: caches, state: nil)
+            }
+            let lastTok = slotInput[0..., (T - 1)..<T]
+            let stepOut = lmModel(LMInput.Text(tokens: lastTok), cache: caches, state: nil)
+            let lastLogits = stepOut.logits[0..., -1, 0...]  // [1, V]
+
+            let sorted = MLX.argSort(lastLogits, axis: -1)
+            let vocab = lastLogits.dim(1)
+            let topIdx = sorted[0..., (vocab - k)..<vocab]   // [1, K]
+            let topVal = takeAlong(lastLogits, topIdx, axis: -1)  // [1, K]
+            eval(topIdx, topVal)
+
+            for j in 0..<k {
+                outIndices[slot * k + j] = topIdx[0, j].item(Int32.self)
+                outValues[slot * k + j] = topVal[0, j].item(Float.self)
+            }
+        }
+        return Int32(B)
+    }
+}
+
+/// Test-only batched analogue of `prefill_seq_uniform_topk`. Same chunked
+/// `[B, T-1]` + `[B, 1]` pattern, single forward per chunk for all B
+/// requests. Captures top-K logits at the same prefill-exit point so the
+/// two functions can be compared apples-to-apples.
+@_cdecl("vsm_engine_prefill_batched_uniform_topk")
+public func vsm_engine_prefill_batched_uniform_topk(
+    _ handle: UnsafeMutableRawPointer?,
+    promptTokens: UnsafePointer<Int32>?,
+    numReqs: Int32,
+    promptLen: Int32,
+    K: Int32,
+    outIndices: UnsafeMutablePointer<Int32>?,
+    outValues: UnsafeMutablePointer<Float>?
+) -> Int32 {
+    guard let handle, let promptTokens, let outIndices, let outValues else { return -1 }
+    let B = Int(numReqs)
+    let T = Int(promptLen)
+    let k = Int(K)
+    guard B > 0, T > 0, k > 0 else { return -1 }
+
+    return engineQueue.sync { () -> Int32 in
+        guard let engine = engines[handle] else { return -1 }
+        guard let qwenModel = engine.model as? Qwen3Model else { return -2 }
+        let lmModel: any LanguageModel = qwenModel
+
+        let intArr = UnsafeBufferPointer(start: promptTokens, count: B * T)
+        let tokens: [Int] = intArr.map { Int($0) }
+        let inputBatch = MLXArray(tokens).reshaped(B, T)
+
+        guard let caches = qwenModel.newCache(parameters: nil) as [KVCache]? else { return -3 }
+        if T > 1 {
+            let prefillChunk = inputBatch[0..., ..<(T - 1)]
+            _ = lmModel(LMInput.Text(tokens: prefillChunk), cache: caches, state: nil)
+        }
+        let lastTok = inputBatch[0..., (T - 1)..<T]  // [B, 1]
+        let stepOut = lmModel(LMInput.Text(tokens: lastTok), cache: caches, state: nil)
+        let lastLogits = stepOut.logits[0..., -1, 0...]  // [B, V]
+
+        let sorted = MLX.argSort(lastLogits, axis: -1)
+        let vocab = lastLogits.dim(1)
+        let topIdx = sorted[0..., (vocab - k)..<vocab]   // [B, K]
+        let topVal = takeAlong(lastLogits, topIdx, axis: -1)  // [B, K]
+        eval(topIdx, topVal)
+
+        for slot in 0..<B {
+            for j in 0..<k {
+                outIndices[slot * k + j] = topIdx[slot, j].item(Int32.self)
+                outValues[slot * k + j] = topVal[slot, j].item(Float.self)
+            }
+        }
+        return Int32(B)
+    }
+}
+
+/// Batched prefill — uniform prompt length only (M1).
+///
+/// Replaces the sequential pattern of `B × prefill_req` + `init_batched`
+/// with a single `[B, T]` forward through the model. The mlx-lm Python
+/// equivalent and vllm-swift sequential both take ~23-27s for B=64/T=2048
+/// on 4B (compute-bound on per-request prefill). This path collapses the
+/// 64 sequential forwards into one batched forward.
+///
+/// `reqIds`: array of B null-terminated request ID strings.
+/// `promptTokens`: flattened [B*T] int32 buffer, row-major (request i at offset i*T).
+/// All requests use the same prompt length T (variable-length deferred to M4).
+///
+/// Returns 0 on success, negative on failure.
+@_cdecl("vsm_engine_prefill_batched_uniform")
+public func vsm_engine_prefill_batched_uniform(
+    _ handle: UnsafeMutableRawPointer?,
+    reqIds: UnsafePointer<UnsafePointer<CChar>?>?,
+    promptTokens: UnsafePointer<Int32>?,
+    numReqs: Int32,
+    promptLen: Int32,
+    temperature: Float,
+    topP: Float
+) -> Int32 {
+    guard let handle, let reqIds, let promptTokens else { return -1 }
+    let B = Int(numReqs)
+    let T = Int(promptLen)
+    guard B > 0, T > 0 else { return -1 }
+
+    return engineQueue.sync { () -> Int32 in
+        guard let engine = engines[handle] else { return -1 }
+        guard let qwenModel = engine.model as? Qwen3Model else { return -2 }
+
+        // Read req IDs out before any compute (clearer error path).
+        var rids = [String]()
+        rids.reserveCapacity(B)
+        for i in 0..<B {
+            guard let cstr = reqIds[i] else { return -3 }
+            rids.append(String(cString: cstr))
+        }
+
+        // Build [B, T] input from flattened prompt buffer.
+        let totalTokens = B * T
+        let intArr = UnsafeBufferPointer(start: promptTokens, count: totalTokens)
+        let tokens: [Int] = intArr.map { Int($0) }
+        let inputBatch = MLXArray(tokens).reshaped(B, T)
+
+        // Fresh per-layer caches. KVCacheSimple holds [B, kvHeads, T, headDim]
+        // after a single batched forward — same shape as the existing
+        // BatchedKVCache layout, so the copy step below is a slice assign.
+        guard let caches = qwenModel.newCache(parameters: nil) as [KVCache]? else { return -4 }
+        let numLayers = caches.count
+
+        // Mirror TokenIterator's prepare + step + iterator.next() pattern so
+        // batchTokens here matches what sequential prefill_req leaves on the
+        // session. Sequential does:
+        //   1. prepare: forward [1, T-1] (populate cache)
+        //   2. step: forward [1, 1] (last prompt token) → first sampled token
+        //   3. iterator.next(): forward [1, 1] (first token) → SECOND token,
+        //      and init_batched reads `session.iterator.y` which is the second.
+        // Skip step 3 and the per-request first decode token differs from the
+        // sequential bench, so we'd report a divergence that isn't a real bug.
+        let lmModel: any LanguageModel = qwenModel
+        if T > 1 {
+            let prefillChunk = inputBatch[0..., ..<(T - 1)]
+            _ = lmModel(LMInput.Text(tokens: prefillChunk), cache: caches, state: nil)
+        }
+        let lastPromptTokens = inputBatch[0..., (T - 1)..<T]  // [B, 1]
+        let firstStepOut = lmModel(
+            LMInput.Text(tokens: lastPromptTokens), cache: caches, state: nil)
+        let firstLogits = firstStepOut.logits[0..., -1, 0...]  // [B, V]
+        let firstSampled = argMax(firstLogits, axis: -1)       // [B]
+        eval(firstSampled)
+        // Advance one more step (iterator.next() equivalent) — the second
+        // sampled token is what init_batched ultimately stashes.
+        let secondInput = firstSampled.reshaped(B, 1)
+        let secondStepOut = lmModel(
+            LMInput.Text(tokens: secondInput), cache: caches, state: nil)
+        let secondLogits = secondStepOut.logits[0..., -1, 0...]
+        let firstTokens = argMax(secondLogits, axis: -1)        // [B]
+        eval(firstTokens)
+
+        // Read K/V from prefilled caches and pull dimensions for BatchedKVCache.
+        // After prepare + step + iterator.next() equivalent, the cache holds
+        // T+1 tokens (prompt + first sampled token).
+        guard let firstSimple = caches[0] as? KVCacheSimple,
+              let firstPeek = firstSimple.peek() else { return -5 }
+        let kvHeads = firstPeek.0.dim(1)
+        let headDim = firstPeek.0.dim(3)
+        let cacheLen = firstSimple.offset  // = T + 1
+
+        // Allocate BatchedKVCache sized for prefill + decode margin.
+        let decodeMargin = 512
+        let maxSeq = max(2048, cacheLen + decodeMargin)
+        var bCaches = [BatchedKVCache]()
+        bCaches.reserveCapacity(numLayers)
+        for layer in 0..<numLayers {
+            let bc = BatchedKVCache(
+                maxBatch: max(B, 64), kvHeads: kvHeads, headDim: headDim,
+                maxSeq: maxSeq, dtype: firstPeek.0.dtype
+            )
+            guard let simple = caches[layer] as? KVCacheSimple,
+                  let (k, v) = simple.peek() else { return -6 }
+            // k, v: [B, kvHeads, cacheLen, headDim]
+            bc.keys[..<B, 0..., ..<cacheLen, 0...] = k
+            bc.values[..<B, 0..., ..<cacheLen, 0...] = v
+            for i in 0..<B { bc.offsets[i] = cacheLen }
+            bc.active = B
+            bCaches.append(bc)
+        }
+
+        // Materialize copies and free the per-layer prefill caches.
+        var toEval = [MLXArray]()
+        for c in bCaches {
+            toEval.append(c.keys)
+            toEval.append(c.values)
+        }
+        eval(toEval)
+
+        // Set up engine state for batched decode. Mirrors init_batched.
+        engine.batchedCaches = bCaches
+        engine.batchSlots.removeAll()
+        engine.batchTokens = Array(repeating: 0, count: max(B, 64))
+
+        // Stash sampled first tokens — they're returned by the first decode_all
+        // (same previousY pattern as sequential prefill_req).
+        let firstTokensArr: [Int32] = (0..<B).map { firstTokens[$0].item(Int32.self) }
+        for (slot, rid) in rids.enumerated() {
+            engine.batchSlots[rid] = slot
+            engine.batchTokens[slot] = Int(firstTokensArr[slot])
+        }
+        // Note: RequestSession requires a TokenIterator (sequential-prefill path
+        // produces one). Batched prefill skips that — decode_all's per-request
+        // temperature loop uses `?? 0` default for missing sessions, which is
+        // correct for greedy. Adding a TokenIterator-less session variant is
+        // M5 polish work, not a correctness issue here.
+
+        return 0
     }
 }
 

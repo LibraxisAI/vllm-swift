@@ -19,9 +19,12 @@ from pathlib import Path
 # Parse args
 MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else os.path.expanduser("~/models/Qwen3-4B-4bit")
 MAX_TOKENS = 50
+PROMPT_TOKENS = 0  # 0 = use default short prompt; >0 = pad to N tokens
 for i, arg in enumerate(sys.argv):
     if arg == "--tokens" and i + 1 < len(sys.argv):
         MAX_TOKENS = int(sys.argv[i + 1])
+    if arg == "--prompt-tokens" and i + 1 < len(sys.argv):
+        PROMPT_TOKENS = int(sys.argv[i + 1])
 
 CONCURRENCY_LEVELS = [1, 8, 32, 64]
 
@@ -91,6 +94,13 @@ if not engine:
 
 prompt = "Explain the theory of relativity in detail, covering both special and general relativity:"
 input_ids = tok.encode(prompt)
+if PROMPT_TOKENS > 0:
+    # Pad with repeats of the seed prompt up to PROMPT_TOKENS. Real prompts
+    # vary, but for throughput timing what matters is the prefill+attention
+    # cost at length N, not the content distribution.
+    while len(input_ids) < PROMPT_TOKENS:
+        input_ids.extend(input_ids[: min(len(input_ids), PROMPT_TOKENS - len(input_ids))])
+    input_ids = input_ids[:PROMPT_TOKENS]
 arr = (ctypes.c_int32 * len(input_ids))(*input_ids)
 
 print(f"Prompt: {len(input_ids)} tokens")
@@ -102,13 +112,13 @@ for B in CONCURRENCY_LEVELS:
     # Reset engine state
     lib.vsm_engine_reset(engine)
 
-    # Prefill all requests
+    # Prefill all requests — TIMED so we can report end-to-end alongside decode-only
+    t_prefill = time.perf_counter()
     for i in range(B):
         rid = f"req-{i}".encode()
         lib.vsm_engine_prefill_req(engine, rid, arr, len(input_ids), 0.0, 1.0)
-
-    # Init batched KV cache
     lib.vsm_engine_init_batched(engine)
+    prefill_elapsed = time.perf_counter() - t_prefill
 
     # Decode loop
     req_ids_buf = (ctypes.c_char_p * (B + 1))()
@@ -119,18 +129,24 @@ for B in CONCURRENCY_LEVELS:
     for _ in range(2):
         lib.vsm_engine_decode_all(engine, req_ids_buf, tokens_buf, B + 1)
 
-    # Timed run
+    # Timed run — decode only
     t0 = time.perf_counter()
     for step in range(MAX_TOKENS):
         n = lib.vsm_engine_decode_all(engine, req_ids_buf, tokens_buf, B + 1)
         total_tokens += n
     elapsed = time.perf_counter() - t0
 
-    tps = total_tokens / elapsed if elapsed > 0 else 0
-    per_req = tps / B if B > 0 else 0
+    tps_decode = total_tokens / elapsed if elapsed > 0 else 0
+    # End-to-end mirrors how vllm-metal's bench measures (prefill+decode/total_tokens).
+    # Includes prefill cost so it's apples-to-apples with that bench's headline number.
+    tps_e2e = total_tokens / (prefill_elapsed + elapsed) if (prefill_elapsed + elapsed) > 0 else 0
+    per_req = tps_decode / B if B > 0 else 0
 
-    print(f"B={B:3d}: {tps:,.1f} tok/s total ({per_req:,.1f} per request) [{elapsed:.2f}s]")
-    results.append((B, tps, per_req))
+    print(
+        f"B={B:3d}: e2e={tps_e2e:,.1f} decode={tps_decode:,.1f} tok/s "
+        f"[prefill={prefill_elapsed*1000:.0f}ms, decode={elapsed:.2f}s]"
+    )
+    results.append((B, tps_e2e, tps_decode, prefill_elapsed))
 
     # Cleanup requests
     for i in range(B):
@@ -141,7 +157,7 @@ lib.vsm_engine_destroy(engine)
 # Summary table
 print()
 print(f"=== {os.path.basename(MODEL_PATH)} — vllm-swift bridge direct ===")
-print(f"{'Concurrency':>12} {'Total tok/s':>14} {'Per-request':>14}")
+print(f"{'B':>4} {'E2E tok/s':>11} {'Decode tok/s':>13} {'Prefill ms':>11}")
 print("-" * 44)
-for B, tps, per_req in results:
-    print(f"{B:>12d} {tps:>14,.1f} {per_req:>14,.1f}")
+for B, tps_e2e, tps_decode, prefill in results:
+    print(f"{B:>4d} {tps_e2e:>11,.1f} {tps_decode:>13,.1f} {prefill*1000:>11.0f}")

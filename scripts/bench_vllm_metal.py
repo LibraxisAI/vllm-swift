@@ -33,26 +33,54 @@ MODEL_PATH = (
 )
 MAX_TOKENS = 50
 CONCURRENCY_LEVELS = [1, 8, 32, 64]
+PROMPT_TOKENS = 0  # 0 = use short default; >0 = pad to N tokens
+for i, arg in enumerate(sys.argv):
+    if arg == "--prompt-tokens" and i + 1 < len(sys.argv):
+        PROMPT_TOKENS = int(sys.argv[i + 1])
 
 
-def run_worker(B: int) -> tuple[float, float, int]:
-    """Inside child process: run one concurrency level and return stats."""
-    from vllm import LLM, SamplingParams  # imported here so import cost is per-process
-
-    prompt = (
+def _build_prompt() -> str:
+    """Short default, or padded prompt of approximately PROMPT_TOKENS length.
+    Returns text — vLLM does its own tokenization."""
+    seed = (
         "Explain the theory of relativity in detail, covering both "
         "special and general relativity:"
     )
+    if PROMPT_TOKENS == 0:
+        return seed
+    # ~3 chars per token rule of thumb for English. Pad with seed repetitions
+    # then trim. vLLM will tokenize and truncate to whatever fits.
+    target_chars = PROMPT_TOKENS * 4
+    out = []
+    while sum(len(s) for s in out) < target_chars:
+        out.append(seed)
+    return " ".join(out)
+
+
+def run_worker(B: int) -> dict:
+    """Inside child process: run one concurrency level and return stats.
+
+    Returns both metrics:
+      - tps_e2e:    total_tokens / wall_clock(prefill + decode) — end-to-end
+      - tps_decode: total_tokens / max(per_request decode window) — pure decode rate
+
+    The vllm-swift bridge bench (bench_throughput.py) measures decode-only
+    by construction (prefill happens before t0). Without tps_decode here the
+    cross-engine comparison is unfair at long context, where prefill dominates.
+    """
+    from vllm import LLM, SamplingParams
+
+    prompt = _build_prompt()
+    max_model_len = max(2048, PROMPT_TOKENS + MAX_TOKENS + 256)
 
     llm = LLM(
         model=MODEL_PATH,
         dtype="float16",
-        max_model_len=2048,
+        max_model_len=max_model_len,
         gpu_memory_utilization=0.9,
-        disable_log_stats=True,
+        disable_log_stats=False,  # need RequestStateStats for decode window
     )
 
-    # Warmup (separate from timed run)
     llm.generate(["Hello"], SamplingParams(temperature=0, max_tokens=5))
 
     params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
@@ -62,24 +90,39 @@ def run_worker(B: int) -> tuple[float, float, int]:
     outputs = llm.generate(prompts, params)
     elapsed = time.perf_counter() - t0
     total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
-    tps = total_tokens / elapsed if elapsed > 0 else 0.0
+    tps_e2e = total_tokens / elapsed if elapsed > 0 else 0.0
 
-    # Process exit cleans up EngineCore subprocess + GPU memory
-    return tps, elapsed, total_tokens
+    # Decode window: max across requests (continuous batching → lockstep decode)
+    decode_windows = []
+    ttfts = []
+    for o in outputs:
+        m = getattr(o, "metrics", None)
+        if m and m.first_token_ts and m.last_token_ts:
+            decode_windows.append(m.last_token_ts - m.first_token_ts)
+        if m and getattr(m, "first_token_latency", None):
+            ttfts.append(m.first_token_latency)
+    decode_window = max(decode_windows) if decode_windows else elapsed
+    tps_decode = total_tokens / decode_window if decode_window > 0 else 0.0
+    ttft = max(ttfts) if ttfts else 0.0
+
+    return {
+        "B": B,
+        "tps_e2e": tps_e2e,
+        "tps_decode": tps_decode,
+        "elapsed": elapsed,
+        "decode_window": decode_window,
+        "ttft": ttft,
+        "total_tokens": total_tokens,
+        # back-compat alias — older parsers read "tps"
+        "tps": tps_e2e,
+    }
 
 
 def main_worker():
     """Worker entry: print one JSON line on stdout, exit."""
     B = int(sys.argv[sys.argv.index("--worker") + 1])
-    tps, elapsed, total_tokens = run_worker(B)
-    print(
-        "VSM_RESULT_JSON " + json.dumps({
-            "B": B,
-            "tps": tps,
-            "elapsed": elapsed,
-            "total_tokens": total_tokens,
-        })
-    )
+    result = run_worker(B)
+    print("VSM_RESULT_JSON " + json.dumps(result))
 
 
 def main_orchestrator():
@@ -117,22 +160,26 @@ def main_orchestrator():
             continue
 
         data = json.loads(result_line.removeprefix("VSM_RESULT_JSON "))
-        per_req = data["tps"] / data["B"] if data["B"] > 0 else 0
+        e2e = data.get("tps_e2e", data["tps"])
+        dec = data.get("tps_decode", e2e)
+        ttft = data.get("ttft", 0.0)
         print(
-            f"  B={data['B']:3d}: {data['tps']:,.1f} tok/s total "
-            f"({per_req:,.1f} per request) "
-            f"[{data['elapsed']:.2f}s, {data['total_tokens']} tokens]"
+            f"  B={data['B']:3d}: e2e={e2e:,.1f} decode={dec:,.1f} tok/s "
+            f"[ttft={ttft*1000:.0f}ms, elapsed={data['elapsed']:.2f}s, "
+            f"{data['total_tokens']} tokens]"
         )
         results.append(data)
 
     # Summary table
     print()
     print(f"=== {os.path.basename(MODEL_PATH)} — vllm-metal (Python/MLX) ===")
-    print(f"{'Concurrency':>12} {'Total tok/s':>14} {'Per-request':>14}")
-    print("-" * 44)
+    print(f"{'B':>4} {'E2E tok/s':>11} {'Decode tok/s':>13} {'TTFT ms':>9}")
+    print("-" * 42)
     for r in results:
-        per_req = r["tps"] / r["B"] if r["B"] > 0 else 0
-        print(f"{r['B']:>12d} {r['tps']:>14,.1f} {per_req:>14,.1f}")
+        e2e = r.get("tps_e2e", r["tps"])
+        dec = r.get("tps_decode", e2e)
+        ttft = r.get("ttft", 0.0)
+        print(f"{r['B']:>4d} {e2e:>11,.1f} {dec:>13,.1f} {ttft*1000:>9.0f}")
 
 
 if __name__ == "__main__":
