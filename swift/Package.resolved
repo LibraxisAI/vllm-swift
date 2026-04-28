@@ -7,7 +7,7 @@
       "location" : "https://github.com/ekryski/mlx-swift",
       "state" : {
         "branch" : "alpha",
-        "revision" : "8ae1a12754ea8902c1f19e9e1905e957cdcc2065"
+        "revision" : "6d5208fff4979f68e9e14e1139db17f28b63d5f3"
       }
     },
     {
@@ -16,7 +16,7 @@
       "location" : "https://github.com/TheTom/mlx-swift-lm.git",
       "state" : {
         "branch" : "alpha",
-        "revision" : "3cf0b948096c5e9b1001250fdff33df1333c37ab"
+        "revision" : "7ae852a9a74fa7c5aafd024a9fca5f8b6b8bf911"
       }
     },
     {

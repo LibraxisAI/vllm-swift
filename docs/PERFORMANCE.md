@@ -121,9 +121,47 @@ DYLD_LIBRARY_PATH=swift/.build/arm64-apple-macosx/release \
 - **PagedAttention foundation.** `PagedKVCache` + `BlockAllocator` mirror vllm-metal's block-based layout. Foundation committed; Metal kernel port pending.
 - **Long-context median-of-3.** Single-sample numbers above will be replaced with median-of-3 measurements before any external comparison claims.
 
+## v0.3.0 candidate — Metal race fix and TurboQuant MoE recovery
+
+After landing the `MTL::Buffer` retain commit (mirrors `ml-explore/mlx#3461 / #3462`), the swift-side `stopGradient + asyncEval` boundary in `compressedAttention` is no longer load-bearing and was removed. Both changes together:
+
+| cell | v0.2.2 | v0.3.0 candidate | Δ |
+|---|---:|---:|---:|
+| Qwen3.5-35B-A3B B=16 4K turbo4v2 | 119.5 | **120.1** | +0.5% |
+| Qwen3.5-35B-A3B B=17 4K turbo4v2 | 108.7 | **119.9** | **+10.3%** |
+| Qwen3.5-35B-A3B B=32 4K turbo4v2 | 111.2 | **119.5** | **+7.5%** |
+
+Stability: 25/25 across the three cells under retain alone — no swift-side boundary needed.
+
+Compression at long context (Qwen3.5 2B, `KV_fp16 / KV_compressed`):
+
+| ctx | turbo4 | turbo3 | turbo2 | turbo4v2 |
+|---|---:|---:|---:|---:|
+| 8K | 2.94× | 3.66× | 4.61× | 3.66× |
+| 32K | 3.58× | 4.64× | 6.46× | 4.64× |
+| 64K | **3.74×** | **4.86×** | **6.95×** | **4.86×** |
+
+64K is within 1–3% of the documented asymptote (3.8× / 4.9× / 7.1× / 4.9×).
+
+vllm-swift bridge identical-prompt baseline (matches README headline format) — no regression vs v0.2.2:
+
+| | B=1 | B=8 | B=32 | B=64 |
+|---|---:|---:|---:|---:|
+| Qwen3-0.6B (v0.3.0) | 403 | 1,541 | 2,844 | 3,264 |
+| Qwen3-0.6B (v0.2.2) | 364 | 1,527 | 2,859 | 3,425 |
+| Qwen3-4B (v0.3.0) | 156 | 482 | 1,191 | 1,493 |
+| Qwen3-4B (v0.2.2) | 147 | 477 | 1,194 | 1,518 |
+
+All deltas inside single-sample run-to-run noise.
+
+Initial DeepSeek-V4 foundation: `model_type: deepseek_v4` dispatches in the bridge; DSV4-Flash-2bit-DQ (90 GB) loads cleanly on M5 Max. Forward pass is not yet production-stable (Phase 1 GPU kernel timeout) — released as foundation only.
+
+Full matrix and methodology: [benchmarks/baseline-2026-04-28.md](../benchmarks/baseline-2026-04-28.md).
+
 ## Date-locked snapshots
 
-- [benchmarks/baseline-2026-04-26.md](../benchmarks/baseline-2026-04-26.md) — unique-prompts apples-to-apples, post-OOM-fix capacity verification, decode-only and e2e per cell, 5-37× decode wins at long ctx
+- [benchmarks/baseline-2026-04-28.md](../benchmarks/baseline-2026-04-28.md) — v0.3.0 candidate: Metal race fix, TurboQuant MoE +10% at B≥17, compression at 64K, DeepSeek-V4 dispatch foundation
+- [benchmarks/baseline-2026-04-26.md](../benchmarks/baseline-2026-04-26.md) — v0.2.2 release: unique-prompts apples-to-apples, post-OOM-fix capacity verification, decode-only and e2e per cell, 5-37× decode wins at long ctx
 - [benchmarks/baseline-2026-04-25.md](../benchmarks/baseline-2026-04-25.md) — original short-ctx + long-ctx matrix, methodology, vs-README diff, attention microbench (long-ctx cells superseded by 2026-04-26)
 - Raw JSON cell data: [benchmarks/baseline-2026-04-25-*.json](../benchmarks/)
 

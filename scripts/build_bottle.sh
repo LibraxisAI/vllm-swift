@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.2"
+VERSION="0.3.0"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 SWIFT_DIR="$PROJECT_DIR/swift"
@@ -139,7 +139,7 @@ print(f'Downloaded to {p}')
     echo "Update complete."
     ;;
   version)
-    echo "vllm-swift 0.2.2"
+    echo "vllm-swift 0.3.0"
     echo "dylib: $PREFIX/lib/libVLLMBridge.dylib"
     [ -d "$VENV_DIR" ] && "$VENV_DIR/bin/python3" -c "import vllm; print(f'vLLM: {vllm.__version__}')" 2>/dev/null
     ;;
@@ -166,18 +166,27 @@ cd /tmp/vllm-swift-bottle
 tar czf "/tmp/$BOTTLE_TAR" vllm-swift/
 echo "Bottle: /tmp/$BOTTLE_TAR ($(du -h "/tmp/$BOTTLE_TAR" | cut -f1))"
 
-# Upload to GitHub Releases
-echo ""
-echo "Uploading to GitHub Releases..."
-gh release create bottles --repo TheTom/homebrew-tap \
-    --title "Bottles" --notes "Prebuilt Homebrew bottles for vllm-swift" 2>/dev/null || true
-gh release upload bottles "/tmp/$BOTTLE_TAR" --repo TheTom/homebrew-tap --clobber
+# Upload to GitHub Releases (skip with NO_UPLOAD=1 for prep-only builds)
+if [ "${NO_UPLOAD:-0}" = "1" ]; then
+    echo ""
+    echo "NO_UPLOAD=1 set — skipping GitHub Releases upload (bottle remains at /tmp/$BOTTLE_TAR)."
+else
+    echo ""
+    echo "Uploading to GitHub Releases..."
+    gh release create bottles --repo TheTom/homebrew-tap \
+        --title "Bottles" --notes "Prebuilt Homebrew bottles for vllm-swift" 2>/dev/null || true
+    gh release upload bottles "/tmp/$BOTTLE_TAR" --repo TheTom/homebrew-tap --clobber
+fi
 
 # Compute SHA for formula
 SHA=$(shasum -a 256 "/tmp/$BOTTLE_TAR" | awk '{print $1}')
 echo ""
 echo "=== Done ==="
-echo "Bottle uploaded to: https://github.com/TheTom/homebrew-tap/releases/tag/bottles"
+if [ "${NO_UPLOAD:-0}" = "1" ]; then
+    echo "Bottle built (not uploaded): /tmp/$BOTTLE_TAR"
+else
+    echo "Bottle uploaded to: https://github.com/TheTom/homebrew-tap/releases/tag/bottles"
+fi
 echo ""
 echo "Add this to Formula/vllm-swift.rb after 'license' line:"
 echo ""
