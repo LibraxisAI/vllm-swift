@@ -12,9 +12,12 @@ let package = Package(
         ),
     ],
     dependencies: [
-        // Pinned snapshot of alpha branch with BatchedKVCache + TurboQuant+
-                // For local dev: .package(path: "/Users/tom/dev/mlx-swift-lm")
-        .package(url: "https://github.com/TheTom/mlx-swift-lm.git", branch: "alpha"),
+        // Frozen snapshot of mlx-swift-lm. The `vllm-swift-stable` branch on
+        // TheTom/mlx-swift-lm is force-pushed at release time to capture the
+        // exact alpha tip (plus any local cherry-picks) we tested. Alpha keeps
+        // moving; vllm-swift-stable does not until the next release.
+        // For local dev: .package(path: "/Users/tom/dev/mlx-swift-lm")
+        .package(url: "https://github.com/TheTom/mlx-swift-lm.git", branch: "vllm-swift-stable"),
     ],
     targets: [
         .target(
