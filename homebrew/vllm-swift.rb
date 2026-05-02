@@ -85,7 +85,14 @@ class VllmSwift < Formula
       case "${1:-}" in
         serve)
           shift
-          exec "$VENV_PYTHON" -m vllm.entrypoints.openai.api_server "$@"
+          # README documents `vllm-swift serve <model> [args]` — the model is
+          # the first positional. vllm.entrypoints.openai.api_server takes
+          # --model X as a flag, NOT a positional, so without this rewrite
+          # the path was getting silently dropped and vLLM was falling back
+          # to its placeholder default (Qwen/Qwen3-0.6B). See #11.
+          MODEL="${1:?Usage: vllm-swift serve <model-path-or-hf-id> [vllm args...]}"
+          shift
+          exec "$VENV_PYTHON" -m vllm.entrypoints.openai.api_server --model "$MODEL" "$@"
           ;;
         download)
           shift

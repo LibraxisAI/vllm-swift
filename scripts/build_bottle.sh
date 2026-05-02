@@ -112,7 +112,14 @@ case "${1:-}" in
   serve)
     _ensure_venv
     shift
-    exec "$VENV_DIR/bin/python3" -m vllm.entrypoints.openai.api_server "$@"
+    # README documents `vllm-swift serve <model> [args]` — the model is the first
+    # positional. vllm.entrypoints.openai.api_server's argparse maps a stray
+    # positional to the deprecated `model_tag` slot, NOT to ModelConfig.model,
+    # so without this rewrite the user's path was getting silently dropped and
+    # vLLM was falling back to its placeholder default (Qwen/Qwen3-0.6B). See #11.
+    MODEL="${1:?Usage: vllm-swift serve <model-path-or-hf-id> [vllm args...]}"
+    shift
+    exec "$VENV_DIR/bin/python3" -m vllm.entrypoints.openai.api_server --model "$MODEL" "$@"
     ;;
   download)
     _ensure_venv
