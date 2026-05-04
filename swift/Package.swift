@@ -32,5 +32,10 @@ let package = Package(
                 .unsafeFlags(["-parse-as-library"]),
             ]
         ),
+        .testTarget(
+            name: "VLLMBridgeTests",
+            dependencies: [],
+            path: "Tests/VLLMBridgeTests"
+        ),
     ]
 )
