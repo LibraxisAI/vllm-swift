@@ -92,7 +92,28 @@ class VllmSwift < Formula
           # to its placeholder default (Qwen/Qwen3-0.6B). See #11.
           MODEL="${1:?Usage: vllm-swift serve <model-path-or-hf-id> [vllm args...]}"
           shift
-          exec "$VENV_PYTHON" -m vllm.entrypoints.openai.api_server --model "$MODEL" "$@"
+          # Smart defaults: auto-inject --enable-auto-tool-choice and --tool-call-parser
+          # if user didn't pass them and the model architecture maps to a known parser.
+          # Hermes (the agent client) and most OpenAI clients send tool_choice=auto by
+          # default; vLLM rejects that without these flags. Detection is conservative:
+          # only injects when both architecture mapping AND chat-template tool fields
+          # are present, so non-tool-capable models don't get a spurious parser.
+          EXTRA_ARGS=()
+          HAS_TOOL_FLAG=0
+          for arg in "$@"; do
+            case "$arg" in
+              --tool-call-parser|--tool-call-parser=*|--enable-auto-tool-choice|--no-enable-auto-tool-choice) HAS_TOOL_FLAG=1 ;;
+            esac
+          done
+          if [ "$HAS_TOOL_FLAG" = 0 ]; then
+            PARSER=$("$VENV_PYTHON" "#{libexec}/scripts/detect_tool_parser.py" "$MODEL" 2>/dev/null)
+            if [ -n "$PARSER" ]; then
+              echo "vllm-swift: auto-detected tool parser '$PARSER' for $(basename "$MODEL"); injecting --enable-auto-tool-choice --tool-call-parser $PARSER"
+              echo "  (override with explicit --tool-call-parser <name> or --no-enable-auto-tool-choice)"
+              EXTRA_ARGS+=(--enable-auto-tool-choice --tool-call-parser "$PARSER")
+            fi
+          fi
+          exec "$VENV_PYTHON" -m vllm.entrypoints.openai.api_server --model "$MODEL" "${EXTRA_ARGS[@]}" "$@"
           ;;
         download)
           shift
