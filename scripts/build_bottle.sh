@@ -56,6 +56,7 @@ METALLIB=$(find .build -name "mlx.metallib" -print -quit 2>/dev/null)
 cp "$PROJECT_DIR"/vllm_swift/*.py "$BOTTLE_DIR/libexec/vllm_swift/"
 cp "$PROJECT_DIR/pyproject.toml" "$BOTTLE_DIR/libexec/"
 cp "$PROJECT_DIR"/scripts/*.sh "$BOTTLE_DIR/libexec/scripts/" 2>/dev/null || true
+cp "$PROJECT_DIR"/scripts/detect_tool_parser.py "$BOTTLE_DIR/libexec/scripts/" 2>/dev/null || true
 
 # Wrapper script
 cat > "$BOTTLE_DIR/bin/vllm-swift" << 'WRAPPER'
@@ -119,7 +120,26 @@ case "${1:-}" in
     # vLLM was falling back to its placeholder default (Qwen/Qwen3-0.6B). See #11.
     MODEL="${1:?Usage: vllm-swift serve <model-path-or-hf-id> [vllm args...]}"
     shift
-    exec "$VENV_DIR/bin/python3" -m vllm.entrypoints.openai.api_server --model "$MODEL" "$@"
+    # Smart defaults: auto-inject --enable-auto-tool-choice and --tool-call-parser
+    # when the model architecture maps to a known parser and the user didn't pass
+    # either flag. Saves the "tool_choice=auto requires --enable-auto-tool-choice"
+    # 400 from vLLM when calling from Hermes / standard OpenAI clients.
+    EXTRA_ARGS=()
+    HAS_TOOL_FLAG=0
+    for arg in "$@"; do
+      case "$arg" in
+        --tool-call-parser|--tool-call-parser=*|--enable-auto-tool-choice|--no-enable-auto-tool-choice) HAS_TOOL_FLAG=1 ;;
+      esac
+    done
+    if [ "$HAS_TOOL_FLAG" = 0 ] && [ -f "$PREFIX/libexec/scripts/detect_tool_parser.py" ]; then
+      PARSER=$("$VENV_DIR/bin/python3" "$PREFIX/libexec/scripts/detect_tool_parser.py" "$MODEL" 2>/dev/null)
+      if [ -n "$PARSER" ]; then
+        echo "vllm-swift: auto-detected tool parser '$PARSER' for $(basename "$MODEL"); injecting --enable-auto-tool-choice --tool-call-parser $PARSER"
+        echo "  (override with explicit --tool-call-parser <name> or --no-enable-auto-tool-choice)"
+        EXTRA_ARGS+=(--enable-auto-tool-choice --tool-call-parser "$PARSER")
+      fi
+    fi
+    exec "$VENV_DIR/bin/python3" -m vllm.entrypoints.openai.api_server --model "$MODEL" "${EXTRA_ARGS[@]}" "$@"
     ;;
   download)
     _ensure_venv
