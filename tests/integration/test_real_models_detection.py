@@ -36,7 +36,12 @@ EXPECTED: tuple[tuple[str, str, str, str], ...] = (
     # so detector relies on the directory-name discriminator to bump
     # hermes -> qwen3_coder. tokenizer_config.json has <think>/</think> as
     # special tokens, so reasoning detector correctly fires too.
-    ("Qwen3-Coder-30B-A3B-Instruct-MLX-6bit", "qwen3_coder", "qwen3", "Qwen3-Coder MLX (arch: Qwen3MoeForCausalLM)"),
+    (
+        "Qwen3-Coder-30B-A3B-Instruct-MLX-6bit",
+        "qwen3_coder",
+        "qwen3",
+        "Qwen3-Coder MLX (arch: Qwen3MoeForCausalLM)",
+    ),
     ("Qwen2.5-3B-Instruct-4bit", "hermes", "", "Qwen2.5 (no native reasoning)"),
     # ===== Nemotron =====
     ("Nemotron-Cascade-2-30B-A3B-4bit", "hermes", "qwen3", "Nemotron-Cascade Qwen3.6 derivative"),
@@ -61,7 +66,12 @@ EXPECTED: tuple[tuple[str, str, str, str], ...] = (
     # checks for, so the tool injection is correctly suppressed. The template
     # DOES include <think>/</think> markers, so the reasoning detector fires.
     # TODO: extend `_has_tool_template` to recognize the unicode `<｜tool` variant.
-    ("DeepSeek-V4-Flash-2bit-DQ", "", "deepseek_v3", "DeepSeek V4 2bit-DQ — unicode tool markers, standard <think>"),
+    (
+        "DeepSeek-V4-Flash-2bit-DQ",
+        "",
+        "deepseek_v3",
+        "DeepSeek V4 2bit-DQ - unicode tool markers, standard <think>",
+    ),
 )
 
 
