@@ -14,7 +14,13 @@ import sys
 from pathlib import Path
 
 from vllm_swift import __version__
+from vllm_swift.detect_reasoning_parser import detect_parser as detect_reasoning_parser
 from vllm_swift.detect_tool_parser import detect_parser
+from vllm_swift.known_parser_issues import (
+    combo_caveats,
+    reasoning_parser_caveats,
+    tool_parser_caveats,
+)
 
 
 def _lib_dir() -> Path:
@@ -30,17 +36,34 @@ def _prepare_dyld_env() -> dict[str, str]:
     return env
 
 
-def _has_tool_flag(args: list[str]) -> bool:
-    targets = (
-        "--tool-call-parser",
-        "--enable-auto-tool-choice",
-        "--no-enable-auto-tool-choice",
-    )
+def _has_flag(args: list[str], targets: tuple[str, ...]) -> bool:
     for arg in args:
         for t in targets:
             if arg == t or arg.startswith(t + "="):
                 return True
     return False
+
+
+def _has_tool_flag(args: list[str]) -> bool:
+    return _has_flag(
+        args,
+        (
+            "--tool-call-parser",
+            "--enable-auto-tool-choice",
+            "--no-enable-auto-tool-choice",
+        ),
+    )
+
+
+def _has_reasoning_flag(args: list[str]) -> bool:
+    return _has_flag(
+        args,
+        (
+            "--reasoning-parser",
+            "--enable-reasoning",
+            "--no-enable-reasoning",
+        ),
+    )
 
 
 def _extract_model(args: list[str]) -> str | None:
@@ -69,10 +92,12 @@ def _serve(args: list[str]) -> int:
         model = _extract_model(args) or ""
         passthrough = args
     auto_args: list[str] = []
+    short = os.path.basename(model.rstrip("/")) if model else ""
+    injected_tool: str = ""
+    injected_reasoning: str = ""
     if model and not _has_tool_flag(passthrough):
         parser = detect_parser(model)
         if parser:
-            short = os.path.basename(model.rstrip("/"))
             print(
                 f"vllm-swift: auto-detected tool parser '{parser}' for {short}; "
                 f"injecting --enable-auto-tool-choice --tool-call-parser {parser}"
@@ -81,7 +106,35 @@ def _serve(args: list[str]) -> int:
                 "  (override with explicit --tool-call-parser <name> or "
                 "--no-enable-auto-tool-choice)"
             )
-            auto_args = ["--enable-auto-tool-choice", "--tool-call-parser", parser]
+            for summary, url, mit in tool_parser_caveats(parser):
+                print(f"  ! known issue [{parser}]: {summary} ({url})")
+                if mit:
+                    print(f"    mitigation: {mit}")
+            auto_args += ["--enable-auto-tool-choice", "--tool-call-parser", parser]
+            injected_tool = parser
+    if model and not _has_reasoning_flag(passthrough):
+        rparser = detect_reasoning_parser(model)
+        if rparser:
+            print(
+                f"vllm-swift: auto-detected reasoning parser '{rparser}' for {short}; "
+                f"injecting --reasoning-parser {rparser}"
+            )
+            print(
+                "  (override with explicit --reasoning-parser <name> or "
+                "--no-enable-reasoning)"
+            )
+            for summary, url, mit in reasoning_parser_caveats(rparser):
+                print(f"  ! known issue [{rparser}]: {summary} ({url})")
+                if mit:
+                    print(f"    mitigation: {mit}")
+            auto_args += ["--reasoning-parser", rparser]
+            injected_reasoning = rparser
+    if injected_reasoning and injected_tool:
+        for summary, url, mit in combo_caveats(injected_reasoning, injected_tool):
+            print(f"  ! known combo issue [{injected_reasoning}+{injected_tool}]: {summary}")
+            print(f"    {url}")
+            if mit:
+                print(f"    mitigation: {mit}")
     cmd = [
         sys.executable,
         "-m",

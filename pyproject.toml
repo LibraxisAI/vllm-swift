@@ -73,6 +73,11 @@ select = ["E", "F", "W", "I"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: tests that hit a real local model or launch a real server (opt in with -m integration)",
+]
+# Default: run only fast static tests; opt into integration with `-m integration`.
+addopts = "-m 'not integration'"
 
 [tool.coverage.run]
 source = ["vllm_swift"]
