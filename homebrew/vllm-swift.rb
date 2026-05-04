@@ -11,13 +11,13 @@ class VllmSwift < Formula
   desc "Native Swift/Metal backend for vLLM on Apple Silicon"
   homepage "https://github.com/TheTom/vllm-swift"
   url "https://github.com/TheTom/vllm-swift.git", branch: "main"
-  version "0.3.0"
+  version "0.3.2"
   license "Apache-2.0"
 
   bottle do
     root_url "https://github.com/TheTom/homebrew-tap/releases/download/bottles"
-    sha256 cellar: :any, arm64_tahoe:   "9ee43fcb6313bec66cf88d5648c1476e4c40f938a0a838149013063b49797db4"
-    sha256 cellar: :any, arm64_sequoia: "9ee43fcb6313bec66cf88d5648c1476e4c40f938a0a838149013063b49797db4"
+    # sha256 cellar: :any, arm64_tahoe:   "<filled by build_bottle.sh>"
+    # sha256 cellar: :any, arm64_sequoia: "<filled by build_bottle.sh>"
   end
 
   depends_on xcode: ["15.0", :build]
@@ -111,7 +111,7 @@ class VllmSwift < Formula
           exec "#{libexec}/scripts/integration_test.sh" "$@"
           ;;
         version)
-          echo "vllm-swift 0.3.0"
+          echo "vllm-swift 0.3.2"
           echo "dylib: #{lib}/libVLLMBridge.dylib"
           "$VENV_PYTHON" -c "import vllm; print(f'vLLM: {vllm.__version__}')" 2>/dev/null || true
           ;;
@@ -148,6 +148,6 @@ class VllmSwift < Formula
   test do
     assert_predicate lib/"libVLLMBridge.dylib", :exist?
     assert_match "vllm-swift", shell_output("#{bin}/vllm-swift")
-    assert_match "0.3.0", shell_output("#{bin}/vllm-swift version")
+    assert_match "0.3.2", shell_output("#{bin}/vllm-swift version")
   end
 end

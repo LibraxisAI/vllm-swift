@@ -1,5 +1,21 @@
 # Release History
 
+## v0.3.2 — May 4, 2026
+
+**Patch release: symlinked model dirs no longer break MLX qwen3 loader.** Reported by @defilan (LLMKube metal-agent integration): passing a symlinked model dir (e.g. `~/models/mlx-community/Qwen3.6-35B-A3B-8bit -> ~/models/Qwen3.6-35B-A3B-8bit`) crashed vllm-swift with `[vsm] Failed to load model: Unsupported model type: qwen3`. The Swift bridge handed the symlinked URL straight to MLX's `LLMModelFactory`, which derives the architecture key from a mix of path components and `config.json` — those disagree on a symlinked path and the qwen3 codepath rejects the mismatch.
+
+- `swift/Sources/VLLMBridge/Bridge.swift` now calls `URL.resolvingSymlinksInPath()` before handing the URL to MLX. No-op on canonical paths; fixes the symlink case.
+- Verified locally on M5 Max: canonical `~/.cache/huggingface/hub/.../snapshots/<commit>/` still loads; symlinked dir pointing at the same target now also loads.
+- Reported by @defilan in defilantech/LLMKube#393.
+
+## v0.3.1 — May 2, 2026
+
+**Patch release: serve subcommand model-path bug.** The wrapper was forwarding the model path as a positional argument to `vllm.entrypoints.openai.api_server`, where vLLM 0.19.1's argparse maps a stray positional to the deprecated `model_tag` slot rather than `ModelConfig.model`. The path was silently dropped and the engine fell back to the `Qwen/Qwen3-0.6B` placeholder. Reported in #11 (Defilan), surfaced again triaging #4 and #10.
+
+- `vllm-swift serve <path>` now passes `--model <path>` explicitly to vLLM (#12)
+- Fixes silent fallback to `Qwen/Qwen3-0.6B` when serving local model directories
+- No dylib changes; bottle rebuild ships only the wrapper fix
+
 ## v0.3.0 — April 28, 2026
 
 **Stability and throughput on TurboQuant MoE.** Closes a long-standing Metal `Invalid Resource` race that hit concurrent custom-kernel workloads (TurboQuant B-path on MoE B≥8). Removing the swift-side band-aid that was only there to mask the underlying race recovers ~10% throughput on Qwen3.5-35B-A3B at B≥17.

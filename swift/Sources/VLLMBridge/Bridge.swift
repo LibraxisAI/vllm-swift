@@ -149,7 +149,8 @@ public func vsm_engine_create(
     }
     let result = LoadResult()
     let semaphore = DispatchSemaphore(value: 0)
-    let modelURL = URL(fileURLWithPath: modelId)
+    // Resolve symlinks: MLX's qwen3 path errors out on symlinked dirs.
+    let modelURL = URL(fileURLWithPath: modelId).resolvingSymlinksInPath()
 
     Task {
         do {
