@@ -1,5 +1,12 @@
 # Release History
 
+## v0.3.3 — May 5, 2026
+
+**Re-release of v0.3.2 with proper wheel contents.** The 0.3.2 PyPI wheel was built before the `package_data` changes were merged to `main`, so it shipped without the bundled `libVLLMBridge.dylib` + `mlx.metallib`. PyPI release files are immutable, so 0.3.2 is yanked and 0.3.3 is the working release. No source changes vs 0.3.2.
+
+- `pip install vllm-swift==0.3.3` now ships the dylib + metallib via wheel `package_data`.
+- Homebrew bottle rebuilt against the same source tree.
+
 ## v0.3.2 — May 4, 2026
 
 **Patch release: symlinked model dirs no longer break MLX qwen3 loader.** Reported by @defilan (LLMKube metal-agent integration): passing a symlinked model dir (e.g. `~/models/mlx-community/Qwen3.6-35B-A3B-8bit -> ~/models/Qwen3.6-35B-A3B-8bit`) crashed vllm-swift with `[vsm] Failed to load model: Unsupported model type: qwen3`. The Swift bridge handed the symlinked URL straight to MLX's `LLMModelFactory`, which derives the architecture key from a mix of path components and `config.json` — those disagree on a symlinked path and the qwen3 codepath rejects the mismatch.
