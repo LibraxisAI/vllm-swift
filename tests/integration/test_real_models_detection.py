@@ -11,15 +11,11 @@ with `pytest -m integration`.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
+from tests.integration.conftest import _has_local_model, _model_path
 from vllm_swift import detect_reasoning_parser as drp
 from vllm_swift import detect_tool_parser as dtp
-
-from tests.integration.conftest import _has_local_model, _model_path
-
 
 pytestmark = pytest.mark.integration
 

@@ -15,7 +15,6 @@ import pytest
 from vllm_swift import detect_reasoning_parser as drp
 from vllm_swift import detect_tool_parser as dtp
 
-
 # ---------------------------------------------------------------------------
 # llama.cpp #20809 / #22684 — Qwen3-Instruct-2507 false thinking detection
 # ---------------------------------------------------------------------------

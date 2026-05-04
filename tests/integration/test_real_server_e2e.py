@@ -23,7 +23,6 @@ import pytest
 
 from tests.integration.conftest import _has_local_model
 
-
 pytestmark = pytest.mark.integration
 
 

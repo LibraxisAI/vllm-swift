@@ -19,7 +19,6 @@ from typing import Iterator
 
 import pytest
 
-
 MODELS_ROOT = Path(os.environ.get("VLLM_SWIFT_MODELS_ROOT", "/Users/tom/models"))
 
 

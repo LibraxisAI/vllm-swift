@@ -22,7 +22,6 @@ from __future__ import annotations
 from vllm_swift.detect_reasoning_parser import _ARCH_TO_REASONING_PARSER
 from vllm_swift.detect_tool_parser import _arch_to_parser as _tool_arch_to_parser
 
-
 # Source: `vllm.entrypoints.openai.api_server --help` --tool-call-parser choices.
 # Pinned at vLLM 0.19.x. Update when bumping vLLM.
 VLLM_TOOL_PARSERS: frozenset[str] = frozenset(

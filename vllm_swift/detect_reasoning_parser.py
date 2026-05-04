@@ -24,7 +24,6 @@ import json
 import os
 import sys
 
-
 # Architecture prefixes that LOOK like thinking-capable models but ship
 # templates with thinking markers ONLY inside conditionals that default
 # to off. Auto-injection on these would catch llama.cpp's #21616 / #20809
