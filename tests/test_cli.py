@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the pip-installed `vllm-swift` CLI entry point."""
 
-import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
