@@ -5,13 +5,12 @@ so `pip install vllm-swift && vllm-swift serve <model>` produces the same
 behavior as the brew installation, with the same auto-detect smart defaults
 for the tool-call parser.
 """
+
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
-from importlib import resources
 from pathlib import Path
 
 from vllm_swift import __version__
@@ -58,9 +57,7 @@ def _extract_model(args: list[str]) -> str | None:
 
 def _serve(args: list[str]) -> int:
     if not args:
-        sys.stderr.write(
-            "Usage: vllm-swift serve <model-path-or-hf-id> [vllm args...]\n"
-        )
+        sys.stderr.write("Usage: vllm-swift serve <model-path-or-hf-id> [vllm args...]\n")
         return 2
     # Accept positional model as first arg (matches brew wrapper UX).
     extra_args: list[str] = []
@@ -107,9 +104,7 @@ def _download(args: list[str]) -> int:
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
-        sys.stderr.write(
-            "huggingface_hub not installed. Run: pip install huggingface-hub\n"
-        )
+        sys.stderr.write("huggingface_hub not installed. Run: pip install huggingface-hub\n")
         return 1
     path = snapshot_download(model_id, local_dir=target)
     print(f"Downloaded to {path}")

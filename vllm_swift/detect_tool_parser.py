@@ -6,6 +6,7 @@ Prints the parser name to stdout, or empty if no mapping. Exits 0 always
 to provide smart defaults when the user runs `serve` without explicit
 --tool-call-parser / --enable-auto-tool-choice flags.
 """
+
 import json
 import os
 import sys
