@@ -468,24 +468,43 @@ def rewrite_request(
     if reasoning_parser not in _REASONING_PARSERS_NEEDING_BUDGET:
         return body
     requested = body.get("max_tokens")
-    if isinstance(requested, int) and 0 < requested < _REASONING_MAX_TOKENS_FLOOR:
-        # Clamp bump against the server's max_model_len when known. Leave a
-        # small safety margin so the prompt tokens still fit.
-        bump = _REASONING_MAX_TOKENS_BUMP
-        if isinstance(max_model_len, int) and max_model_len > 0:
-            bump = min(bump, max_model_len - 256)
-        # Don't bump *down* — if the requested value already beats our
-        # clamped ceiling, leave it alone.
-        if bump <= requested:
+    if not isinstance(requested, int) or requested <= 0:
+        return body
+    if requested >= _REASONING_MAX_TOKENS_FLOOR:
+        return body
+    # When max_model_len is known, the bump ceiling is constrained by
+    # the total context window: prompt_tokens + output_tokens must fit.
+    # We don't see the prompt yet at request rewrite time, so reserve
+    # half of max_model_len for prompt + 1K safety. If half is below
+    # what we need to materially help reasoning (≥8K of free output),
+    # skip the bump entirely — bumping into a context where reasoning
+    # can't fit anyway just trades one failure mode for another.
+    bump = _REASONING_MAX_TOKENS_BUMP
+    if isinstance(max_model_len, int) and max_model_len > 0:
+        prompt_reserve = max(max_model_len // 2, 1024)
+        ceiling = max_model_len - prompt_reserve
+        if ceiling < 8192:
+            # Reasoning model in a context too small to bump usefully.
+            # Trust the client; vLLM will fail the request with a clear
+            # error if there's truly not enough room.
+            logger.info(
+                "skipping bump: max_model_len=%d too small for reasoning "
+                "headroom (would clamp to %d, below 8K useful threshold)",
+                max_model_len,
+                ceiling,
+            )
             return body
-        body["max_tokens"] = bump
-        logger.info(
-            "bumped max_tokens %d -> %d (reasoning_parser=%s, max_model_len=%s)",
-            requested,
-            bump,
-            reasoning_parser,
-            max_model_len if max_model_len else "<unknown>",
-        )
+        bump = min(bump, ceiling)
+    if bump <= requested:
+        return body
+    body["max_tokens"] = bump
+    logger.info(
+        "bumped max_tokens %d -> %d (reasoning_parser=%s, max_model_len=%s)",
+        requested,
+        bump,
+        reasoning_parser,
+        max_model_len if max_model_len else "<unknown>",
+    )
     return body
 
 

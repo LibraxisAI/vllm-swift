@@ -107,31 +107,41 @@ def test_negative_max_tokens_left_alone():
     assert out["max_tokens"] == -1
 
 
-def test_bump_clamps_against_max_model_len():
-    """Empirical bug from Qwen3.5-2B (max_model_len=4096) on M2: bump
-    to 32768 made vLLM 400 with 'max_tokens cannot be greater than
-    max_model_len=4096'. When max_model_len is known, clamp the bump
-    so the server can actually produce the requested output."""
+def test_bump_skipped_when_max_model_len_too_small_for_reasoning_headroom():
+    """Empirical bug from Qwen3.5-2B (max_model_len=4096) on M2:
+    bump to 32768 hit "max_tokens > max_model_len" 400. Even after
+    clamping (4096 - prompt_reserve = ~2K), the leftover headroom is
+    less than what reasoning needs — bumping at all just creates the
+    follow-on bug "prompt + output > max_model_len". Skip entirely."""
     body = {"max_tokens": 256}
     out = rewrite_request(body, arch="", reasoning_parser=REASONING_PARSER, max_model_len=4096)
-    # Should clamp to max_model_len - 256 safety margin = 3840
-    assert out["max_tokens"] == 3840
+    # No bump — leave client's value alone, log the skip
+    assert out["max_tokens"] == 256
 
 
 def test_bump_unaffected_when_max_model_len_above_default_bump():
-    """Large max_model_len (32K+) — clamp is a no-op, full bump applies."""
+    """Large max_model_len (131K) — full bump applies, no clamp needed."""
     body = {"max_tokens": 8192}
     out = rewrite_request(body, arch="", reasoning_parser=REASONING_PARSER, max_model_len=131072)
     assert out["max_tokens"] == _REASONING_MAX_TOKENS_BUMP
 
 
+def test_bump_clamps_when_max_model_len_in_useful_band():
+    """Mid-range context (e.g. 24K): bump clamps to half (12K) which
+    is above the 8K useful threshold — clamp applies instead of skip."""
+    body = {"max_tokens": 4096}
+    out = rewrite_request(body, arch="", reasoning_parser=REASONING_PARSER, max_model_len=24576)
+    # ceiling = 24576 - 12288 = 12288 (above 8K threshold)
+    assert out["max_tokens"] == 12288
+
+
 def test_bump_skips_when_clamped_value_below_requested():
-    """Tiny max_model_len edge case: don't bump *down* — leave the
-    client's value alone if our clamped bump is smaller."""
-    body = {"max_tokens": 4000}
-    out = rewrite_request(body, arch="", reasoning_parser=REASONING_PARSER, max_model_len=4096)
-    # Clamp would give 3840 but client requested 4000 — don't bump down
-    assert out["max_tokens"] == 4000
+    """Don't bump *down* — leave the client's value alone if our
+    clamped bump is smaller than what they asked for."""
+    body = {"max_tokens": 14000}
+    out = rewrite_request(body, arch="", reasoning_parser=REASONING_PARSER, max_model_len=24576)
+    # ceiling = 12288, but client wants 14000 — leave alone
+    assert out["max_tokens"] == 14000
 
 
 # ---------------------------------------------------------------------------

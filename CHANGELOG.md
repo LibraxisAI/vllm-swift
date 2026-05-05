@@ -1,5 +1,16 @@
 # Release History
 
+## v0.4.2 — May 5, 2026
+
+**Patch: skip max_tokens bump when max_model_len is too small for reasoning headroom.** Follow-up to 0.4.1's clamp. Mac Mini M2 testing surfaced that even after clamping the bump against `max_model_len`, a small context window (e.g. Qwen3.5-2B with `--max-model-len 4096`) still 400'd: `prompt_tokens + max_tokens > max_model_len`. The 0.4.1 safety margin (256 tokens) wasn't enough headroom for realistic prompts.
+
+- When `max_model_len < 16384` (or when half of it falls below the 8K useful-reasoning threshold), the rewriter now skips the bump entirely instead of clamping into a too-tight ceiling. Trust the client's `max_tokens`; vLLM will surface a clear error if the request truly doesn't fit.
+- Reserves half of `max_model_len` for prompt tokens (or 1K minimum) when computing the bump ceiling.
+- 1 new test pinning the skip behavior on a 4K context, plus updated tests for the band where clamping still applies (24K context).
+
+`pip install vllm-swift==0.4.2` and rebuilt bottle ship the fix.
+
+
 ## v0.4.1 — May 5, 2026
 
 **Patch: clamp `max_tokens` rescue against the configured `max_model_len`.**
