@@ -751,6 +751,33 @@ def test_stream_recovery_already_structured_tool_calls_passthrough():
     assert '"finish_reason": "tool_calls"' in out
 
 
+def test_stream_recovery_finish_in_separate_chunk_flushes_deciding_buffer():
+    """Real-world vLLM pattern: last content chunk has finish_reason=None,
+    then a separate empty-delta chunk has finish_reason=stop. The DECIDING
+    buffer must flush at the second chunk, not get silently dropped."""
+    blob = _sse([
+        _content_chunk("Hi there"),  # finish=None — still deciding
+        {"id": "x", "model": "m", "choices": [{
+            "index": 0, "delta": {}, "finish_reason": "stop",
+        }]},
+        "[DONE]",
+    ])
+    out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
+    assert "Hi there" in out, "DECIDING buffer was dropped on separate finish chunk"
+    assert '"finish_reason": "stop"' in out
+
+
+def test_stream_recovery_done_without_finish_flushes_defensively():
+    """Defensive: if upstream sends [DONE] without ever firing finish_reason
+    on a buffered choice, the rewriter must still flush rather than swallow."""
+    blob = _sse([
+        _content_chunk("orphan content"),
+        "[DONE]",
+    ])
+    out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
+    assert "orphan content" in out, "buffered content silently dropped at [DONE]"
+
+
 def test_stream_recovery_metadata_chunks_passthrough():
     """vLLM's usage chunk (choices=[]) and similar must pass through unchanged."""
     usage_chunk = {

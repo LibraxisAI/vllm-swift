@@ -604,6 +604,23 @@ async def stream_tool_recovery(
                 continue
             payload_text = event[len("data: "):]
             if payload_text.strip() == "[DONE]":
+                # Defensive: flush any still-buffered content before terminating.
+                # Normal flow flushes on finish_reason; this catches edge cases
+                # where the upstream forgot to set finish_reason on a final chunk.
+                for idx, st in states.items():
+                    if st.buffer and st.decision != _RecoveryChoiceState.PASSTHROUGH:
+                        flush = {
+                            "id": "stream",
+                            "object": "chat.completion.chunk",
+                            "choices": [{
+                                "index": idx,
+                                "delta": {"content": st.buffer},
+                                "finish_reason": "stop",
+                            }],
+                        }
+                        yield f"data: {json.dumps(flush)}\n\n".encode()
+                        st.buffer = ""
+                        st.decision = _RecoveryChoiceState.PASSTHROUGH
                 yield event.encode() + b"\n\n"
                 continue
             try:
@@ -639,6 +656,7 @@ async def stream_tool_recovery(
                 # No content delta in this chunk
                 if content_delta is None:
                     in_buffering = st.decision == _RecoveryChoiceState.BUFFERING
+                    in_deciding = st.decision == _RecoveryChoiceState.DECIDING
                     if finish_reason and in_buffering and st.buffer:
                         # Stream end while buffering — try recovery
                         recovered = _recover_tool_calls_from_content(st.buffer)
@@ -666,6 +684,18 @@ async def stream_tool_recovery(
                                 "finish_reason": finish_reason,
                             })
                         st.buffer = ""
+                        st.decision = _RecoveryChoiceState.PASSTHROUGH
+                    elif finish_reason and in_deciding and st.buffer:
+                        # Stream end while still deciding — flush buffer as content.
+                        # This handles vLLM's pattern of emitting finish_reason in
+                        # a separate empty-delta chunk after the last content chunk.
+                        forward_choices.append({
+                            "index": idx,
+                            "delta": {"content": st.buffer},
+                            "finish_reason": finish_reason,
+                        })
+                        st.buffer = ""
+                        st.decision = _RecoveryChoiceState.PASSTHROUGH
                     else:
                         forward_choices.append(c)
                     continue
