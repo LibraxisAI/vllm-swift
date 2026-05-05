@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-VERSION="0.3.3"
+VERSION="0.4.0"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 SWIFT_DIR="$PROJECT_DIR/swift"
