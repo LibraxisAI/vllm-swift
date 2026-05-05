@@ -45,6 +45,22 @@ _NON_REASONING_NAME_SUFFIXES: tuple[str, ...] = (
     "-no-think",
 )
 
+# Substring patterns on model directory names that should suppress reasoning
+# parser injection because the parser+model combo races (vLLM #39056-class).
+# Specifically: `qwen3_coder` tool parser + `qwen3` reasoning parser causes
+# the model to emit tool calls *inside* `<think>...</think>` blocks, which
+# the reasoning parser eats before the tool parser ever sees them. Result:
+# `tool_calls=[]` and silent dropped output. Empirically reproduced against
+# Qwen3-Coder-30B-A3B-Instruct-MLX-6bit on 2026-05-04: model generated
+# tokens but they vanished into reasoning_content, never surfaced as either
+# content or tool_calls. Suppressing reasoning makes Qwen3-Coder reliably
+# tool-dispatch since the model still thinks internally — we just stop
+# trying to extract the thinking server-side.
+_REASONING_SUPPRESS_NAME_SUBSTRINGS: tuple[str, ...] = (
+    "-Coder-",  # Qwen3-Coder, future Qwen-Coder family
+    "-coder-",  # lowercase variants
+)
+
 # Architecture prefix -> vLLM reasoning parser name. Order matters: longer
 # / more specific prefixes must come first so e.g. "DeepseekR1" matches
 # before the "Deepseek" generic family. Names match vLLM's
@@ -234,6 +250,8 @@ def _is_suppressed(arch: str, model_dir_name: str) -> bool:
         return True
     name = model_dir_name or ""
     if any(suffix in name for suffix in _NON_REASONING_NAME_SUFFIXES):
+        return True
+    if any(sub in name for sub in _REASONING_SUPPRESS_NAME_SUBSTRINGS):
         return True
     return False
 

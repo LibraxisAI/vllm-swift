@@ -52,7 +52,7 @@ EXPECTED: tuple[tuple[str, str, str, str], ...] = (
     (
         "Qwen3-Coder-30B-A3B-Instruct-MLX-6bit",
         "qwen3_coder",
-        "qwen3",
+        "",  # reasoning suppressed by `-Coder-` dirname rule (qwen3+qwen3_coder race)
         "Qwen3-Coder MLX (arch: Qwen3MoeForCausalLM)",
     ),
     ("Qwen2.5-3B-Instruct-4bit", "hermes", "", "Qwen2.5 (no native reasoning)"),
