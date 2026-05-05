@@ -28,6 +28,7 @@ from vllm_swift.known_parser_issues import (
     tool_parser_caveats,
 )
 from vllm_swift.response_rewriter import (
+    _LEAKY_TOOL_PARSERS,
     _REASONING_PARSERS_NEEDING_BUDGET,
     needs_rewrite,
 )
@@ -254,6 +255,7 @@ def _serve(args: list[str]) -> int:
     needs_proxy = (
         injected_reasoning in _REASONING_PARSERS_NEEDING_BUDGET
         or needs_rewrite(arch)
+        or injected_tool in _LEAKY_TOOL_PARSERS
     )
     env = _prepare_dyld_env()
     if not needs_proxy:
@@ -316,6 +318,13 @@ def _serve_with_rewriter(
             f"  rewriter rule: split leaked 'Thinking:' prefix into "
             f"reasoning_content (arch={arch})"
         )
+    # Recovery rule fires whenever the proxy is engaged (cheap regex pass).
+    # Surface it in the banner only when the recovery is the *primary*
+    # reason we spawned — i.e., a known-leaky tool parser without reasoning.
+    print(
+        "  rewriter rule: recover structured tool_calls from plaintext-JSON "
+        "leaks in `content` (hermes / qwen3_coder / phi4-pipe / mistral shapes)"
+    )
     proc = subprocess.Popen(cmd, env=env)
 
     def _shutdown(*_: object) -> None:

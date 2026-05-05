@@ -89,6 +89,18 @@ _REASONING_MAX_TOKENS_FLOOR = 16384
 # Apple Silicon-friendly models so we don't blow KV cache budgets.
 _REASONING_MAX_TOKENS_BUMP = 32768
 
+# Tool parsers known to occasionally fail to extract a structured tool_call
+# even when the model emitted the right shape (the call ends up as plain
+# text in `message.content`). When the auto-detected tool parser is in
+# this set, the proxy spawns even for non-reasoning models so the response-
+# side recovery path can synthesize the structured tool_call from content.
+#   - `phi4_mini_json`: Microsoft's own model card admits Phi-4-mini emits
+#     `<|tool_calls|>[{...}]<|/tool_calls|>` as text. Tracked in
+#     vllm-project/vllm#14682 / #14359.
+_LEAKY_TOOL_PARSERS: frozenset[str] = frozenset({
+    "phi4_mini_json",
+})
+
 
 # Regex for the 'Thinking:' / 'Thinking ' / 'thinking:' prefix variants.
 # Capture group 1 is the prefix label; rest is the actual thinking body.
@@ -141,21 +153,274 @@ def split_thinking_prefix(content: str) -> tuple[str, str]:
     return (reasoning, answer)
 
 
+# ----------------------------------------------------------------------------
+# Tool-call recovery: synthesize structured `tool_calls` when the parser
+# misses an extraction and the call leaks into `message.content` as text.
+# ----------------------------------------------------------------------------
+
+# Conservative threshold: the matched tool-call shape must occupy at least
+# this fraction of the content for recovery to fire. Defends against
+# false-positives where a model writes natural-language commentary that
+# happens to mention `<tool_call>` etc.
+_RECOVERY_MIN_RATIO = 0.5
+
+# Hermes-style: `<tool_call>{json}</tool_call>` (one or more)
+_HERMES_BLOCK_RE = re.compile(
+    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    re.DOTALL,
+)
+
+# qwen3_coder XML: `<tool_call><function=name><parameter=k>v</parameter>...
+# </function></tool_call>`
+_QWEN3CODER_BLOCK_RE = re.compile(
+    r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>",
+    re.DOTALL,
+)
+_QWEN3CODER_PARAM_RE = re.compile(
+    r"<parameter=([^>]+)>(.*?)</parameter>",
+    re.DOTALL,
+)
+
+# Phi-4-mini pipe-tag: `<|tool_calls|>[{...}]<|/tool_calls|>`
+# Microsoft's own model card admits the model emits this as text.
+_PHI4_PIPE_RE = re.compile(
+    r"<\|tool_calls?\|>\s*(\[.*?\]|\{.*?\})\s*<\|/tool_calls?\|>",
+    re.DOTALL,
+)
+
+# Mistral bracket: `[TOOL_CALLS][{...}]`
+_MISTRAL_BRACKET_RE = re.compile(
+    r"\[TOOL_CALLS\]\s*(\[.*?\])",
+    re.DOTALL,
+)
+
+
+def _make_tool_call_id(seed: int) -> str:
+    """Synthesize a tool_call id when the parser-bypass path didn't generate one."""
+    return f"chatcmpl-tool-recovered-{seed:012d}"
+
+
+def _validate_function_payload(name: str, args: object) -> dict | None:
+    """Return a normalized function payload if `name` and `args` look valid."""
+    if not name or not isinstance(name, str):
+        return None
+    if isinstance(args, str):
+        # Some leaks already have stringified JSON; accept as-is.
+        try:
+            json.loads(args)  # validation only
+        except json.JSONDecodeError:
+            return None
+        args_str = args
+    elif isinstance(args, dict):
+        args_str = json.dumps(args)
+    else:
+        return None
+    return {"name": name, "arguments": args_str}
+
+
+def _recover_hermes(content: str) -> tuple[list[dict], str] | None:
+    """Extract one or more `<tool_call>{json}</tool_call>` blocks."""
+    matches = list(_HERMES_BLOCK_RE.finditer(content))
+    if not matches:
+        return None
+    calls = []
+    for i, m in enumerate(matches):
+        try:
+            obj = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        fn = _validate_function_payload(obj.get("name"), obj.get("arguments"))
+        if fn:
+            calls.append({
+                "id": _make_tool_call_id(i),
+                "type": "function",
+                "function": fn,
+            })
+    if not calls:
+        return None
+    residual = _strip_matches(content, matches).strip()
+    matched_len = sum(m.end() - m.start() for m in matches)
+    if matched_len < int(len(content) * _RECOVERY_MIN_RATIO):
+        return None
+    return calls, residual
+
+
+def _recover_qwen3_coder(content: str) -> tuple[list[dict], str] | None:
+    """Extract qwen3_coder XML tool calls."""
+    matches = list(_QWEN3CODER_BLOCK_RE.finditer(content))
+    if not matches:
+        return None
+    calls = []
+    for i, m in enumerate(matches):
+        name = m.group(1).strip()
+        body = m.group(2)
+        params: dict[str, object] = {}
+        for pm in _QWEN3CODER_PARAM_RE.finditer(body):
+            params[pm.group(1).strip()] = pm.group(2).strip()
+        fn = _validate_function_payload(name, params)
+        if fn:
+            calls.append({
+                "id": _make_tool_call_id(i),
+                "type": "function",
+                "function": fn,
+            })
+    if not calls:
+        return None
+    residual = _strip_matches(content, matches).strip()
+    matched_len = sum(m.end() - m.start() for m in matches)
+    if matched_len < int(len(content) * _RECOVERY_MIN_RATIO):
+        return None
+    return calls, residual
+
+
+def _recover_phi4_pipe(content: str) -> tuple[list[dict], str] | None:
+    """Extract phi-4-mini-style `<|tool_calls|>...<|/tool_calls|>` blocks."""
+    matches = list(_PHI4_PIPE_RE.finditer(content))
+    if not matches:
+        return None
+    calls = []
+    seq = 0
+    for m in matches:
+        try:
+            payload = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        items = payload if isinstance(payload, list) else [payload]
+        for obj in items:
+            if not isinstance(obj, dict):
+                continue
+            fn = _validate_function_payload(obj.get("name"), obj.get("arguments"))
+            if fn:
+                calls.append({
+                    "id": _make_tool_call_id(seq),
+                    "type": "function",
+                    "function": fn,
+                })
+                seq += 1
+    if not calls:
+        return None
+    residual = _strip_matches(content, matches).strip()
+    matched_len = sum(m.end() - m.start() for m in matches)
+    if matched_len < int(len(content) * _RECOVERY_MIN_RATIO):
+        return None
+    return calls, residual
+
+
+def _recover_mistral_bracket(content: str) -> tuple[list[dict], str] | None:
+    """Extract `[TOOL_CALLS][{...}]` blocks."""
+    matches = list(_MISTRAL_BRACKET_RE.finditer(content))
+    if not matches:
+        return None
+    calls = []
+    seq = 0
+    for m in matches:
+        try:
+            arr = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(arr, list):
+            continue
+        for obj in arr:
+            if not isinstance(obj, dict):
+                continue
+            fn = _validate_function_payload(obj.get("name"), obj.get("arguments"))
+            if fn:
+                calls.append({
+                    "id": _make_tool_call_id(seq),
+                    "type": "function",
+                    "function": fn,
+                })
+                seq += 1
+    if not calls:
+        return None
+    residual = _strip_matches(content, matches).strip()
+    matched_len = sum(m.end() - m.start() for m in matches)
+    if matched_len < int(len(content) * _RECOVERY_MIN_RATIO):
+        return None
+    return calls, residual
+
+
+def _strip_matches(content: str, matches: list) -> str:
+    """Remove all matched substrings from content, preserving non-matched parts."""
+    out: list[str] = []
+    cursor = 0
+    for m in matches:
+        out.append(content[cursor:m.start()])
+        cursor = m.end()
+    out.append(content[cursor:])
+    return "".join(out)
+
+
+def _recover_tool_calls_from_content(content: str) -> tuple[list[dict], str] | None:
+    """Try each known leak shape in order; return first successful recovery.
+
+    Returns (tool_calls, residual_content) or None if no shape matched
+    convincingly enough (above the `_RECOVERY_MIN_RATIO` floor).
+    """
+    for fn in (
+        _recover_hermes,
+        _recover_qwen3_coder,
+        _recover_phi4_pipe,
+        _recover_mistral_bracket,
+    ):
+        result = fn(content)
+        if result:
+            return result
+    return None
+
+
 def rewrite_chat_completion(payload: dict) -> dict:
-    """Rewrite a non-streaming /v1/chat/completions response in place."""
+    """Rewrite a non-streaming /v1/chat/completions response in place.
+
+    Two response-side fixes:
+      1. **Thinking: prefix splitter** — for models that ignore their own
+         `<think>` contract and emit "Thinking:" plaintext (notably
+         Nemotron-Cascade-2). Pull that out of `content` into
+         `reasoning_content`.
+      2. **Tool-call recovery** — for models whose tool-call output is
+         unparsed by vLLM's tool parser and ends up as plain text in
+         `content` (notably Phi-4-mini emitting `<|tool_calls|>[{...}]
+         <|/tool_calls|>` per Microsoft's own model card; older Mistral
+         emissions; misrouted hermes/qwen3_coder shapes). Detect the
+         shape, parse, synthesize structured `message.tool_calls`, and
+         clear the leaked text from `content`.
+    """
     choices = payload.get("choices", [])
     for choice in choices:
         msg = choice.get("message") or {}
         content = msg.get("content") or ""
         existing_reasoning = msg.get("reasoning_content") or ""
+
+        # Pass 1: Thinking: prefix split
         if not existing_reasoning and content:
             reasoning, cleaned = split_thinking_prefix(content)
             if reasoning:
                 msg["reasoning_content"] = reasoning
+                content = cleaned
                 msg["content"] = cleaned
                 choice["message"] = msg
-                logger.info("split Thinking: prefix; %d chars reasoning, %d chars content",
-                            len(reasoning), len(cleaned))
+                logger.info(
+                    "split Thinking: prefix; %d chars reasoning, %d chars content",
+                    len(reasoning), len(cleaned),
+                )
+
+        # Pass 2: tool-call recovery (only if model didn't already produce
+        # structured tool_calls)
+        if not msg.get("tool_calls") and content:
+            recovered = _recover_tool_calls_from_content(content)
+            if recovered:
+                tool_calls, residual = recovered
+                msg["tool_calls"] = tool_calls
+                msg["content"] = residual or None
+                choice["message"] = msg
+                # Update finish_reason to tool_calls (was likely 'stop'
+                # or 'length' since the parser missed the dispatch)
+                if choice.get("finish_reason") in ("stop", "length", None):
+                    choice["finish_reason"] = "tool_calls"
+                logger.info(
+                    "recovered %d tool_call(s) from content (was %d chars, residual %d chars)",
+                    len(tool_calls), len(content), len(residual),
+                )
     return payload
 
 
