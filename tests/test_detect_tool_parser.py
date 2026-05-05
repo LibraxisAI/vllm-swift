@@ -14,11 +14,19 @@ from vllm_swift import detect_tool_parser as dtp
     [
         ("", ""),
         ("Qwen3CoderForCausalLM", "qwen3_coder"),
+        # All Qwen3.5+/3.6+/Next variants (dense and MoE) ship qwen3_coder
+        # XML in chat_template.jinja. Older Qwen3 (vanilla) stays hermes.
+        ("Qwen3_5ForConditionalGeneration", "qwen3_coder"),
+        ("Qwen3_5MoeForConditionalGeneration", "qwen3_coder"),
+        ("Qwen3_6ForCausalLM", "qwen3_coder"),
+        ("Qwen3_6MoeForConditionalGeneration", "qwen3_coder"),
+        ("Qwen3NextForCausalLM", "qwen3_coder"),
+        ("Qwen3MoeForCausalLM", "qwen3_coder"),
         ("Qwen3ForCausalLM", "hermes"),
         ("Qwen2_5ForCausalLM", "hermes"),
         ("Qwen2ForCausalLM", "hermes"),
-        ("NemotronHForCausalLM", "hermes"),
-        ("NemotronForCausalLM", "hermes"),
+        ("NemotronHForCausalLM", "qwen3_coder"),
+        ("NemotronForCausalLM", "qwen3_coder"),
         ("HermesForCausalLM", "hermes"),
         ("Llama4ForCausalLM", "llama4_json"),
         ("LlamaForCausalLM", "llama3_json"),
@@ -37,6 +45,12 @@ from vllm_swift import detect_tool_parser as dtp
         ("Glm45ForCausalLM", "glm45"),
         ("Glm47ForCausalLM", "glm47"),
         ("Glm4ForCausalLM", "glm45"),
+        # MiMo (Xiaomi) — official recipe routes tool to qwen3_xml
+        ("MiMoForCausalLM", "qwen3_xml"),
+        ("MimoForCausalLM", "qwen3_xml"),
+        # LongCat (Meituan) — dedicated longcat parser per vLLM recipe
+        ("LongcatFlashForCausalLM", "longcat"),
+        ("LongCatFlashForCausalLM", "longcat"),
         ("MinimaxM2ForCausalLM", "minimax_m2"),
         ("MiniMaxM2ForCausalLM", "minimax_m2"),
         ("MiniMaxText", "minimax"),
@@ -118,6 +132,25 @@ def test_detect_parser_full_match(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"architectures": ["Qwen3ForCausalLM"]}))
     (tmp_path / "tokenizer_config.json").write_text('{"chat_template": "tools and tool_call"}')
     assert dtp.detect_parser(str(tmp_path)) == "hermes"
+
+
+def test_xlam_dirname_discriminator_bumps_llama_to_xlam(tmp_path):
+    """xLAM ships as LlamaForCausalLM but needs vLLM's dedicated `xlam`
+    tool parser. Detection is dirname-based since the arch is generic."""
+    xlam_dir = tmp_path / "xLAM-2-3b-fc-r"
+    xlam_dir.mkdir()
+    (xlam_dir / "config.json").write_text(json.dumps({"architectures": ["LlamaForCausalLM"]}))
+    (xlam_dir / "tokenizer_config.json").write_text('{"chat_template": "tools and tool_call"}')
+    assert dtp.detect_parser(str(xlam_dir)) == "xlam"
+
+
+def test_xlam_dirname_caseinsensitive(tmp_path):
+    """Salesforce ships some variants with `Llama-xLAM-2-...` naming."""
+    xlam_dir = tmp_path / "Llama-xLAM-2-8b-fc-r"
+    xlam_dir.mkdir()
+    (xlam_dir / "config.json").write_text(json.dumps({"architectures": ["LlamaForCausalLM"]}))
+    (xlam_dir / "tokenizer_config.json").write_text('{"chat_template": "tools and tool_call"}')
+    assert dtp.detect_parser(str(xlam_dir)) == "xlam"
 
 
 def test_main_no_args_returns_0(monkeypatch):

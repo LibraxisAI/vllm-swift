@@ -213,6 +213,15 @@ vllm-swift serve <model> [options]
 
 All standard [vLLM flags](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html) work — these are just the most common ones.
 
+## Documentation
+
+| Doc | What's in it |
+|---|---|
+| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Full perf matrix vs vllm-metal, methodology, long-context cells |
+| [docs/MODEL_COMPATIBILITY.md](docs/MODEL_COMPATIBILITY.md) | Empirical pass / soft-fail / hard-fail across local MLX models with root-cause classification (model intrinsic, vLLM upstream, env-missing) |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → diagnostic → fix for known failure patterns (parser mismatch, reasoning consuming the turn, Gemma-4 boot failure, etc.) |
+| [CHANGELOG.md](CHANGELOG.md) | Release history |
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.

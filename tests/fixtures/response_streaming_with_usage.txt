@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-fixture-stream","object":"chat.completion.chunk","created":1777948000,"model":"/Users/tom/models/Nemotron-Cascade-2-30B-A3B-4bit","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-stream","object":"chat.completion.chunk","created":1777948000,"model":"/Users/tom/models/Nemotron-Cascade-2-30B-A3B-4bit","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-stream","object":"chat.completion.chunk","created":1777948000,"model":"/Users/tom/models/Nemotron-Cascade-2-30B-A3B-4bit","choices":[{"index":0,"delta":{"content":" there"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-stream","object":"chat.completion.chunk","created":1777948000,"model":"/Users/tom/models/Nemotron-Cascade-2-30B-A3B-4bit","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-fixture-stream","object":"chat.completion.chunk","created":1777948000,"model":"/Users/tom/models/Nemotron-Cascade-2-30B-A3B-4bit","choices":[],"usage":{"prompt_tokens":35,"total_tokens":85,"completion_tokens":50}}
+
+data: [DONE]
+

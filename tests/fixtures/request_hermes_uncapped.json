@@ -1,0 +1,35 @@
+{
+  "_capture_metadata": {
+    "captured_from": "Hermes (NousResearch hermes-agent) via OpenAI/Python 2.29.0",
+    "captured_against": "vllm-swift fronting Nemotron-Cascade-2-30B-A3B-4bit",
+    "captured_date": "2026-05-04",
+    "purpose": "Hermes leaves max_tokens=null so reasoning has full budget. The bump rescue MUST NOT fire here — already uncapped."
+  },
+  "model": "/Users/tom/models/Nemotron-Cascade-2-30B-A3B-4bit",
+  "max_tokens": null,
+  "stream": true,
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant with bash, read, and write tools. Use the tools whenever the user asks for file or shell operations."
+    },
+    {
+      "role": "user",
+      "content": "list files in /tmp/sweep-test"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "bash",
+        "description": "Execute a bash command",
+        "parameters": {
+          "type": "object",
+          "properties": {"command": {"type": "string"}},
+          "required": ["command"]
+        }
+      }
+    }
+  ]
+}

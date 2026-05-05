@@ -1,0 +1,27 @@
+{
+  "_capture_metadata": {
+    "captured_from": "Qwen3.6-35B-A3B-4bit emission shape captured 2026-05-04 BEFORE the auto-detect was fixed to route Qwen3_5MoeForConditionalGeneration → qwen3_coder. With hermes parser routing in place, the parser couldn't extract this XML and dumped it into content.",
+    "purpose": "Defense-in-depth: even though our detector now routes Qwen3.5+/3.6+ MoE to qwen3_coder, recovery should catch any case where this XML leaks into content (e.g., user manually overrode parser, or future model variant misroutes)."
+  },
+  "id": "chatcmpl-qwen3xml-fixture",
+  "object": "chat.completion",
+  "created": 1777948000,
+  "model": "/Users/tom/models/Qwen3.6-35B-A3B-4bit",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "\n\n<tool_call>\n<function=bash>\n<parameter=command>\nls -l /tmp/nemotron-test\n</parameter>\n</function>\n</tool_call>",
+        "tool_calls": [],
+        "reasoning_content": null
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 296,
+    "completion_tokens": 41,
+    "total_tokens": 337
+  }
+}

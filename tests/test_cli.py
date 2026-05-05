@@ -224,3 +224,123 @@ def test_main_uses_sys_argv_by_default(monkeypatch):
     with patch("vllm_swift.cli._version", return_value=0) as mock_v:
         cli.main()
     mock_v.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# Port helpers + rewriter routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        (["--port", "9000"], 9000),
+        (["--port=9001"], 9001),
+        (["--max-model-len", "8192"], 8000),
+        ([], 8000),
+        (["--port", "not-a-number"], 8000),
+    ],
+)
+def test_extract_port(args, expected):
+    assert cli._extract_port(args) == expected
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        (["--port", "9000", "--max-model-len", "8192"], ["--max-model-len", "8192"]),
+        (["--port=9001", "--foo"], ["--foo"]),
+        (["--max-model-len", "4096"], ["--max-model-len", "4096"]),
+        ([], []),
+    ],
+)
+def test_strip_port(args, expected):
+    assert cli._strip_port(args) == expected
+
+
+def test_serve_routes_through_rewriter_when_reasoning_parser_set(tmp_path):
+    """Reasoning-parser auto-injection should trigger the proxy path."""
+    model_dir = tmp_path / "fake-model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"architectures":["NemotronHForCausalLM"]}')
+
+    with (
+        patch("vllm_swift.cli.detect_parser", return_value=""),
+        patch("vllm_swift.cli.detect_reasoning_parser", return_value="nemotron_v3"),
+        patch("vllm_swift.cli._serve_with_rewriter", return_value=0) as mock_proxy,
+        patch("subprocess.call", return_value=0) as mock_call,
+    ):
+        rc = cli._serve([str(model_dir)])
+    assert rc == 0
+    mock_proxy.assert_called_once()
+    mock_call.assert_not_called()
+
+
+def test_serve_skips_rewriter_for_plain_chat_model(tmp_path):
+    """Llama-style non-reasoning models should bypass the proxy."""
+    model_dir = tmp_path / "llama"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"architectures":["LlamaForCausalLM"]}')
+
+    with (
+        patch("vllm_swift.cli.detect_parser", return_value=""),
+        patch("vllm_swift.cli.detect_reasoning_parser", return_value=""),
+        patch("vllm_swift.cli._serve_with_rewriter", return_value=0) as mock_proxy,
+        patch("subprocess.call", return_value=0) as mock_call,
+    ):
+        rc = cli._serve([str(model_dir)])
+    assert rc == 0
+    mock_proxy.assert_not_called()
+    mock_call.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight parser-registry validation
+# ---------------------------------------------------------------------------
+
+
+def test_validate_against_registry_passes_for_registered():
+    assert cli._validate_against_registry("hermes", {"hermes", "qwen3_coder"}, "tool")
+
+
+def test_validate_against_registry_skips_when_unregistered(capsys):
+    """Unregistered parser name → returns False + warns to stderr."""
+    ok = cli._validate_against_registry("ghost_parser", {"hermes", "qwen3_coder"}, "tool")
+    assert ok is False
+    err = capsys.readouterr().err
+    assert "ghost_parser" in err
+    assert "not registered" in err
+    assert "skipping auto-injection" in err
+
+
+def test_validate_against_registry_passes_when_vllm_unavailable(capsys):
+    """Empty registry (vLLM not importable) → trust the detector, no warning."""
+    ok = cli._validate_against_registry("hermes", set(), "tool")
+    assert ok is True
+    assert capsys.readouterr().err == ""
+
+
+def test_serve_skips_injection_for_unregistered_parser(tmp_path):
+    """Detected parser not in vLLM's registry → skip injection, fall through
+    to the no-proxy bypass path so vLLM still launches without crashing."""
+    model_dir = tmp_path / "hypothetical-future-model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"architectures":["FutureForCausalLM"]}')
+
+    with (
+        patch("vllm_swift.cli.detect_parser", return_value="future_parser_dne"),
+        patch("vllm_swift.cli.detect_reasoning_parser", return_value=""),
+        patch("vllm_swift.cli._registered_tool_parsers", return_value={"hermes"}),
+        patch("vllm_swift.cli._registered_reasoning_parsers", return_value=set()),
+        patch("vllm_swift.cli._serve_with_rewriter", return_value=0) as mock_proxy,
+        patch("subprocess.call", return_value=0) as mock_call,
+    ):
+        rc = cli._serve([str(model_dir)])
+    assert rc == 0
+    # Unregistered tool parser → no proxy path, plain bypass to vLLM
+    mock_proxy.assert_not_called()
+    mock_call.assert_called_once()
+    # The injected args should NOT include the bogus parser
+    cmd = mock_call.call_args[0][0]
+    assert "future_parser_dne" not in cmd
+    assert "--tool-call-parser" not in cmd

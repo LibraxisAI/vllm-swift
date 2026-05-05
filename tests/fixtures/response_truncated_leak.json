@@ -1,0 +1,32 @@
+{
+  "_capture_metadata": {
+    "captured_from": "Synthesized from the failure mode where vLLM hits max_tokens mid-emission of a leak shape. The closing `</tool_call>` (or `<|/tool_calls|>`) is never reached, so the regex shape match fails.",
+    "purpose": "Graceful degradation: a partial/truncated leak shape must NOT produce malformed structured tool_calls. Recovery should skip rather than try to half-extract. finish_reason=length is the giveaway that vLLM hit the budget.",
+    "scenarios_covered": [
+      "Phi-4 partial pipe-tag (no closing <|/tool_calls|>)",
+      "Hermes partial bracket (no closing </tool_call>)",
+      "Qwen3-coder partial XML (no closing </function>)"
+    ]
+  },
+  "id": "chatcmpl-truncated-fixture",
+  "object": "chat.completion",
+  "created": 1777948200,
+  "model": "/Users/tom/models/Phi-4-mini-instruct-4bit",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "<|tool_calls|>[{\"name\": \"get_current_weather\", \"arguments\": {\"location\": \"Pa",
+        "tool_calls": null,
+        "reasoning_content": null
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 78,
+    "completion_tokens": 256,
+    "total_tokens": 334
+  }
+}

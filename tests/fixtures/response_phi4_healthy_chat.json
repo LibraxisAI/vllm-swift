@@ -1,0 +1,27 @@
+{
+  "_capture_metadata": {
+    "captured_from": "Phi-4-mini-instruct-4bit on M5 Max via vllm-swift, captured 2026-05-05 during recovery validation",
+    "purpose": "Regression guard: this is the EXACT shape Phi-4 actually produced when given a tool-call prompt and tool definitions but didn't emit the leak shape — it just chatted with a markdown code block and natural-language explanation. Recovery MUST NOT fire on this. The recovery feature is only useful if it doesn't false-positive on real production-shaped chat traffic."
+  },
+  "id": "chatcmpl-phi4-healthy-fixture",
+  "object": "chat.completion",
+  "created": 1777988100,
+  "model": "/Users/tom/models/Phi-4-mini-instruct-4bit",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "To list files in a directory using a bash tool, you can simply use the `ls` command on a Linux terminal. However, if you specifically want to use a custom tool, here's the syntax:\n\n```bash\nls /tmp/sweep-test\n```\n\nThis will display all files and subdirectories within `/tmp/sweep-test`. If you want a more detailed listing including hidden files and metadata, you can use `ls -la /tmp/sweep-test` instead.",
+        "tool_calls": null,
+        "reasoning_content": null
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 78,
+    "completion_tokens": 95,
+    "total_tokens": 173
+  }
+}
