@@ -70,6 +70,7 @@ Decode throughput, tok/s. Prompt = 18 tokens, generation = 50 tokens, greedy (te
 | vllm-metal (Python/MLX) | 104 | 396 | 1,065 | 1,375 |
 
 > Full matrix, methodology, and long-context cells in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+> End-to-end model compatibility (which models work, which fail, and where the failure originates) in [docs/MODEL_COMPATIBILITY.md](docs/MODEL_COMPATIBILITY.md).
 
 ### [TurboQuant+](https://github.com/TheTom/turboquant_plus) KV Cache Compression
 
