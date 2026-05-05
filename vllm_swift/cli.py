@@ -137,6 +137,47 @@ def _wait_for_vllm_ready(port: int, timeout: float = 600.0) -> bool:
     return False
 
 
+def _registered_tool_parsers() -> set[str]:
+    """Names registered in the running vLLM's tool parser registry, or
+    empty set if vLLM isn't importable (CI / dev shell). Importing
+    `vllm.tool_parsers` is cheap enough — the heavy modules are lazy.
+    """
+    try:
+        from vllm.tool_parsers import _TOOL_PARSERS_TO_REGISTER  # type: ignore[attr-defined]
+    except (ImportError, AttributeError):
+        return set()
+    return set(_TOOL_PARSERS_TO_REGISTER)
+
+
+def _registered_reasoning_parsers() -> set[str]:
+    """Names registered in the running vLLM's reasoning parser registry."""
+    try:
+        from vllm.reasoning import _REASONING_PARSERS_TO_REGISTER  # type: ignore[attr-defined]
+    except (ImportError, AttributeError):
+        return set()
+    return set(_REASONING_PARSERS_TO_REGISTER)
+
+
+def _validate_against_registry(parser: str, registered: set[str], kind: str) -> bool:
+    """True if `parser` is in vLLM's registry (or registry is unknown).
+
+    When False, prints a stderr warning so the user sees why injection
+    got skipped — defensive against future vLLM parser renames/removals
+    that would otherwise crash vLLM with an opaque "unknown parser" error.
+    """
+    if not registered:
+        # vLLM not importable — can't validate; trust the detector.
+        return True
+    if parser in registered:
+        return True
+    sys.stderr.write(
+        f"vllm-swift: detected {kind} parser '{parser}' is not registered in "
+        f"the running vLLM build; skipping auto-injection. Override with an "
+        f"explicit flag if you know a compatible parser name.\n"
+    )
+    return False
+
+
 def _free_port(preferred: int) -> int:
     """Return `preferred` if free, otherwise an OS-assigned ephemeral port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -167,9 +208,11 @@ def _serve(args: list[str]) -> int:
     short = os.path.basename(model.rstrip("/")) if model else ""
     injected_tool: str = ""
     injected_reasoning: str = ""
+    tool_registry = _registered_tool_parsers()
+    reasoning_registry = _registered_reasoning_parsers()
     if model and not _has_tool_flag(passthrough):
         parser = detect_parser(model)
-        if parser:
+        if parser and _validate_against_registry(parser, tool_registry, "tool"):
             print(
                 f"vllm-swift: auto-detected tool parser '{parser}' for {short}; "
                 f"injecting --enable-auto-tool-choice --tool-call-parser {parser}"
@@ -186,7 +229,7 @@ def _serve(args: list[str]) -> int:
             injected_tool = parser
     if model and not _has_reasoning_flag(passthrough):
         rparser = detect_reasoning_parser(model)
-        if rparser:
+        if rparser and _validate_against_registry(rparser, reasoning_registry, "reasoning"):
             print(
                 f"vllm-swift: auto-detected reasoning parser '{rparser}' for {short}; "
                 f"injecting --reasoning-parser {rparser}"
