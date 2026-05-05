@@ -14,12 +14,14 @@ from vllm_swift import detect_tool_parser as dtp
     [
         ("", ""),
         ("Qwen3CoderForCausalLM", "qwen3_coder"),
-        # Qwen3.5/3.6 35B-A3B MoE variants ship qwen3_coder XML shape per
-        # chat_template.jinja. Older dense Qwen3 variants stay on hermes.
+        # All Qwen3.5+/3.6+/Next variants (dense and MoE) ship qwen3_coder
+        # XML in chat_template.jinja. Older Qwen3 (vanilla) stays hermes.
+        ("Qwen3_5ForConditionalGeneration", "qwen3_coder"),
         ("Qwen3_5MoeForConditionalGeneration", "qwen3_coder"),
+        ("Qwen3_6ForCausalLM", "qwen3_coder"),
         ("Qwen3_6MoeForConditionalGeneration", "qwen3_coder"),
+        ("Qwen3NextForCausalLM", "qwen3_coder"),
         ("Qwen3MoeForCausalLM", "qwen3_coder"),
-        ("Qwen3_5ForConditionalGeneration", "hermes"),
         ("Qwen3ForCausalLM", "hermes"),
         ("Qwen2_5ForCausalLM", "hermes"),
         ("Qwen2ForCausalLM", "hermes"),

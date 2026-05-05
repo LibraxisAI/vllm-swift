@@ -28,8 +28,15 @@ EXPECTED: tuple[tuple[str, str, str, str], ...] = (
     ("Qwen3-0.6B-4bit", "hermes", "qwen3", "vanilla Qwen3"),
     ("Qwen3-0.6B-hf", "hermes", "qwen3", "HF original"),
     ("Qwen3-4B-4bit", "hermes", "qwen3", "Qwen3-4B"),
-    ("Qwen3.5-2B-4bit", "hermes", "qwen3", "Qwen3.5-2B (arch: Qwen3_5ForConditionalGeneration)"),
-    ("Qwen3.5-9B-4bit", "hermes", "qwen3", "Qwen3.5-9B"),
+    # Dense Qwen3.5/3.6 also ship qwen3_coder XML in chat_template.jinja
+    # (verified Nov 2026 — same template text as Qwen3-Coder).
+    (
+        "Qwen3.5-2B-4bit",
+        "qwen3_coder",
+        "qwen3",
+        "Qwen3.5-2B (arch: Qwen3_5ForConditionalGeneration)",
+    ),
+    ("Qwen3.5-9B-4bit", "qwen3_coder", "qwen3", "Qwen3.5-9B (dense Qwen3_5For...)"),
     # Qwen3.5/3.6 35B-A3B MoE variants (arch: Qwen3_5MoeForConditionalGeneration)
     # ship the qwen3_coder XML tool-call shape per their chat_template.jinja
     # (same `<tool_call><function=name><parameter=k>v</parameter>` template
