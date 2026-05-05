@@ -264,10 +264,12 @@ def test_serve_routes_through_rewriter_when_reasoning_parser_set(tmp_path):
     model_dir.mkdir()
     (model_dir / "config.json").write_text('{"architectures":["NemotronHForCausalLM"]}')
 
-    with patch("vllm_swift.cli.detect_parser", return_value=""), \
-         patch("vllm_swift.cli.detect_reasoning_parser", return_value="nemotron_v3"), \
-         patch("vllm_swift.cli._serve_with_rewriter", return_value=0) as mock_proxy, \
-         patch("subprocess.call", return_value=0) as mock_call:
+    with (
+        patch("vllm_swift.cli.detect_parser", return_value=""),
+        patch("vllm_swift.cli.detect_reasoning_parser", return_value="nemotron_v3"),
+        patch("vllm_swift.cli._serve_with_rewriter", return_value=0) as mock_proxy,
+        patch("subprocess.call", return_value=0) as mock_call,
+    ):
         rc = cli._serve([str(model_dir)])
     assert rc == 0
     mock_proxy.assert_called_once()
@@ -280,10 +282,12 @@ def test_serve_skips_rewriter_for_plain_chat_model(tmp_path):
     model_dir.mkdir()
     (model_dir / "config.json").write_text('{"architectures":["LlamaForCausalLM"]}')
 
-    with patch("vllm_swift.cli.detect_parser", return_value=""), \
-         patch("vllm_swift.cli.detect_reasoning_parser", return_value=""), \
-         patch("vllm_swift.cli._serve_with_rewriter", return_value=0) as mock_proxy, \
-         patch("subprocess.call", return_value=0) as mock_call:
+    with (
+        patch("vllm_swift.cli.detect_parser", return_value=""),
+        patch("vllm_swift.cli.detect_reasoning_parser", return_value=""),
+        patch("vllm_swift.cli._serve_with_rewriter", return_value=0) as mock_proxy,
+        patch("subprocess.call", return_value=0) as mock_call,
+    ):
         rc = cli._serve([str(model_dir)])
     assert rc == 0
     mock_proxy.assert_not_called()
@@ -323,12 +327,14 @@ def test_serve_skips_injection_for_unregistered_parser(tmp_path):
     model_dir.mkdir()
     (model_dir / "config.json").write_text('{"architectures":["FutureForCausalLM"]}')
 
-    with patch("vllm_swift.cli.detect_parser", return_value="future_parser_dne"), \
-         patch("vllm_swift.cli.detect_reasoning_parser", return_value=""), \
-         patch("vllm_swift.cli._registered_tool_parsers", return_value={"hermes"}), \
-         patch("vllm_swift.cli._registered_reasoning_parsers", return_value=set()), \
-         patch("vllm_swift.cli._serve_with_rewriter", return_value=0) as mock_proxy, \
-         patch("subprocess.call", return_value=0) as mock_call:
+    with (
+        patch("vllm_swift.cli.detect_parser", return_value="future_parser_dne"),
+        patch("vllm_swift.cli.detect_reasoning_parser", return_value=""),
+        patch("vllm_swift.cli._registered_tool_parsers", return_value={"hermes"}),
+        patch("vllm_swift.cli._registered_reasoning_parsers", return_value=set()),
+        patch("vllm_swift.cli._serve_with_rewriter", return_value=0) as mock_proxy,
+        patch("subprocess.call", return_value=0) as mock_call,
+    ):
         rc = cli._serve([str(model_dir)])
     assert rc == 0
     # Unregistered tool parser → no proxy path, plain bypass to vLLM

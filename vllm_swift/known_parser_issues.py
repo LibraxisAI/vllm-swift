@@ -8,6 +8,7 @@ catch regressions on the parser name itself.
 
 Format per entry: (parser_name, summary, issue_url, optional_mitigation).
 """
+
 from __future__ import annotations
 
 KnownIssue = tuple[str, str, str, str]
@@ -94,9 +95,7 @@ _REASONING_PARSER_ISSUES: tuple[KnownIssue, ...] = (
 def tool_parser_caveats(parser: str) -> list[tuple[str, str, str]]:
     """Return (summary, url, mitigation) for each known tool-parser issue."""
     return [
-        (summary, url, mit)
-        for name, summary, url, mit in _TOOL_PARSER_ISSUES
-        if name == parser
+        (summary, url, mit) for name, summary, url, mit in _TOOL_PARSER_ISSUES if name == parser
     ]
 
 

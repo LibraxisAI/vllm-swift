@@ -172,9 +172,7 @@ def test_detect_parser_nemotron_h_resolves_to_nemotron_v3(tmp_path):
     reasoning parser per NVIDIA (vLLM PR #36393). nemotron_v3 subclasses
     DeepSeekR1 with enable_thinking swap; qwen3 would also fire on the
     <think> markers, but nemotron_v3 is NVIDIA's recommended choice."""
-    (tmp_path / "config.json").write_text(
-        json.dumps({"architectures": ["NemotronHForCausalLM"]})
-    )
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": ["NemotronHForCausalLM"]}))
     (tmp_path / "chat_template.jinja").write_text(
         "Here's a thinking process: <think>plan</think> answer"
     )

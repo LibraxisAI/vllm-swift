@@ -5,6 +5,7 @@ When a vLLM parser bug listed in `known_parser_issues` is fixed upstream,
 remove the corresponding entry from the table. This test file pins the
 current set so removal is intentional and visible in code review.
 """
+
 from __future__ import annotations
 
 import pytest

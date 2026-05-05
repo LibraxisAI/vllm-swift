@@ -6,6 +6,7 @@ model directory is missing, so the suite stays runnable on machines without
 the full local model library. Marker `integration` keeps them out of the
 default `pytest` run; opt in with `pytest -m integration`.
 """
+
 from __future__ import annotations
 
 import json

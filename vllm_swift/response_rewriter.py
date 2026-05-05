@@ -29,6 +29,7 @@ Architecture:
     /v1/chat/completions request through the rewriter.
   - All other paths pass through unchanged.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -69,16 +70,18 @@ _REWRITE_ARCH_PREFIXES: tuple[str, ...] = (
 # 4–6K tokens in <think> on tool-use turns with 23K-char system prompts,
 # so the </think> never closes and the parser dumps raw thinking into
 # content (manifests as monologue / hallucinated tool output).
-_REASONING_PARSERS_NEEDING_BUDGET: frozenset[str] = frozenset({
-    "nemotron_v3",
-    "qwen3",
-    "deepseek_r1",
-    "deepseek_v3",
-    "openai_gptoss",
-    "gemma4",
-    "granite",
-    "minimax_m2",
-})
+_REASONING_PARSERS_NEEDING_BUDGET: frozenset[str] = frozenset(
+    {
+        "nemotron_v3",
+        "qwen3",
+        "deepseek_r1",
+        "deepseek_v3",
+        "openai_gptoss",
+        "gemma4",
+        "granite",
+        "minimax_m2",
+    }
+)
 
 # Floor below which we consider a reasoning request budget-starved.
 # Above this, trust the client. Picked to comfortably cover the typical
@@ -97,9 +100,11 @@ _REASONING_MAX_TOKENS_BUMP = 32768
 #   - `phi4_mini_json`: Microsoft's own model card admits Phi-4-mini emits
 #     `<|tool_calls|>[{...}]<|/tool_calls|>` as text. Tracked in
 #     vllm-project/vllm#14682 / #14359.
-_LEAKY_TOOL_PARSERS: frozenset[str] = frozenset({
-    "phi4_mini_json",
-})
+_LEAKY_TOOL_PARSERS: frozenset[str] = frozenset(
+    {
+        "phi4_mini_json",
+    }
+)
 
 
 # Regex for the 'Thinking:' / 'Thinking ' / 'thinking:' prefix variants.
@@ -140,7 +145,7 @@ def split_thinking_prefix(content: str) -> tuple[str, str]:
     match = _THINKING_PREFIX_RE.match(content)
     if not match:
         return ("", content)
-    after_prefix = content[match.end():]
+    after_prefix = content[match.end() :]
     earliest = len(after_prefix)
     for marker in _THINKING_END_MARKERS:
         idx = after_prefix.find(marker)
@@ -231,11 +236,13 @@ def _recover_hermes(content: str) -> tuple[list[dict], str] | None:
             continue
         fn = _validate_function_payload(obj.get("name"), obj.get("arguments"))
         if fn:
-            calls.append({
-                "id": _make_tool_call_id(i),
-                "type": "function",
-                "function": fn,
-            })
+            calls.append(
+                {
+                    "id": _make_tool_call_id(i),
+                    "type": "function",
+                    "function": fn,
+                }
+            )
     if not calls:
         return None
     residual = _strip_matches(content, matches).strip()
@@ -259,11 +266,13 @@ def _recover_qwen3_coder(content: str) -> tuple[list[dict], str] | None:
             params[pm.group(1).strip()] = pm.group(2).strip()
         fn = _validate_function_payload(name, params)
         if fn:
-            calls.append({
-                "id": _make_tool_call_id(i),
-                "type": "function",
-                "function": fn,
-            })
+            calls.append(
+                {
+                    "id": _make_tool_call_id(i),
+                    "type": "function",
+                    "function": fn,
+                }
+            )
     if not calls:
         return None
     residual = _strip_matches(content, matches).strip()
@@ -291,11 +300,13 @@ def _recover_phi4_pipe(content: str) -> tuple[list[dict], str] | None:
                 continue
             fn = _validate_function_payload(obj.get("name"), obj.get("arguments"))
             if fn:
-                calls.append({
-                    "id": _make_tool_call_id(seq),
-                    "type": "function",
-                    "function": fn,
-                })
+                calls.append(
+                    {
+                        "id": _make_tool_call_id(seq),
+                        "type": "function",
+                        "function": fn,
+                    }
+                )
                 seq += 1
     if not calls:
         return None
@@ -325,11 +336,13 @@ def _recover_mistral_bracket(content: str) -> tuple[list[dict], str] | None:
                 continue
             fn = _validate_function_payload(obj.get("name"), obj.get("arguments"))
             if fn:
-                calls.append({
-                    "id": _make_tool_call_id(seq),
-                    "type": "function",
-                    "function": fn,
-                })
+                calls.append(
+                    {
+                        "id": _make_tool_call_id(seq),
+                        "type": "function",
+                        "function": fn,
+                    }
+                )
                 seq += 1
     if not calls:
         return None
@@ -345,7 +358,7 @@ def _strip_matches(content: str, matches: list) -> str:
     out: list[str] = []
     cursor = 0
     for m in matches:
-        out.append(content[cursor:m.start()])
+        out.append(content[cursor : m.start()])
         cursor = m.end()
     out.append(content[cursor:])
     return "".join(out)
@@ -401,7 +414,8 @@ def rewrite_chat_completion(payload: dict) -> dict:
                 choice["message"] = msg
                 logger.info(
                     "split Thinking: prefix; %d chars reasoning, %d chars content",
-                    len(reasoning), len(cleaned),
+                    len(reasoning),
+                    len(cleaned),
                 )
 
         # Pass 2: tool-call recovery (only if model didn't already produce
@@ -419,7 +433,9 @@ def rewrite_chat_completion(payload: dict) -> dict:
                     choice["finish_reason"] = "tool_calls"
                 logger.info(
                     "recovered %d tool_call(s) from content (was %d chars, residual %d chars)",
-                    len(tool_calls), len(content), len(residual),
+                    len(tool_calls),
+                    len(content),
+                    len(residual),
                 )
     return payload
 
@@ -445,7 +461,9 @@ def rewrite_request(body: dict, arch: str, reasoning_parser: str = "") -> dict:
         body["max_tokens"] = _REASONING_MAX_TOKENS_BUMP
         logger.info(
             "bumped max_tokens %d -> %d (reasoning_parser=%s, client-side starvation)",
-            requested, _REASONING_MAX_TOKENS_BUMP, reasoning_parser,
+            requested,
+            _REASONING_MAX_TOKENS_BUMP,
+            reasoning_parser,
         )
     return body
 
@@ -487,8 +505,9 @@ def _split_first_transition(text: str) -> tuple[str, str] | None:
     return (text[:earliest], text[earliest:].lstrip())
 
 
-def _make_delta_event(idx: int, role: str | None, reasoning: str | None,
-                      content: str | None, original_chunk: dict) -> str:
+def _make_delta_event(
+    idx: int, role: str | None, reasoning: str | None, content: str | None, original_chunk: dict
+) -> str:
     """Build an SSE chunk preserving original metadata (id, created, model)."""
     new_chunk = {
         "id": original_chunk.get("id"),
@@ -530,8 +549,8 @@ def _make_delta_event(idx: int, role: str | None, reasoning: str | None,
 #         - Failure → flush buffer as a single content delta + original finish
 
 _LEAK_OPEN_MARKERS: tuple[str, ...] = (
-    "<|tool_call",   # phi4 — covers both `<|tool_calls|>` and `<|tool_call|>`
-    "<tool_call>",   # hermes JSON or qwen3_coder XML
+    "<|tool_call",  # phi4 — covers both `<|tool_calls|>` and `<|tool_call|>`
+    "<tool_call>",  # hermes JSON or qwen3_coder XML
     "[TOOL_CALLS]",  # mistral
 )
 _LEAK_DECISION_THRESHOLD = 32  # chars to buffer before deciding passthrough
@@ -602,7 +621,7 @@ async def stream_tool_recovery(
             if not event.startswith("data: "):
                 yield (event + "\n\n").encode()
                 continue
-            payload_text = event[len("data: "):]
+            payload_text = event[len("data: ") :]
             if payload_text.strip() == "[DONE]":
                 # Defensive: flush any still-buffered content before terminating.
                 # Normal flow flushes on finish_reason; this catches edge cases
@@ -612,11 +631,13 @@ async def stream_tool_recovery(
                         flush = {
                             "id": "stream",
                             "object": "chat.completion.chunk",
-                            "choices": [{
-                                "index": idx,
-                                "delta": {"content": st.buffer},
-                                "finish_reason": "stop",
-                            }],
+                            "choices": [
+                                {
+                                    "index": idx,
+                                    "delta": {"content": st.buffer},
+                                    "finish_reason": "stop",
+                                }
+                            ],
                         }
                         yield f"data: {json.dumps(flush)}\n\n".encode()
                         st.buffer = ""
@@ -662,38 +683,45 @@ async def stream_tool_recovery(
                         recovered = _recover_tool_calls_from_content(st.buffer)
                         if recovered:
                             tool_calls, _residual = recovered
-                            forward_choices.append({
-                                "index": idx,
-                                "delta": {
-                                    "tool_calls": [
-                                        _streaming_tool_call_delta(i, tc)
-                                        for i, tc in enumerate(tool_calls)
-                                    ],
-                                },
-                                "finish_reason": "tool_calls",
-                            })
+                            forward_choices.append(
+                                {
+                                    "index": idx,
+                                    "delta": {
+                                        "tool_calls": [
+                                            _streaming_tool_call_delta(i, tc)
+                                            for i, tc in enumerate(tool_calls)
+                                        ],
+                                    },
+                                    "finish_reason": "tool_calls",
+                                }
+                            )
                             logger.info(
                                 "stream-recovered %d tool_calls from %d buffered chars",
-                                len(tool_calls), len(st.buffer),
+                                len(tool_calls),
+                                len(st.buffer),
                             )
                         else:
                             # Recovery failed — flush buffer as content
-                            forward_choices.append({
-                                "index": idx,
-                                "delta": {"content": st.buffer},
-                                "finish_reason": finish_reason,
-                            })
+                            forward_choices.append(
+                                {
+                                    "index": idx,
+                                    "delta": {"content": st.buffer},
+                                    "finish_reason": finish_reason,
+                                }
+                            )
                         st.buffer = ""
                         st.decision = _RecoveryChoiceState.PASSTHROUGH
                     elif finish_reason and in_deciding and st.buffer:
                         # Stream end while still deciding — flush buffer as content.
                         # This handles vLLM's pattern of emitting finish_reason in
                         # a separate empty-delta chunk after the last content chunk.
-                        forward_choices.append({
-                            "index": idx,
-                            "delta": {"content": st.buffer},
-                            "finish_reason": finish_reason,
-                        })
+                        forward_choices.append(
+                            {
+                                "index": idx,
+                                "delta": {"content": st.buffer},
+                                "finish_reason": finish_reason,
+                            }
+                        )
                         st.buffer = ""
                         st.decision = _RecoveryChoiceState.PASSTHROUGH
                     else:
@@ -713,45 +741,54 @@ async def stream_tool_recovery(
                             recovered = _recover_tool_calls_from_content(st.buffer)
                             if recovered:
                                 tool_calls, _residual = recovered
-                                forward_choices.append({
-                                    "index": idx,
-                                    "delta": {
-                                        "tool_calls": [
-                                            _streaming_tool_call_delta(i, tc)
-                                            for i, tc in enumerate(tool_calls)
-                                        ],
-                                    },
-                                    "finish_reason": "tool_calls",
-                                })
+                                forward_choices.append(
+                                    {
+                                        "index": idx,
+                                        "delta": {
+                                            "tool_calls": [
+                                                _streaming_tool_call_delta(i, tc)
+                                                for i, tc in enumerate(tool_calls)
+                                            ],
+                                        },
+                                        "finish_reason": "tool_calls",
+                                    }
+                                )
                                 logger.info(
                                     "stream-recovered %d tool_calls from %d buffered chars",
-                                    len(tool_calls), len(st.buffer),
+                                    len(tool_calls),
+                                    len(st.buffer),
                                 )
                             else:
-                                forward_choices.append({
-                                    "index": idx,
-                                    "delta": {"content": st.buffer},
-                                    "finish_reason": finish_reason,
-                                })
+                                forward_choices.append(
+                                    {
+                                        "index": idx,
+                                        "delta": {"content": st.buffer},
+                                        "finish_reason": finish_reason,
+                                    }
+                                )
                             st.buffer = ""
                         # else: keep buffering, emit no delta this round
                     elif classification == "no-leak":
                         st.decision = _RecoveryChoiceState.PASSTHROUGH
                         # Flush accumulated buffer as a single content delta
-                        forward_choices.append({
-                            "index": idx,
-                            "delta": {"content": st.buffer},
-                            "finish_reason": finish_reason,
-                        })
+                        forward_choices.append(
+                            {
+                                "index": idx,
+                                "delta": {"content": st.buffer},
+                                "finish_reason": finish_reason,
+                            }
+                        )
                         st.buffer = ""
                     else:
                         # Still ambiguous; if finish_reason arrives, flush as content
                         if finish_reason:
-                            forward_choices.append({
-                                "index": idx,
-                                "delta": {"content": st.buffer},
-                                "finish_reason": finish_reason,
-                            })
+                            forward_choices.append(
+                                {
+                                    "index": idx,
+                                    "delta": {"content": st.buffer},
+                                    "finish_reason": finish_reason,
+                                }
+                            )
                             st.buffer = ""
                             st.decision = _RecoveryChoiceState.PASSTHROUGH
                         # else: hold and wait for more
@@ -761,26 +798,31 @@ async def stream_tool_recovery(
                         recovered = _recover_tool_calls_from_content(st.buffer)
                         if recovered:
                             tool_calls, _residual = recovered
-                            forward_choices.append({
-                                "index": idx,
-                                "delta": {
-                                    "tool_calls": [
-                                        _streaming_tool_call_delta(i, tc)
-                                        for i, tc in enumerate(tool_calls)
-                                    ],
-                                },
-                                "finish_reason": "tool_calls",
-                            })
+                            forward_choices.append(
+                                {
+                                    "index": idx,
+                                    "delta": {
+                                        "tool_calls": [
+                                            _streaming_tool_call_delta(i, tc)
+                                            for i, tc in enumerate(tool_calls)
+                                        ],
+                                    },
+                                    "finish_reason": "tool_calls",
+                                }
+                            )
                             logger.info(
                                 "stream-recovered %d tool_calls from %d buffered chars",
-                                len(tool_calls), len(st.buffer),
+                                len(tool_calls),
+                                len(st.buffer),
                             )
                         else:
-                            forward_choices.append({
-                                "index": idx,
-                                "delta": {"content": st.buffer},
-                                "finish_reason": finish_reason,
-                            })
+                            forward_choices.append(
+                                {
+                                    "index": idx,
+                                    "delta": {"content": st.buffer},
+                                    "finish_reason": finish_reason,
+                                }
+                            )
                         st.buffer = ""
 
             if forward_choices:
@@ -796,9 +838,7 @@ async def stream_tool_recovery(
 # =============================================================================
 
 
-async def stream_rewriter(
-    upstream_iter: AsyncIterator[bytes], arch: str
-) -> AsyncIterator[bytes]:
+async def stream_rewriter(upstream_iter: AsyncIterator[bytes], arch: str) -> AsyncIterator[bytes]:
     """Rewrite an SSE stream. Yields rewritten SSE chunks."""
     if not needs_rewrite(arch):
         async for chunk in upstream_iter:
@@ -817,14 +857,12 @@ async def stream_rewriter(
             if not event.startswith("data: "):
                 yield (event + "\n\n").encode()
                 continue
-            payload_text = event[len("data: "):]
+            payload_text = event[len("data: ") :]
             if payload_text.strip() == "[DONE]":
                 # Flush any remaining buffered content as content (no transition seen)
                 for idx, st in states.items():
                     if not st.decided and st.buffer:
-                        yield _make_delta_event(
-                            idx, None, None, st.buffer, {}
-                        ).encode()
+                        yield _make_delta_event(idx, None, None, st.buffer, {}).encode()
                 yield event.encode() + b"\n\n"
                 continue
             try:
@@ -865,44 +903,58 @@ async def stream_rewriter(
                         match = _THINKING_PREFIX_RE.match(st.buffer)
                         if match:
                             st.in_reasoning = True
-                            after_prefix = st.buffer[match.end():]
+                            after_prefix = st.buffer[match.end() :]
                             split = _split_first_transition(after_prefix)
                             if split:
                                 # Boundary already in buffer
                                 reasoning_part, content_part = split
                                 if reasoning_part.strip():
-                                    new_choices.append({
-                                        "index": idx,
-                                        "delta": {**({"role": role} if role else {}),
-                                                  "reasoning_content": reasoning_part.strip()},
-                                        "finish_reason": None,
-                                    })
+                                    new_choices.append(
+                                        {
+                                            "index": idx,
+                                            "delta": {
+                                                **({"role": role} if role else {}),
+                                                "reasoning_content": reasoning_part.strip(),
+                                            },
+                                            "finish_reason": None,
+                                        }
+                                    )
                                 if content_part:
-                                    new_choices.append({
-                                        "index": idx,
-                                        "delta": {"content": content_part},
-                                        "finish_reason": c.get("finish_reason"),
-                                    })
+                                    new_choices.append(
+                                        {
+                                            "index": idx,
+                                            "delta": {"content": content_part},
+                                            "finish_reason": c.get("finish_reason"),
+                                        }
+                                    )
                                 st.in_reasoning = False
                                 st.transition_seen = True
                             else:
                                 # All buffered text is reasoning so far
                                 if after_prefix:
-                                    new_choices.append({
-                                        "index": idx,
-                                        "delta": {**({"role": role} if role else {}),
-                                                  "reasoning_content": after_prefix},
-                                        "finish_reason": None,
-                                    })
+                                    new_choices.append(
+                                        {
+                                            "index": idx,
+                                            "delta": {
+                                                **({"role": role} if role else {}),
+                                                "reasoning_content": after_prefix,
+                                            },
+                                            "finish_reason": None,
+                                        }
+                                    )
                             st.buffer = ""
                         else:
                             # No prefix; flush as content
-                            new_choices.append({
-                                "index": idx,
-                                "delta": {**({"role": role} if role else {}),
-                                          "content": st.buffer},
-                                "finish_reason": c.get("finish_reason"),
-                            })
+                            new_choices.append(
+                                {
+                                    "index": idx,
+                                    "delta": {
+                                        **({"role": role} if role else {}),
+                                        "content": st.buffer,
+                                    },
+                                    "finish_reason": c.get("finish_reason"),
+                                }
+                            )
                             st.buffer = ""
                     # else: still buffering; emit no delta this round
                 else:
@@ -913,32 +965,40 @@ async def stream_rewriter(
                         if split:
                             reasoning_part, content_part = split
                             if reasoning_part:
-                                new_choices.append({
-                                    "index": idx,
-                                    "delta": {"reasoning_content": reasoning_part},
-                                    "finish_reason": None,
-                                })
+                                new_choices.append(
+                                    {
+                                        "index": idx,
+                                        "delta": {"reasoning_content": reasoning_part},
+                                        "finish_reason": None,
+                                    }
+                                )
                             if content_part:
-                                new_choices.append({
-                                    "index": idx,
-                                    "delta": {"content": content_part},
-                                    "finish_reason": c.get("finish_reason"),
-                                })
+                                new_choices.append(
+                                    {
+                                        "index": idx,
+                                        "delta": {"content": content_part},
+                                        "finish_reason": c.get("finish_reason"),
+                                    }
+                                )
                             st.transition_seen = True
                             st.in_reasoning = False
                         else:
-                            new_choices.append({
-                                "index": idx,
-                                "delta": {"reasoning_content": content_delta},
-                                "finish_reason": c.get("finish_reason"),
-                            })
+                            new_choices.append(
+                                {
+                                    "index": idx,
+                                    "delta": {"reasoning_content": content_delta},
+                                    "finish_reason": c.get("finish_reason"),
+                                }
+                            )
                     else:
                         # In content mode
-                        new_choices.append({
-                            "index": idx,
-                            "delta": {"content": content_delta},
-                            "finish_reason": c.get("finish_reason"),
-                        })
+                        new_choices.append(
+                            {
+                                "index": idx,
+                                "delta": {"content": content_delta},
+                                "finish_reason": c.get("finish_reason"),
+                            }
+                        )
 
             if new_choices:
                 rewritten = {**chunk, "choices": new_choices}
@@ -952,8 +1012,9 @@ async def stream_rewriter(
 # =============================================================================
 
 
-async def _make_app(upstream_url: str, arch: str, reasoning_parser: str = "",
-                    tool_parser: str = "") -> web.Application:
+async def _make_app(
+    upstream_url: str, arch: str, reasoning_parser: str = "", tool_parser: str = ""
+) -> web.Application:
     timeout = aiohttp.ClientTimeout(total=600)
 
     async def proxy(request: web.Request) -> web.StreamResponse:
@@ -970,12 +1031,16 @@ async def _make_app(upstream_url: str, arch: str, reasoning_parser: str = "",
         url = f"{upstream_url}{request.path}"
         if request.query_string:
             url += f"?{request.query_string}"
-        headers = {k: v for k, v in request.headers.items()
-                   if k.lower() not in ("host", "content-length")}
+        headers = {
+            k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")
+        }
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.request(
-                request.method, url, data=body if body else None,
-                headers=headers, allow_redirects=False,
+                request.method,
+                url,
+                data=body if body else None,
+                headers=headers,
+                allow_redirects=False,
             ) as upstream_resp:
                 ct = upstream_resp.headers.get("content-type", "")
                 if is_chat and "text/event-stream" in ct:
@@ -985,12 +1050,8 @@ async def _make_app(upstream_url: str, arch: str, reasoning_parser: str = "",
                     )
                     await response.prepare(request)
                     # Chain: thinking-split → tool-call streaming recovery
-                    thinking_split = stream_rewriter(
-                        upstream_resp.content.iter_any(), arch
-                    )
-                    async for out_chunk in stream_tool_recovery(
-                        thinking_split, tool_parser
-                    ):
+                    thinking_split = stream_rewriter(upstream_resp.content.iter_any(), arch)
+                    async for out_chunk in stream_tool_recovery(thinking_split, tool_parser):
                         await response.write(out_chunk)
                     await response.write_eof()
                     return response
@@ -1007,11 +1068,15 @@ async def _make_app(upstream_url: str, arch: str, reasoning_parser: str = "",
                         )
                     except Exception as exc:
                         logger.warning("response rewrite failed, returning raw: %s", exc)
-                        return web.Response(status=upstream_resp.status, body=raw,
-                                            headers=dict(upstream_resp.headers))
+                        return web.Response(
+                            status=upstream_resp.status,
+                            body=raw,
+                            headers=dict(upstream_resp.headers),
+                        )
                 # Pass-through for everything else
-                response = web.StreamResponse(status=upstream_resp.status,
-                                              headers=dict(upstream_resp.headers))
+                response = web.StreamResponse(
+                    status=upstream_resp.status, headers=dict(upstream_resp.headers)
+                )
                 await response.prepare(request)
                 async for ch in upstream_resp.content.iter_any():
                     await response.write(ch)
@@ -1023,20 +1088,24 @@ async def _make_app(upstream_url: str, arch: str, reasoning_parser: str = "",
     return app
 
 
-def run(user_port: int, upstream_port: int, arch: str,
-        reasoning_parser: str = "", tool_parser: str = "") -> None:
+def run(
+    user_port: int,
+    upstream_port: int,
+    arch: str,
+    reasoning_parser: str = "",
+    tool_parser: str = "",
+) -> None:
     """Run the rewriter proxy. Blocks until killed."""
     upstream_url = f"http://127.0.0.1:{upstream_port}"
     logger.info(
-        "rewriter starting: user_port=%d upstream=%s arch=%s reasoning_parser=%s "
-        "tool_parser=%s",
-        user_port, upstream_url, arch, reasoning_parser or "<none>",
+        "rewriter starting: user_port=%d upstream=%s arch=%s reasoning_parser=%s tool_parser=%s",
+        user_port,
+        upstream_url,
+        arch,
+        reasoning_parser or "<none>",
         tool_parser or "<none>",
     )
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = loop.run_until_complete(
-        _make_app(upstream_url, arch, reasoning_parser, tool_parser)
-    )
-    web.run_app(app, host="127.0.0.1", port=user_port,
-                print=lambda *_: None, loop=loop)
+    app = loop.run_until_complete(_make_app(upstream_url, arch, reasoning_parser, tool_parser))
+    web.run_app(app, host="127.0.0.1", port=user_port, print=lambda *_: None, loop=loop)

@@ -235,10 +235,7 @@ def _serve(args: list[str]) -> int:
                 f"vllm-swift: auto-detected reasoning parser '{rparser}' for {short}; "
                 f"injecting --reasoning-parser {rparser}"
             )
-            print(
-                "  (override with explicit --reasoning-parser <name> or "
-                "--no-enable-reasoning)"
-            )
+            print("  (override with explicit --reasoning-parser <name> or --no-enable-reasoning)")
             for summary, url, mit in reasoning_parser_caveats(rparser):
                 print(f"  ! known issue [{rparser}]: {summary} ({url})")
                 if mit:
@@ -347,6 +344,7 @@ def _serve_with_rewriter(
             return proc.returncode or 1
 
         from vllm_swift.response_rewriter import run as run_rewriter
+
         run_rewriter(
             user_port=user_port,
             upstream_port=internal_port,

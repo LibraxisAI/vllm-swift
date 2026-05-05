@@ -17,6 +17,7 @@ table) trips immediately. The lists below are derived from:
 Update these sets when vLLM adds / renames parsers. Don't update by
 removing entries that fail — fix the detector mapping instead.
 """
+
 from __future__ import annotations
 
 from vllm_swift.detect_reasoning_parser import _ARCH_TO_REASONING_PARSER

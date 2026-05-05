@@ -12,6 +12,7 @@ OpenCode, the `<think>` block can eat the whole budget; vLLM truncates,
 The rewriter silently bumps `max_tokens` to a reasoning-safe floor so
 the model has headroom for a real answer / tool_call.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -36,52 +37,55 @@ NON_REASONING_PARSER = ""
 
 def test_bumps_starved_max_tokens_for_reasoning_parser():
     body = {"max_tokens": 8192, "messages": []}
-    out = rewrite_request(body, arch="NemotronHForCausalLM",
-                          reasoning_parser=REASONING_PARSER)
+    out = rewrite_request(body, arch="NemotronHForCausalLM", reasoning_parser=REASONING_PARSER)
     assert out["max_tokens"] == _REASONING_MAX_TOKENS_BUMP
 
 
 def test_leaves_generous_max_tokens_alone():
     body = {"max_tokens": 65536, "messages": []}
-    out = rewrite_request(body, arch="NemotronHForCausalLM",
-                          reasoning_parser=REASONING_PARSER)
+    out = rewrite_request(body, arch="NemotronHForCausalLM", reasoning_parser=REASONING_PARSER)
     assert out["max_tokens"] == 65536
 
 
 def test_leaves_max_tokens_at_floor_alone():
     """Boundary: floor itself is considered acceptable, not starved."""
     body = {"max_tokens": _REASONING_MAX_TOKENS_FLOOR, "messages": []}
-    out = rewrite_request(body, arch="NemotronHForCausalLM",
-                          reasoning_parser=REASONING_PARSER)
+    out = rewrite_request(body, arch="NemotronHForCausalLM", reasoning_parser=REASONING_PARSER)
     assert out["max_tokens"] == _REASONING_MAX_TOKENS_FLOOR
 
 
 def test_no_bump_when_max_tokens_absent():
     body = {"messages": []}
-    out = rewrite_request(body, arch="NemotronHForCausalLM",
-                          reasoning_parser=REASONING_PARSER)
+    out = rewrite_request(body, arch="NemotronHForCausalLM", reasoning_parser=REASONING_PARSER)
     assert "max_tokens" not in out
 
 
 def test_no_bump_for_non_reasoning_parser():
     """Tight budget on a non-reasoning model is the client's choice."""
     body = {"max_tokens": 256, "messages": []}
-    out = rewrite_request(body, arch="LlamaForCausalLM",
-                          reasoning_parser=NON_REASONING_PARSER)
+    out = rewrite_request(body, arch="LlamaForCausalLM", reasoning_parser=NON_REASONING_PARSER)
     assert out["max_tokens"] == 256
 
 
 def test_no_bump_for_unknown_reasoning_parser_name():
     body = {"max_tokens": 256, "messages": []}
-    out = rewrite_request(body, arch="WeirdoForCausalLM",
-                          reasoning_parser="not_a_real_parser")
+    out = rewrite_request(body, arch="WeirdoForCausalLM", reasoning_parser="not_a_real_parser")
     assert out["max_tokens"] == 256
 
 
-@pytest.mark.parametrize("parser", [
-    "nemotron_v3", "qwen3", "deepseek_r1", "deepseek_v3",
-    "openai_gptoss", "gemma4", "granite", "minimax_m2",
-])
+@pytest.mark.parametrize(
+    "parser",
+    [
+        "nemotron_v3",
+        "qwen3",
+        "deepseek_r1",
+        "deepseek_v3",
+        "openai_gptoss",
+        "gemma4",
+        "granite",
+        "minimax_m2",
+    ],
+)
 def test_all_known_reasoning_parsers_trigger_bump(parser: str):
     body = {"max_tokens": 8192}
     out = rewrite_request(body, arch="", reasoning_parser=parser)
@@ -119,6 +123,7 @@ def _drive_rewriter(blob: bytes, arch: str) -> bytes:
     Wraps the async machinery in `asyncio.run` so this stays a plain
     synchronous test — no pytest-asyncio dependency.
     """
+
     async def _async_iter_bytes():
         yield blob
 
@@ -176,7 +181,7 @@ def test_recover_phi4_pipe_tag_leak():
     content = (
         '<|tool_calls|>[{"name": "get_current_weather", '
         '"arguments": {"location": "Paris", "format": "celsius"}}]'
-        '<|/tool_calls|>'
+        "<|/tool_calls|>"
     )
     result = _recover_tool_calls_from_content(content)
     assert result is not None
@@ -188,9 +193,7 @@ def test_recover_phi4_pipe_tag_leak():
 
 
 def test_recover_hermes_block():
-    content = (
-        '<tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>'
-    )
+    content = '<tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>'
     result = _recover_tool_calls_from_content(content)
     assert result is not None
     calls, residual = result
@@ -259,14 +262,16 @@ def test_rewrite_chat_completion_recovers_phi4_leak():
     rewritten — tool_calls populated, content cleared, finish_reason
     bumped to tool_calls."""
     payload = {
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": '<|tool_calls|>[{"name": "ls", "arguments": {}}]<|/tool_calls|>',
-                "tool_calls": None,
-            },
-            "finish_reason": "stop",
-        }],
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": '<|tool_calls|>[{"name": "ls", "arguments": {}}]<|/tool_calls|>',
+                    "tool_calls": None,
+                },
+                "finish_reason": "stop",
+            }
+        ],
     }
     rewrite_chat_completion(payload)
     msg = payload["choices"][0]["message"]
@@ -279,18 +284,22 @@ def test_rewrite_chat_completion_recovers_phi4_leak():
 def test_rewrite_chat_completion_does_not_clobber_existing_tool_calls():
     """If the message already has structured tool_calls, recovery is a no-op."""
     payload = {
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": '<tool_call>{"name": "evil", "arguments": {}}</tool_call>',
-                "tool_calls": [{
-                    "id": "real-1",
-                    "type": "function",
-                    "function": {"name": "real_tool", "arguments": "{}"},
-                }],
-            },
-            "finish_reason": "tool_calls",
-        }],
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": '<tool_call>{"name": "evil", "arguments": {}}</tool_call>',
+                    "tool_calls": [
+                        {
+                            "id": "real-1",
+                            "type": "function",
+                            "function": {"name": "real_tool", "arguments": "{}"},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
     }
     rewrite_chat_completion(payload)
     msg = payload["choices"][0]["message"]
@@ -417,13 +426,15 @@ def test_rewrite_chat_completion_handles_multiple_choices():
 def test_rewrite_chat_completion_does_not_overwrite_finish_reason_when_already_tool_calls():
     """If finish_reason was already `tool_calls`, leave it alone (don't double-bump)."""
     payload = {
-        "choices": [{
-            "message": {
-                "content": '<|tool_calls|>[{"name":"a","arguments":{}}]<|/tool_calls|>',
-                "tool_calls": None,
-            },
-            "finish_reason": "tool_calls",  # already set, somehow
-        }],
+        "choices": [
+            {
+                "message": {
+                    "content": '<|tool_calls|>[{"name":"a","arguments":{}}]<|/tool_calls|>',
+                    "tool_calls": None,
+                },
+                "finish_reason": "tool_calls",  # already set, somehow
+            }
+        ],
     }
     rewrite_chat_completion(payload)
     # Recovery still fires (tool_calls is None initially), and finish_reason
@@ -436,13 +447,15 @@ def test_rewrite_chat_completion_does_not_overwrite_finish_reason_when_already_t
 def test_rewrite_chat_completion_preserves_other_finish_reasons():
     """`content_filter` and other vLLM finish reasons should NOT be bumped."""
     payload = {
-        "choices": [{
-            "message": {
-                "content": '<|tool_calls|>[{"name":"a","arguments":{}}]<|/tool_calls|>',
-                "tool_calls": None,
-            },
-            "finish_reason": "content_filter",
-        }],
+        "choices": [
+            {
+                "message": {
+                    "content": '<|tool_calls|>[{"name":"a","arguments":{}}]<|/tool_calls|>',
+                    "tool_calls": None,
+                },
+                "finish_reason": "content_filter",
+            }
+        ],
     }
     rewrite_chat_completion(payload)
     # Recovery doesn't bump this — only `stop`, `length`, `None` are bumped.
@@ -611,6 +624,7 @@ def test_replay_phi4_healthy_chat_does_not_trigger_recovery():
 
 def _drive_recovery(blob: bytes, tool_parser: str) -> bytes:
     """Run stream_tool_recovery end-to-end on `blob`, return joined output."""
+
     async def _async_iter():
         yield blob
 
@@ -637,19 +651,21 @@ def _sse(events: list[dict | str]) -> bytes:
 def _content_chunk(content: str, finish: str | None = None, idx: int = 0) -> dict:
     """Compact builder for a single content-delta chunk."""
     return {
-        "id": "x", "model": "m",
-        "choices": [{"index": idx, "delta": {"content": content},
-                     "finish_reason": finish}],
+        "id": "x",
+        "model": "m",
+        "choices": [{"index": idx, "delta": {"content": content}, "finish_reason": finish}],
     }
 
 
 def test_stream_recovery_passthrough_for_non_leaky_parser():
     """Non-leaky parsers get a pure passthrough — no buffering overhead."""
-    blob = _sse([
-        _content_chunk("hello"),
-        _content_chunk(" world", finish="stop"),
-        "[DONE]",
-    ])
+    blob = _sse(
+        [
+            _content_chunk("hello"),
+            _content_chunk(" world", finish="stop"),
+            "[DONE]",
+        ]
+    )
     out = _drive_recovery(blob, tool_parser="hermes")
     assert out == blob, "non-leaky parser must be exact passthrough"
 
@@ -657,12 +673,14 @@ def test_stream_recovery_passthrough_for_non_leaky_parser():
 def test_stream_recovery_healthy_chat_streams_normally():
     """Phi-4-mini chat content (no leak shape) should reach the client,
     not get buffered until done."""
-    blob = _sse([
-        _content_chunk("To list "),
-        _content_chunk("files use "),
-        _content_chunk("ls.", finish="stop"),
-        "[DONE]",
-    ])
+    blob = _sse(
+        [
+            _content_chunk("To list "),
+            _content_chunk("files use "),
+            _content_chunk("ls.", finish="stop"),
+            "[DONE]",
+        ]
+    )
     out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
     assert "To list " in out
     assert "files use" in out
@@ -675,13 +693,15 @@ def test_stream_recovery_healthy_chat_streams_normally():
 def test_stream_recovery_phi4_leak_synthesizes_tool_call():
     """Leak-shaped streaming content gets recovered into a single
     structured tool_calls delta with finish_reason=tool_calls."""
-    blob = _sse([
-        _content_chunk("<|tool_calls|>"),
-        _content_chunk('[{"name": "bash"'),
-        _content_chunk(', "arguments": {"command": "ls"}}]'),
-        _content_chunk("<|/tool_calls|>", finish="stop"),
-        "[DONE]",
-    ])
+    blob = _sse(
+        [
+            _content_chunk("<|tool_calls|>"),
+            _content_chunk('[{"name": "bash"'),
+            _content_chunk(', "arguments": {"command": "ls"}}]'),
+            _content_chunk("<|/tool_calls|>", finish="stop"),
+            "[DONE]",
+        ]
+    )
     out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
     assert "<|tool_calls|>" not in out
     assert '"tool_calls"' in out
@@ -692,15 +712,17 @@ def test_stream_recovery_phi4_leak_synthesizes_tool_call():
 def test_stream_recovery_marker_split_across_deltas():
     """Leak opener split across deltas (`<|` then `tool_calls|>`).
     The DECIDING state must keep buffering, not flip to passthrough early."""
-    blob = _sse([
-        _content_chunk("<|"),
-        _content_chunk("tool_calls|>"),
-        _content_chunk(
-            '[{"name":"a","arguments":{}}]<|/tool_calls|>',
-            finish="stop",
-        ),
-        "[DONE]",
-    ])
+    blob = _sse(
+        [
+            _content_chunk("<|"),
+            _content_chunk("tool_calls|>"),
+            _content_chunk(
+                '[{"name":"a","arguments":{}}]<|/tool_calls|>',
+                finish="stop",
+            ),
+            "[DONE]",
+        ]
+    )
     out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
     assert '"tool_calls"' in out
     assert '"name":"a"' in out or '"name": "a"' in out
@@ -710,39 +732,48 @@ def test_stream_recovery_marker_split_across_deltas():
 def test_stream_recovery_truncated_leak_flushes_as_content():
     """If finish_reason=length arrives mid-leak (model hit max_tokens),
     the partial content is flushed as content and finish_reason stays length."""
-    blob = _sse([
-        _content_chunk("<|tool_calls|>"),
-        _content_chunk(
-            '[{"name":"a","arguments":{"loc":"Pa',
-            finish="length",
-        ),
-        "[DONE]",
-    ])
+    blob = _sse(
+        [
+            _content_chunk("<|tool_calls|>"),
+            _content_chunk(
+                '[{"name":"a","arguments":{"loc":"Pa',
+                finish="length",
+            ),
+            "[DONE]",
+        ]
+    )
     out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
     assert "<|tool_calls|>" in out
     assert '"finish_reason": "length"' in out
-    assert (
-        "tool_calls" not in out
-        or '"finish_reason": "tool_calls"' not in out
-    )
+    assert "tool_calls" not in out or '"finish_reason": "tool_calls"' not in out
 
 
 def test_stream_recovery_already_structured_tool_calls_passthrough():
     """If the model emits structured tool_calls in a delta (parser DID
     extract correctly), recovery must not interfere."""
     structured = {
-        "id": "x", "model": "m",
-        "choices": [{
-            "index": 0,
-            "delta": {"tool_calls": [{
-                "index": 0, "id": "t1", "type": "function",
-                "function": {"name": "bash", "arguments": "{}"},
-            }]},
-            "finish_reason": None,
-        }],
+        "id": "x",
+        "model": "m",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "t1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": "{}"},
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ],
     }
     finish = {
-        "id": "x", "model": "m",
+        "id": "x",
+        "model": "m",
         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
     }
     blob = _sse([structured, finish, "[DONE]"])
@@ -755,13 +786,23 @@ def test_stream_recovery_finish_in_separate_chunk_flushes_deciding_buffer():
     """Real-world vLLM pattern: last content chunk has finish_reason=None,
     then a separate empty-delta chunk has finish_reason=stop. The DECIDING
     buffer must flush at the second chunk, not get silently dropped."""
-    blob = _sse([
-        _content_chunk("Hi there"),  # finish=None — still deciding
-        {"id": "x", "model": "m", "choices": [{
-            "index": 0, "delta": {}, "finish_reason": "stop",
-        }]},
-        "[DONE]",
-    ])
+    blob = _sse(
+        [
+            _content_chunk("Hi there"),  # finish=None — still deciding
+            {
+                "id": "x",
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+            "[DONE]",
+        ]
+    )
     out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
     assert "Hi there" in out, "DECIDING buffer was dropped on separate finish chunk"
     assert '"finish_reason": "stop"' in out
@@ -770,10 +811,12 @@ def test_stream_recovery_finish_in_separate_chunk_flushes_deciding_buffer():
 def test_stream_recovery_done_without_finish_flushes_defensively():
     """Defensive: if upstream sends [DONE] without ever firing finish_reason
     on a buffered choice, the rewriter must still flush rather than swallow."""
-    blob = _sse([
-        _content_chunk("orphan content"),
-        "[DONE]",
-    ])
+    blob = _sse(
+        [
+            _content_chunk("orphan content"),
+            "[DONE]",
+        ]
+    )
     out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
     assert "orphan content" in out, "buffered content silently dropped at [DONE]"
 
@@ -781,15 +824,18 @@ def test_stream_recovery_done_without_finish_flushes_defensively():
 def test_stream_recovery_metadata_chunks_passthrough():
     """vLLM's usage chunk (choices=[]) and similar must pass through unchanged."""
     usage_chunk = {
-        "id": "x", "model": "m",
+        "id": "x",
+        "model": "m",
         "choices": [],
         "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
     }
-    blob = _sse([
-        _content_chunk("hi", finish="stop"),
-        usage_chunk,
-        "[DONE]",
-    ])
+    blob = _sse(
+        [
+            _content_chunk("hi", finish="stop"),
+            usage_chunk,
+            "[DONE]",
+        ]
+    )
     out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
     assert '"usage"' in out
     assert '"prompt_tokens": 5' in out

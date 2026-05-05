@@ -13,6 +13,7 @@ All of those rely on the server populating `message.tool_calls` and
 `message.reasoning_content` correctly, which only happens when vLLM has
 the right `--tool-call-parser` and `--reasoning-parser` configured.
 """
+
 from __future__ import annotations
 
 import json
@@ -262,9 +263,7 @@ FIXTURES: tuple[ModelFixture, ...] = (
 
 def _materialize(tmp_path: Path, fixture: ModelFixture) -> Path:
     """Write a minimal HF-style model directory and return the path."""
-    (tmp_path / "config.json").write_text(
-        json.dumps({"architectures": [fixture.architecture]})
-    )
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": [fixture.architecture]}))
     (tmp_path / "chat_template.jinja").write_text(fixture.chat_template)
     # Some real templates only live inside tokenizer_config.json; mirror that.
     (tmp_path / "tokenizer_config.json").write_text(

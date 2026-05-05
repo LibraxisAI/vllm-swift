@@ -12,6 +12,7 @@ Skips when model not present, and the whole module skips when
 `--enable-auto-tool-choice` requires a vLLM that isn't installed in the
 current venv. Opt in: `pytest -m integration tests/integration/test_real_server_e2e.py`.
 """
+
 from __future__ import annotations
 
 import json
@@ -46,6 +47,7 @@ def _require_vllm_swift_cli():
 # ---------------------------------------------------------------------------
 # Tool calling round-trip — Llama-3.2 (tools, no reasoning)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     "vllm_swift_server",
@@ -106,6 +108,7 @@ def test_llama_tool_calling_response_shape(vllm_swift_server):
 # Reasoning round-trip — Qwen3-0.6B (thinking + tools)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     "vllm_swift_server",
     [{"model": "Qwen3-0.6B-hf"}],
@@ -133,16 +136,13 @@ def test_qwen3_reasoning_response_shape(vllm_swift_server):
     reasoning = msg.get("reasoning_content") or ""
     # The damning failure mode: reasoning is null AND content starts with a
     # CoT preamble (the bug that started this whole feature).
-    cot_leaked = (
-        not reasoning
-        and any(
-            preamble in content[:200].lower()
-            for preamble in (
-                "here's a thinking process",
-                "here is a thinking process",
-                "<think>",
-                "let me think",
-            )
+    cot_leaked = not reasoning and any(
+        preamble in content[:200].lower()
+        for preamble in (
+            "here's a thinking process",
+            "here is a thinking process",
+            "<think>",
+            "let me think",
         )
     )
     assert not cot_leaked, (
@@ -155,6 +155,7 @@ def test_qwen3_reasoning_response_shape(vllm_swift_server):
 # ---------------------------------------------------------------------------
 # Negative: a non-thinking model must NOT have reasoning_content populated
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     "vllm_swift_server",

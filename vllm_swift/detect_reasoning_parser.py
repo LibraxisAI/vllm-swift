@@ -18,6 +18,7 @@ Saves the OpenCode / Hermes / Droid / etc symptom where the model's
 chain-of-thought leaks into `message.content` and `message.reasoning_content`
 stays null because vLLM has no parser configured.
 """
+
 from __future__ import annotations
 
 import json

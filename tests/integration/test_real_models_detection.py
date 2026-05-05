@@ -9,6 +9,7 @@ and what model authors actually ship in the wild.
 Skips per-model when the model isn't on disk; opt in to the whole suite
 with `pytest -m integration`.
 """
+
 from __future__ import annotations
 
 import pytest
