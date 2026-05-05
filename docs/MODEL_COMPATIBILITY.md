@@ -34,7 +34,7 @@ within run-to-run variance.
 | Qwen3.5-2B-4bit | ❌ HARD-FAIL | qwen3_coder / qwen3 | silent generation: 0 tokens emitted to content/reasoning/tool_calls | Qwen3.5 small variant chat-template bug + reasoning-disabled-by-default |
 | Llama-3.2-1B-Instruct-hf | ❌ HARD-FAIL | llama3_json / *(none)* | never dispatches tools | sub-1B intrinsic limit (Meta: "lightweight models do not support built-in tools") |
 | Mistral-7B-Instruct-v0.3-4bit | ❌ HARD-FAIL | mistral / *(none)* | vLLM mistral parser fails with "Only one BOT token should have been outputted" + emits `[TOOL_CALLS][TOOL_CALLS]` | vLLM upstream parser bug |
-| Phi-4-mini-instruct-4bit | ❌ HARD-FAIL | phi4_mini_json / *(none)* | model emits `<\|tool_calls\|>...<\|/tool_calls\|>` as plain content text; parser doesn't extract | vLLM upstream parser gap |
+| Phi-4-mini-instruct-4bit | ⚠️ SOFT-FAIL | phi4_mini_json / *(none)* | Model emits `<\|tool_calls\|>...<\|/tool_calls\|>` as plain content text and vLLM's parser doesn't extract. Auto-recovery in vllm-swift's response rewriter (both non-streaming and streaming) now synthesizes structured `tool_calls` from this leak shape, lifting Phi-4-mini from HARD-FAIL to functional for clients that hit the documented behavior. Remaining failure mode is the model occasionally choosing to chat-explain instead of dispatch — a model-quality issue, not a parser/recovery one. | vLLM upstream parser gap; recovered by vllm-swift |
 | gemma-4-e2b-it-4bit | ⏭️ SKIPPED | gemma4 / gemma4 | server boot fails: "Can't load video processor" missing `video_preprocessor_config.json` | environment / missing files |
 
 ## Per-model details
@@ -127,16 +127,24 @@ itself is the upstream bug surface.
 #### Phi-4-mini-instruct-4bit
 Auto-detect picks `phi4_mini_json`. Model emits the correct token
 sequence as plain content (`<|tool_calls|>[{...}]<|/tool_calls|>`),
-but the parser does not extract it into `message.tool_calls`. Documented:
+but vLLM's parser does not extract it into `message.tool_calls`. Documented:
 
 - [#14682 — Phi-4-mini function calling support](https://github.com/vllm-project/vllm/issues/14682)
 - [#14359 — phi-4-mini-instruct auto tool call doesn't have tool-call-parser](https://github.com/vllm-project/vllm/issues/14359)
 - [#14037 — Phi-4-mini giving random outputs with continuous batching](https://github.com/vllm-project/vllm/issues/14037)
 
 Microsoft's [Phi-4-mini-instruct model card](https://huggingface.co/microsoft/Phi-4-mini-instruct)
-also notes the model "could sometimes hallucinate function names." The
-combination of model-level instability and parser-extraction gap
-explains the failure.
+also notes the model "could sometimes hallucinate function names."
+
+**Recovered by vllm-swift since v0.4.0.** When `phi4_mini_json` is the
+auto-detected tool parser, the rewriter proxy spawns automatically (via
+`_LEAKY_TOOL_PARSERS`) and runs auto-recovery on both non-streaming and
+streaming responses. The leak shape gets parsed out of `content` and
+synthesized into a structured `message.tool_calls`, with `finish_reason`
+bumped to `tool_calls`. Clients see a normal structured tool dispatch.
+The remaining model-quality issue (Phi-4-mini sometimes choosing to
+chat-explain rather than dispatch) is unfixable from vllm-swift; if your
+agent loop hits it, a stronger model is the answer.
 
 ### ⏭️ SKIPPED — environment / missing files
 
@@ -166,9 +174,9 @@ entirely on the MLX 4-bit build we have on disk.
 
 | Category | Count | Models |
 |---|---|---|
-| Works end-to-end via vllm-swift | **6/12** | Qwen3.5-9B, Qwen3-Coder-30B-MLX, Nemotron-Cascade-2, Qwen3.6-35B-A3B, Llama-3.2-3B, gpt-oss-20b |
+| Works end-to-end via vllm-swift | **7/12** | Qwen3.5-9B, Qwen3-Coder-30B-MLX, Nemotron-Cascade-2, Qwen3.6-35B-A3B, Llama-3.2-3B, gpt-oss-20b, Phi-4-mini *(via auto-recovery since v0.4.0)* |
 | Model intrinsic limit (sub-7B) | 3/12 | Qwen3-0.6B, Qwen3.5-2B, Llama-3.2-1B |
-| vLLM upstream parser bug | 2/12 | Mistral-7B-v0.3, Phi-4-mini |
+| vLLM upstream parser bug (no in-band recovery) | 1/12 | Mistral-7B-v0.3 (parser 500s before recovery sees it) |
 | Environment / missing files | 1/12 | gemma-4-e2b-it |
 
 **0/12 failures are vllm-swift bugs.** Every failure traces to (a)

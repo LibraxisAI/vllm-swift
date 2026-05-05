@@ -54,10 +54,29 @@ Qwen3-Coder, and Nemotron-Cascade-2 ship qwen3_coder XML. The
 detector handles this, but if you've manually overridden or the
 detector mis-routed, mismatched parser explains the leak.
 
-**Fix:** override to the correct parser (see "auto-detect picked the
-wrong parser" above). If you believe the routing is wrong for a model
-the detector picks, file an issue with the chat template excerpt
-showing the actual emission shape.
+**What vllm-swift now does automatically (since v0.4.0):** the response
+rewriter detects four leak shapes in `message.content` and synthesizes
+proper structured `message.tool_calls`, clearing the leaked text and
+bumping `finish_reason` to `tool_calls`. Shapes covered:
+
+  - `<tool_call>{"name":...,"arguments":...}</tool_call>` (hermes JSON)
+  - `<tool_call><function=name><parameter=k>v</parameter>...</function></tool_call>` (qwen3_coder XML)
+  - `<\|tool_calls\|>[{...}]<\|/tool_calls\|>` (phi4 pipe-tag)
+  - `[TOOL_CALLS][{...}]` (mistral bracket)
+
+Recovery runs in both non-streaming and streaming responses. For
+non-leaky parsers it's pass-through with no overhead. For known-leaky
+parsers (`phi4_mini_json` today) the rewriter proxy auto-spawns even
+on non-reasoning models so recovery has a chance to fire. Tail
+`~/.vllm-swift/debug.log` for `recovered N tool_call(s)` lines.
+
+**Manual fix when recovery doesn't catch your case:** override to the
+correct parser (see "auto-detect picked the wrong parser" above). If
+you believe the routing is wrong for a model the detector picks, file
+an issue with the chat template excerpt showing the actual emission
+shape — and ideally a captured response showing how it leaked, so the
+next person hits the auto-recovery path instead of needing a manual
+override.
 
 ## Symptom: "Thinking-only response", "Empty response", or agent loop terminates after one turn
 
