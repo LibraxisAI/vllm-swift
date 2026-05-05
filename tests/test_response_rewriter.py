@@ -27,6 +27,7 @@ from vllm_swift.response_rewriter import (
     rewrite_chat_completion,
     rewrite_request,
     stream_rewriter,
+    stream_tool_recovery,
 )
 
 REASONING_PARSER = "nemotron_v3"
@@ -601,6 +602,171 @@ def test_replay_phi4_healthy_chat_does_not_trigger_recovery():
     assert payload["choices"][0]["finish_reason"] == original_finish, (
         "recovery false-positively bumped finish_reason on healthy response"
     )
+
+
+# ---------------------------------------------------------------------------
+# Streaming tool-call recovery
+# ---------------------------------------------------------------------------
+
+
+def _drive_recovery(blob: bytes, tool_parser: str) -> bytes:
+    """Run stream_tool_recovery end-to-end on `blob`, return joined output."""
+    async def _async_iter():
+        yield blob
+
+    async def _collect():
+        out = []
+        async for chunk in stream_tool_recovery(_async_iter(), tool_parser):
+            out.append(chunk)
+        return b"".join(out)
+
+    return asyncio.run(_collect())
+
+
+def _sse(events: list[dict | str]) -> bytes:
+    """Encode a list of dicts (or the literal '[DONE]') as SSE."""
+    out = []
+    for e in events:
+        if e == "[DONE]":
+            out.append("data: [DONE]\n\n")
+        else:
+            out.append(f"data: {json.dumps(e)}\n\n")
+    return "".join(out).encode()
+
+
+def _content_chunk(content: str, finish: str | None = None, idx: int = 0) -> dict:
+    """Compact builder for a single content-delta chunk."""
+    return {
+        "id": "x", "model": "m",
+        "choices": [{"index": idx, "delta": {"content": content},
+                     "finish_reason": finish}],
+    }
+
+
+def test_stream_recovery_passthrough_for_non_leaky_parser():
+    """Non-leaky parsers get a pure passthrough — no buffering overhead."""
+    blob = _sse([
+        _content_chunk("hello"),
+        _content_chunk(" world", finish="stop"),
+        "[DONE]",
+    ])
+    out = _drive_recovery(blob, tool_parser="hermes")
+    assert out == blob, "non-leaky parser must be exact passthrough"
+
+
+def test_stream_recovery_healthy_chat_streams_normally():
+    """Phi-4-mini chat content (no leak shape) should reach the client,
+    not get buffered until done."""
+    blob = _sse([
+        _content_chunk("To list "),
+        _content_chunk("files use "),
+        _content_chunk("ls.", finish="stop"),
+        "[DONE]",
+    ])
+    out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
+    assert "To list " in out
+    assert "files use" in out
+    assert "ls." in out
+    assert '"finish_reason": "stop"' in out
+    assert "tool_calls" not in out
+    assert "[DONE]" in out
+
+
+def test_stream_recovery_phi4_leak_synthesizes_tool_call():
+    """Leak-shaped streaming content gets recovered into a single
+    structured tool_calls delta with finish_reason=tool_calls."""
+    blob = _sse([
+        _content_chunk("<|tool_calls|>"),
+        _content_chunk('[{"name": "bash"'),
+        _content_chunk(', "arguments": {"command": "ls"}}]'),
+        _content_chunk("<|/tool_calls|>", finish="stop"),
+        "[DONE]",
+    ])
+    out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
+    assert "<|tool_calls|>" not in out
+    assert '"tool_calls"' in out
+    assert '"name": "bash"' in out
+    assert '"finish_reason": "tool_calls"' in out
+
+
+def test_stream_recovery_marker_split_across_deltas():
+    """Leak opener split across deltas (`<|` then `tool_calls|>`).
+    The DECIDING state must keep buffering, not flip to passthrough early."""
+    blob = _sse([
+        _content_chunk("<|"),
+        _content_chunk("tool_calls|>"),
+        _content_chunk(
+            '[{"name":"a","arguments":{}}]<|/tool_calls|>',
+            finish="stop",
+        ),
+        "[DONE]",
+    ])
+    out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
+    assert '"tool_calls"' in out
+    assert '"name":"a"' in out or '"name": "a"' in out
+    assert '"finish_reason": "tool_calls"' in out
+
+
+def test_stream_recovery_truncated_leak_flushes_as_content():
+    """If finish_reason=length arrives mid-leak (model hit max_tokens),
+    the partial content is flushed as content and finish_reason stays length."""
+    blob = _sse([
+        _content_chunk("<|tool_calls|>"),
+        _content_chunk(
+            '[{"name":"a","arguments":{"loc":"Pa',
+            finish="length",
+        ),
+        "[DONE]",
+    ])
+    out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
+    assert "<|tool_calls|>" in out
+    assert '"finish_reason": "length"' in out
+    assert (
+        "tool_calls" not in out
+        or '"finish_reason": "tool_calls"' not in out
+    )
+
+
+def test_stream_recovery_already_structured_tool_calls_passthrough():
+    """If the model emits structured tool_calls in a delta (parser DID
+    extract correctly), recovery must not interfere."""
+    structured = {
+        "id": "x", "model": "m",
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": 0, "id": "t1", "type": "function",
+                "function": {"name": "bash", "arguments": "{}"},
+            }]},
+            "finish_reason": None,
+        }],
+    }
+    finish = {
+        "id": "x", "model": "m",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+    }
+    blob = _sse([structured, finish, "[DONE]"])
+    out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
+    assert '"name": "bash"' in out
+    assert '"finish_reason": "tool_calls"' in out
+
+
+def test_stream_recovery_metadata_chunks_passthrough():
+    """vLLM's usage chunk (choices=[]) and similar must pass through unchanged."""
+    usage_chunk = {
+        "id": "x", "model": "m",
+        "choices": [],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+    }
+    blob = _sse([
+        _content_chunk("hi", finish="stop"),
+        usage_chunk,
+        "[DONE]",
+    ])
+    out = _drive_recovery(blob, tool_parser="phi4_mini_json").decode()
+    assert '"usage"' in out
+    assert '"prompt_tokens": 5' in out
+    assert "[DONE]" in out
 
 
 def test_replay_truncated_leak_response_skips_recovery_gracefully():

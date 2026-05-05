@@ -510,6 +510,262 @@ def _make_delta_event(idx: int, role: str | None, reasoning: str | None,
     return f"data: {json.dumps(new_chunk)}\n\n"
 
 
+# =============================================================================
+# Streaming tool-call recovery
+# =============================================================================
+#
+# Mirrors `_recover_tool_calls_from_content` but for SSE streams. Most clients
+# (OpenCode / Pi / Hermes) use stream=true, so non-streaming-only recovery
+# wouldn't actually fix Phi-4-mini against them.
+#
+# Design: per-choice state machine over content deltas.
+#   - DECIDING: buffer first ~32 chars. Compare against known leak openers.
+#       - If prefix matches a leak opener → BUFFERING
+#       - If buffer past threshold without matching → PASSTHROUGH (flush + stream)
+#       - Else stay DECIDING (need more data)
+#   - PASSTHROUGH: forward content deltas verbatim. Streaming UX preserved.
+#   - BUFFERING: accumulate content, emit nothing until finish_reason.
+#       On finish: try _recover_tool_calls_from_content over the full buffer.
+#         - Success → emit synthesized tool_calls delta + finish_reason=tool_calls
+#         - Failure → flush buffer as a single content delta + original finish
+
+_LEAK_OPEN_MARKERS: tuple[str, ...] = (
+    "<|tool_call",   # phi4 — covers both `<|tool_calls|>` and `<|tool_call|>`
+    "<tool_call>",   # hermes JSON or qwen3_coder XML
+    "[TOOL_CALLS]",  # mistral
+)
+_LEAK_DECISION_THRESHOLD = 32  # chars to buffer before deciding passthrough
+
+
+def _classify_streaming_buffer(buffer: str) -> str | None:
+    """Decide whether a streamed buffer prefix is a leak opener.
+
+    Returns:
+        "leak" — definite leak shape; switch to BUFFERING.
+        "no-leak" — definitely not a leak shape; switch to PASSTHROUGH.
+        None — ambiguous; need more data before deciding.
+    """
+    stripped = buffer.lstrip()
+    if any(stripped.startswith(m) for m in _LEAK_OPEN_MARKERS):
+        return "leak"
+    # Could still become a leak if we get more chars (e.g., buffer is `<` and
+    # next delta starts with `|`). Keep deciding.
+    if any(m.startswith(stripped) for m in _LEAK_OPEN_MARKERS):
+        return None
+    if len(buffer) >= _LEAK_DECISION_THRESHOLD:
+        return "no-leak"
+    return None
+
+
+def _streaming_tool_call_delta(idx: int, tc: dict) -> dict:
+    """Format a recovered tool_call as a single streaming delta entry."""
+    return {
+        "index": idx,
+        "id": tc["id"],
+        "type": tc.get("type", "function"),
+        "function": tc["function"],
+    }
+
+
+class _RecoveryChoiceState:
+    __slots__ = ("buffer", "decision")
+    DECIDING = "deciding"
+    PASSTHROUGH = "passthrough"
+    BUFFERING = "buffering"
+
+    def __init__(self) -> None:
+        self.buffer = ""
+        self.decision = self.DECIDING
+
+
+async def stream_tool_recovery(
+    upstream_iter: AsyncIterator[bytes],
+    tool_parser: str,
+) -> AsyncIterator[bytes]:
+    """SSE wrapper that recovers structured tool_calls from leak-shaped content.
+
+    Engaged only when `tool_parser` is in `_LEAKY_TOOL_PARSERS`. For all other
+    parsers, this is a thin passthrough (no buffering overhead).
+    """
+    if tool_parser not in _LEAKY_TOOL_PARSERS:
+        async for chunk in upstream_iter:
+            yield chunk
+        return
+
+    states: dict[int, _RecoveryChoiceState] = {}
+    pending = b""
+    async for raw in upstream_iter:
+        pending += raw
+        while b"\n\n" in pending:
+            event_bytes, pending = pending.split(b"\n\n", 1)
+            event = event_bytes.decode("utf-8", errors="replace")
+            if not event.startswith("data: "):
+                yield (event + "\n\n").encode()
+                continue
+            payload_text = event[len("data: "):]
+            if payload_text.strip() == "[DONE]":
+                yield event.encode() + b"\n\n"
+                continue
+            try:
+                chunk = json.loads(payload_text)
+            except json.JSONDecodeError:
+                yield (event + "\n\n").encode()
+                continue
+            # Pass-through metadata chunks (usage)
+            if not chunk.get("choices"):
+                yield (event + "\n\n").encode()
+                continue
+
+            forward_choices = []
+            for c in chunk.get("choices", []):
+                idx = c.get("index", 0)
+                st = states.setdefault(idx, _RecoveryChoiceState())
+                delta = c.get("delta", {}) or {}
+                content_delta = delta.get("content")
+                finish_reason = c.get("finish_reason")
+
+                # Already-structured tool_calls in delta → flip to passthrough
+                # for this choice and just forward.
+                if delta.get("tool_calls"):
+                    st.decision = _RecoveryChoiceState.PASSTHROUGH
+                    forward_choices.append(c)
+                    continue
+
+                # PASSTHROUGH choice: forward verbatim
+                if st.decision == _RecoveryChoiceState.PASSTHROUGH:
+                    forward_choices.append(c)
+                    continue
+
+                # No content delta in this chunk
+                if content_delta is None:
+                    in_buffering = st.decision == _RecoveryChoiceState.BUFFERING
+                    if finish_reason and in_buffering and st.buffer:
+                        # Stream end while buffering — try recovery
+                        recovered = _recover_tool_calls_from_content(st.buffer)
+                        if recovered:
+                            tool_calls, _residual = recovered
+                            forward_choices.append({
+                                "index": idx,
+                                "delta": {
+                                    "tool_calls": [
+                                        _streaming_tool_call_delta(i, tc)
+                                        for i, tc in enumerate(tool_calls)
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            })
+                            logger.info(
+                                "stream-recovered %d tool_calls from %d buffered chars",
+                                len(tool_calls), len(st.buffer),
+                            )
+                        else:
+                            # Recovery failed — flush buffer as content
+                            forward_choices.append({
+                                "index": idx,
+                                "delta": {"content": st.buffer},
+                                "finish_reason": finish_reason,
+                            })
+                        st.buffer = ""
+                    else:
+                        forward_choices.append(c)
+                    continue
+
+                # Content delta arrived; accumulate
+                st.buffer += content_delta
+
+                if st.decision == _RecoveryChoiceState.DECIDING:
+                    classification = _classify_streaming_buffer(st.buffer)
+                    if classification == "leak":
+                        st.decision = _RecoveryChoiceState.BUFFERING
+                        # If finish_reason came along with this content delta,
+                        # try recovery now.
+                        if finish_reason:
+                            recovered = _recover_tool_calls_from_content(st.buffer)
+                            if recovered:
+                                tool_calls, _residual = recovered
+                                forward_choices.append({
+                                    "index": idx,
+                                    "delta": {
+                                        "tool_calls": [
+                                            _streaming_tool_call_delta(i, tc)
+                                            for i, tc in enumerate(tool_calls)
+                                        ],
+                                    },
+                                    "finish_reason": "tool_calls",
+                                })
+                                logger.info(
+                                    "stream-recovered %d tool_calls from %d buffered chars",
+                                    len(tool_calls), len(st.buffer),
+                                )
+                            else:
+                                forward_choices.append({
+                                    "index": idx,
+                                    "delta": {"content": st.buffer},
+                                    "finish_reason": finish_reason,
+                                })
+                            st.buffer = ""
+                        # else: keep buffering, emit no delta this round
+                    elif classification == "no-leak":
+                        st.decision = _RecoveryChoiceState.PASSTHROUGH
+                        # Flush accumulated buffer as a single content delta
+                        forward_choices.append({
+                            "index": idx,
+                            "delta": {"content": st.buffer},
+                            "finish_reason": finish_reason,
+                        })
+                        st.buffer = ""
+                    else:
+                        # Still ambiguous; if finish_reason arrives, flush as content
+                        if finish_reason:
+                            forward_choices.append({
+                                "index": idx,
+                                "delta": {"content": st.buffer},
+                                "finish_reason": finish_reason,
+                            })
+                            st.buffer = ""
+                            st.decision = _RecoveryChoiceState.PASSTHROUGH
+                        # else: hold and wait for more
+                elif st.decision == _RecoveryChoiceState.BUFFERING:
+                    # Keep accumulating; recover only at finish_reason
+                    if finish_reason:
+                        recovered = _recover_tool_calls_from_content(st.buffer)
+                        if recovered:
+                            tool_calls, _residual = recovered
+                            forward_choices.append({
+                                "index": idx,
+                                "delta": {
+                                    "tool_calls": [
+                                        _streaming_tool_call_delta(i, tc)
+                                        for i, tc in enumerate(tool_calls)
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            })
+                            logger.info(
+                                "stream-recovered %d tool_calls from %d buffered chars",
+                                len(tool_calls), len(st.buffer),
+                            )
+                        else:
+                            forward_choices.append({
+                                "index": idx,
+                                "delta": {"content": st.buffer},
+                                "finish_reason": finish_reason,
+                            })
+                        st.buffer = ""
+
+            if forward_choices:
+                rewritten = {**chunk, "choices": forward_choices}
+                yield f"data: {json.dumps(rewritten)}\n\n".encode()
+
+    if pending:
+        yield pending
+
+
+# =============================================================================
+# Streaming Thinking-prefix splitter (existing)
+# =============================================================================
+
+
 async def stream_rewriter(
     upstream_iter: AsyncIterator[bytes], arch: str
 ) -> AsyncIterator[bytes]:
@@ -666,7 +922,8 @@ async def stream_rewriter(
 # =============================================================================
 
 
-async def _make_app(upstream_url: str, arch: str, reasoning_parser: str = "") -> web.Application:
+async def _make_app(upstream_url: str, arch: str, reasoning_parser: str = "",
+                    tool_parser: str = "") -> web.Application:
     timeout = aiohttp.ClientTimeout(total=600)
 
     async def proxy(request: web.Request) -> web.StreamResponse:
@@ -697,8 +954,12 @@ async def _make_app(upstream_url: str, arch: str, reasoning_parser: str = "") ->
                         headers={"Content-Type": ct, "Cache-Control": "no-cache"},
                     )
                     await response.prepare(request)
-                    async for out_chunk in stream_rewriter(
+                    # Chain: thinking-split → tool-call streaming recovery
+                    thinking_split = stream_rewriter(
                         upstream_resp.content.iter_any(), arch
+                    )
+                    async for out_chunk in stream_tool_recovery(
+                        thinking_split, tool_parser
                     ):
                         await response.write(out_chunk)
                     await response.write_eof()
@@ -733,15 +994,19 @@ async def _make_app(upstream_url: str, arch: str, reasoning_parser: str = "") ->
 
 
 def run(user_port: int, upstream_port: int, arch: str,
-        reasoning_parser: str = "") -> None:
+        reasoning_parser: str = "", tool_parser: str = "") -> None:
     """Run the rewriter proxy. Blocks until killed."""
     upstream_url = f"http://127.0.0.1:{upstream_port}"
     logger.info(
-        "rewriter starting: user_port=%d upstream=%s arch=%s reasoning_parser=%s",
+        "rewriter starting: user_port=%d upstream=%s arch=%s reasoning_parser=%s "
+        "tool_parser=%s",
         user_port, upstream_url, arch, reasoning_parser or "<none>",
+        tool_parser or "<none>",
     )
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = loop.run_until_complete(_make_app(upstream_url, arch, reasoning_parser))
+    app = loop.run_until_complete(
+        _make_app(upstream_url, arch, reasoning_parser, tool_parser)
+    )
     web.run_app(app, host="127.0.0.1", port=user_port,
                 print=lambda *_: None, loop=loop)

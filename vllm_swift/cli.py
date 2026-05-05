@@ -275,6 +275,7 @@ def _serve(args: list[str]) -> int:
         env=env,
         arch=arch,
         reasoning_parser=injected_reasoning,
+        tool_parser=injected_tool,
     )
 
 
@@ -286,6 +287,7 @@ def _serve_with_rewriter(
     env: dict[str, str],
     arch: str,
     reasoning_parser: str,
+    tool_parser: str = "",
 ) -> int:
     """Spawn vLLM on an internal port and the rewriter on the user port.
 
@@ -350,6 +352,7 @@ def _serve_with_rewriter(
             upstream_port=internal_port,
             arch=arch,
             reasoning_parser=reasoning_parser,
+            tool_parser=tool_parser,
         )
         return 0
     finally:
