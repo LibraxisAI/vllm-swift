@@ -113,33 +113,17 @@ case "${1:-}" in
   serve)
     _ensure_venv
     shift
-    # README documents `vllm-swift serve <model> [args]` — the model is the first
-    # positional. vllm.entrypoints.openai.api_server's argparse maps a stray
-    # positional to the deprecated `model_tag` slot, NOT to ModelConfig.model,
-    # so without this rewrite the user's path was getting silently dropped and
-    # vLLM was falling back to its placeholder default (Qwen/Qwen3-0.6B). See #11.
-    MODEL="${1:?Usage: vllm-swift serve <model-path-or-hf-id> [vllm args...]}"
-    shift
-    # Smart defaults: auto-inject --enable-auto-tool-choice and --tool-call-parser
-    # when the model architecture maps to a known parser and the user didn't pass
-    # either flag. Saves the "tool_choice=auto requires --enable-auto-tool-choice"
-    # 400 from vLLM when calling from Hermes / standard OpenAI clients.
-    EXTRA_ARGS=()
-    HAS_TOOL_FLAG=0
-    for arg in "$@"; do
-      case "$arg" in
-        --tool-call-parser|--tool-call-parser=*|--enable-auto-tool-choice|--no-enable-auto-tool-choice) HAS_TOOL_FLAG=1 ;;
-      esac
-    done
-    if [ "$HAS_TOOL_FLAG" = 0 ] && [ -f "$PREFIX/libexec/scripts/detect_tool_parser.py" ]; then
-      PARSER=$("$VENV_DIR/bin/python3" "$PREFIX/libexec/scripts/detect_tool_parser.py" "$MODEL" 2>/dev/null)
-      if [ -n "$PARSER" ]; then
-        echo "vllm-swift: auto-detected tool parser '$PARSER' for $(basename "$MODEL"); injecting --enable-auto-tool-choice --tool-call-parser $PARSER"
-        echo "  (override with explicit --tool-call-parser <name> or --no-enable-auto-tool-choice)"
-        EXTRA_ARGS+=(--enable-auto-tool-choice --tool-call-parser "$PARSER")
-      fi
-    fi
-    exec "$VENV_DIR/bin/python3" -m vllm.entrypoints.openai.api_server --model "$MODEL" "${EXTRA_ARGS[@]}" "$@"
+    # Delegate to the Python CLI (vllm_swift.cli). It owns the full
+    # auto-detect + invisible self-heal stack as of v0.4.0:
+    #   - tool + reasoning parser detection (3-layer)
+    #   - pre-flight registry validation against vLLM's parser sets
+    #   - rewriter proxy for max_tokens rescue, Thinking: split,
+    #     plaintext-JSON tool-call recovery (streaming + non-streaming)
+    # Keeping the bash wrapper as a thin shim that only sets up
+    # DYLD_LIBRARY_PATH + venv routing means the bottle inherits every
+    # v0.4.0+ feature automatically without re-implementing parser logic
+    # in two places.
+    exec "$VENV_DIR/bin/python3" -m vllm_swift.cli serve "$@"
     ;;
   download)
     _ensure_venv
@@ -166,7 +150,7 @@ print(f'Downloaded to {p}')
     echo "Update complete."
     ;;
   version)
-    echo "vllm-swift 0.3.3"
+    echo "vllm-swift 0.4.0"
     echo "dylib: $PREFIX/lib/libVLLMBridge.dylib"
     [ -d "$VENV_DIR" ] && "$VENV_DIR/bin/python3" -c "import vllm; print(f'vLLM: {vllm.__version__}')" 2>/dev/null
     ;;
