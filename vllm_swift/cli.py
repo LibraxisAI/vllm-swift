@@ -123,6 +123,24 @@ def _strip_port(args: list[str]) -> list[str]:
     return out
 
 
+def _extract_max_model_len(args: list[str]) -> int | None:
+    """Find --max-model-len in args, else None."""
+    prev = ""
+    for arg in args:
+        if arg.startswith("--max-model-len="):
+            try:
+                return int(arg.split("=", 1)[1])
+            except ValueError:
+                return None
+        if prev == "--max-model-len":
+            try:
+                return int(arg)
+            except ValueError:
+                return None
+        prev = arg
+    return None
+
+
 def _wait_for_vllm_ready(port: int, timeout: float = 600.0) -> bool:
     """Poll the vLLM /health endpoint until it responds or we time out."""
     url = f"http://127.0.0.1:{port}/health"
@@ -273,6 +291,7 @@ def _serve(args: list[str]) -> int:
         arch=arch,
         reasoning_parser=injected_reasoning,
         tool_parser=injected_tool,
+        max_model_len=_extract_max_model_len(passthrough),
     )
 
 
@@ -285,6 +304,7 @@ def _serve_with_rewriter(  # pragma: no cover
     arch: str,
     reasoning_parser: str,
     tool_parser: str = "",
+    max_model_len: int | None = None,
 ) -> int:
     """Spawn vLLM on an internal port and the rewriter on the user port.
 
@@ -351,6 +371,7 @@ def _serve_with_rewriter(  # pragma: no cover
             arch=arch,
             reasoning_parser=reasoning_parser,
             tool_parser=tool_parser,
+            max_model_len=max_model_len,
         )
         return 0
     finally:

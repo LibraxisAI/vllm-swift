@@ -440,7 +440,12 @@ def rewrite_chat_completion(payload: dict) -> dict:
     return payload
 
 
-def rewrite_request(body: dict, arch: str, reasoning_parser: str = "") -> dict:
+def rewrite_request(
+    body: dict,
+    arch: str,
+    reasoning_parser: str = "",
+    max_model_len: int | None = None,
+) -> dict:
     """Rewrite an outgoing /v1/chat/completions request in place.
 
     Currently does one thing: silently bumps `max_tokens` when the proxy
@@ -450,6 +455,12 @@ def rewrite_request(body: dict, arch: str, reasoning_parser: str = "") -> dict:
     `</think>` never closes, and the parser dumps raw thinking into
     `content` as a monologue.
 
+    `max_model_len` (when known from the CLI invocation) clamps the
+    bump value so we never request more output tokens than the server
+    can produce. Prevents the "max_tokens=32768 cannot be greater than
+    max_model_len=4096" 400 from vLLM on small-context configurations.
+    Falls back to the static `_REASONING_MAX_TOKENS_BUMP` when unknown.
+
     `arch` is unused here today; kept in the signature so the response-
     side rewriter can stay arch-gated without a second plumbing pass.
     """
@@ -458,12 +469,22 @@ def rewrite_request(body: dict, arch: str, reasoning_parser: str = "") -> dict:
         return body
     requested = body.get("max_tokens")
     if isinstance(requested, int) and 0 < requested < _REASONING_MAX_TOKENS_FLOOR:
-        body["max_tokens"] = _REASONING_MAX_TOKENS_BUMP
+        # Clamp bump against the server's max_model_len when known. Leave a
+        # small safety margin so the prompt tokens still fit.
+        bump = _REASONING_MAX_TOKENS_BUMP
+        if isinstance(max_model_len, int) and max_model_len > 0:
+            bump = min(bump, max_model_len - 256)
+        # Don't bump *down* — if the requested value already beats our
+        # clamped ceiling, leave it alone.
+        if bump <= requested:
+            return body
+        body["max_tokens"] = bump
         logger.info(
-            "bumped max_tokens %d -> %d (reasoning_parser=%s, client-side starvation)",
+            "bumped max_tokens %d -> %d (reasoning_parser=%s, max_model_len=%s)",
             requested,
-            _REASONING_MAX_TOKENS_BUMP,
+            bump,
             reasoning_parser,
+            max_model_len if max_model_len else "<unknown>",
         )
     return body
 
@@ -1013,7 +1034,11 @@ async def stream_rewriter(upstream_iter: AsyncIterator[bytes], arch: str) -> Asy
 
 
 async def _make_app(  # pragma: no cover
-    upstream_url: str, arch: str, reasoning_parser: str = "", tool_parser: str = ""
+    upstream_url: str,
+    arch: str,
+    reasoning_parser: str = "",
+    tool_parser: str = "",
+    max_model_len: int | None = None,
 ) -> "web.Application":
     # aiohttp is only required when the proxy actually runs. Importing
     # lazily lets the recovery / streaming functions be tested in CI
@@ -1032,7 +1057,7 @@ async def _make_app(  # pragma: no cover
         if is_chat and body:
             try:
                 req_payload = json.loads(body.decode())
-                req_payload = rewrite_request(req_payload, arch, reasoning_parser)
+                req_payload = rewrite_request(req_payload, arch, reasoning_parser, max_model_len)
                 body = json.dumps(req_payload).encode()
             except Exception as exc:
                 logger.warning("request rewrite failed, forwarding raw: %s", exc)
@@ -1103,21 +1128,26 @@ def run(  # pragma: no cover
     arch: str,
     reasoning_parser: str = "",
     tool_parser: str = "",
+    max_model_len: int | None = None,
 ) -> None:
     """Run the rewriter proxy. Blocks until killed."""
     upstream_url = f"http://127.0.0.1:{upstream_port}"
     logger.info(
-        "rewriter starting: user_port=%d upstream=%s arch=%s reasoning_parser=%s tool_parser=%s",
+        "rewriter starting: user_port=%d upstream=%s arch=%s reasoning_parser=%s "
+        "tool_parser=%s max_model_len=%s",
         user_port,
         upstream_url,
         arch,
         reasoning_parser or "<none>",
         tool_parser or "<none>",
+        max_model_len if max_model_len else "<unknown>",
     )
     # Lazy aiohttp import — only when the proxy actually runs.
     from aiohttp import web
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = loop.run_until_complete(_make_app(upstream_url, arch, reasoning_parser, tool_parser))
+    app = loop.run_until_complete(
+        _make_app(upstream_url, arch, reasoning_parser, tool_parser, max_model_len)
+    )
     web.run_app(app, host="127.0.0.1", port=user_port, print=lambda *_: None, loop=loop)

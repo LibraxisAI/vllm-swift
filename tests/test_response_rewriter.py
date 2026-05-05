@@ -107,6 +107,33 @@ def test_negative_max_tokens_left_alone():
     assert out["max_tokens"] == -1
 
 
+def test_bump_clamps_against_max_model_len():
+    """Empirical bug from Qwen3.5-2B (max_model_len=4096) on M2: bump
+    to 32768 made vLLM 400 with 'max_tokens cannot be greater than
+    max_model_len=4096'. When max_model_len is known, clamp the bump
+    so the server can actually produce the requested output."""
+    body = {"max_tokens": 256}
+    out = rewrite_request(body, arch="", reasoning_parser=REASONING_PARSER, max_model_len=4096)
+    # Should clamp to max_model_len - 256 safety margin = 3840
+    assert out["max_tokens"] == 3840
+
+
+def test_bump_unaffected_when_max_model_len_above_default_bump():
+    """Large max_model_len (32K+) — clamp is a no-op, full bump applies."""
+    body = {"max_tokens": 8192}
+    out = rewrite_request(body, arch="", reasoning_parser=REASONING_PARSER, max_model_len=131072)
+    assert out["max_tokens"] == _REASONING_MAX_TOKENS_BUMP
+
+
+def test_bump_skips_when_clamped_value_below_requested():
+    """Tiny max_model_len edge case: don't bump *down* — leave the
+    client's value alone if our clamped bump is smaller."""
+    body = {"max_tokens": 4000}
+    out = rewrite_request(body, arch="", reasoning_parser=REASONING_PARSER, max_model_len=4096)
+    # Clamp would give 3840 but client requested 4000 — don't bump down
+    assert out["max_tokens"] == 4000
+
+
 # ---------------------------------------------------------------------------
 # Streaming rewriter — usage-chunk preservation
 # ---------------------------------------------------------------------------

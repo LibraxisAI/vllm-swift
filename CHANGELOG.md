@@ -1,5 +1,17 @@
 # Release History
 
+## v0.4.1 — May 5, 2026
+
+**Patch: clamp `max_tokens` rescue against the configured `max_model_len`.**
+Empirical bug surfaced on Mac Mini M2 testing v0.4.0 against `Qwen3.5-2B-4bit` with `--max-model-len 4096`: the request rewriter bumped a client `max_tokens=256` to the static `_REASONING_MAX_TOKENS_BUMP=32768`, which vLLM then 400'd with `max_tokens cannot be greater than max_model_len=4096`. The bump was correct in spirit (small budget against a reasoning model would have starved the `<think>` block) but didn't know about the server's context ceiling.
+
+- `rewrite_request` now takes an optional `max_model_len` and clamps the bump to `max_model_len - 256` (safety margin for prompt tokens).
+- If the clamped bump is below the client's requested value, leave the request alone — never bump *down*.
+- CLI extracts `--max-model-len` from passthrough args and threads it through `_serve_with_rewriter` → `run` → `_make_app` so the rewriter has the value when bumping.
+- 3 new tests pin the clamp behavior at three boundaries (clamp applies, clamp is no-op when ample, clamp would bump down so skip).
+
+`pip install vllm-swift==0.4.1` and the rebuilt Homebrew bottle for v0.4.1 carry the fix.
+
 ## v0.4.0 — May 5, 2026
 
 **Auto-detect tool + reasoning parsers, plus an invisible self-heal layer for the rough edges.** Closes [#13](https://github.com/TheTom/vllm-swift/issues/13). The original triggering case (`mlx-community/Qwen3.6-35B-A3B-8bit` needing a manual `--tool-call-parser qwen3_coder --reasoning-parser qwen3` workaround) now Just Works, and several other footguns get caught by the same plumbing.
