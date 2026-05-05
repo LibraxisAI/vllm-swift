@@ -276,7 +276,7 @@ def _serve(args: list[str]) -> int:
     )
 
 
-def _serve_with_rewriter(
+def _serve_with_rewriter(  # pragma: no cover
     *,
     extra_args: list[str],
     auto_args: list[str],

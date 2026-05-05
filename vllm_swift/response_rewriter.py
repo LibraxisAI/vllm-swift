@@ -1012,12 +1012,15 @@ async def stream_rewriter(upstream_iter: AsyncIterator[bytes], arch: str) -> Asy
 # =============================================================================
 
 
-async def _make_app(
+async def _make_app(  # pragma: no cover
     upstream_url: str, arch: str, reasoning_parser: str = "", tool_parser: str = ""
 ) -> "web.Application":
     # aiohttp is only required when the proxy actually runs. Importing
     # lazily lets the recovery / streaming functions be tested in CI
-    # without needing aiohttp installed in the test env.
+    # without needing aiohttp installed in the test env. The whole
+    # aiohttp wiring is integration-test territory (requires a live
+    # upstream) — coverage-excluded here, exercised via the
+    # `tests/integration/test_real_server_e2e.py` opt-in suite.
     import aiohttp
     from aiohttp import web
 
@@ -1094,7 +1097,7 @@ async def _make_app(
     return app
 
 
-def run(
+def run(  # pragma: no cover
     user_port: int,
     upstream_port: int,
     arch: str,
