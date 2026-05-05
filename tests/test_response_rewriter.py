@@ -15,6 +15,8 @@ the model has headroom for a real answer / tool_call.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 
 import pytest
 
@@ -294,3 +296,259 @@ def test_rewrite_chat_completion_does_not_clobber_existing_tool_calls():
     # Original tool_calls preserved, NOT replaced by recovery
     assert len(msg["tool_calls"]) == 1
     assert msg["tool_calls"][0]["function"]["name"] == "real_tool"
+
+
+# ---------------------------------------------------------------------------
+# Edge / boundary / negative tests for recovery (audit-driven)
+# ---------------------------------------------------------------------------
+
+
+def test_recover_returns_none_for_empty_content():
+    assert _recover_tool_calls_from_content("") is None
+
+
+def test_recover_returns_none_for_whitespace_only_content():
+    assert _recover_tool_calls_from_content("   \n\t ") is None
+
+
+def test_recover_at_exact_50pct_boundary_passes():
+    """At exactly the ratio floor (>= 50% of content), recovery should fire.
+    Crafted so the matched block is exactly half the content length."""
+    block = '<tool_call>{"name":"a","arguments":{}}</tool_call>'  # 50 chars
+    filler = "x" * len(block)  # equal-length filler — gives exactly 50%
+    content = block + filler
+    result = _recover_tool_calls_from_content(content)
+    assert result is not None, (
+        "boundary case: matched_len == 0.5 * len(content) should pass the "
+        "`< int(len(content) * RATIO)` gate"
+    )
+
+
+def test_recover_just_below_boundary_skips():
+    """Just below 50% should skip — defends the false-positive guard."""
+    block = '<tool_call>{"name":"a","arguments":{}}</tool_call>'
+    filler = "x" * (len(block) + 10)  # filler 10 chars longer
+    content = block + filler
+    assert _recover_tool_calls_from_content(content) is None
+
+
+def test_recover_rejects_phi4_with_malformed_inner_json():
+    content = "<|tool_calls|>[not valid json]<|/tool_calls|>"
+    assert _recover_tool_calls_from_content(content) is None
+
+
+def test_recover_rejects_qwen3_coder_with_no_function_tag():
+    """qwen3_coder block without `<function=...>` inside is malformed."""
+    content = "<tool_call>just text inside, no function</tool_call>"
+    # Hermes regex fails (no `{`), qwen3_coder regex fails (no function=).
+    # Falls through to other shapes which also miss. Total: None.
+    assert _recover_tool_calls_from_content(content) is None
+
+
+def test_recover_rejects_mistral_with_non_array_payload():
+    """Mistral's bracket regex demands an array. Object payload misses."""
+    content = '[TOOL_CALLS]{"name":"x","arguments":{}}'
+    assert _recover_tool_calls_from_content(content) is None
+
+
+def test_recover_drops_calls_with_empty_function_name():
+    """Validation: name must be a non-empty string. Empty name → call dropped."""
+    content = '<tool_call>{"name":"","arguments":{}}</tool_call>'
+    assert _recover_tool_calls_from_content(content) is None
+
+
+def test_recover_drops_calls_with_int_arguments():
+    """Validation: arguments must be dict or stringified-JSON-str. Int rejected."""
+    content = '<tool_call>{"name":"a","arguments":42}</tool_call>'
+    assert _recover_tool_calls_from_content(content) is None
+
+
+def test_recover_drops_calls_with_null_arguments():
+    content = '<tool_call>{"name":"a","arguments":null}</tool_call>'
+    assert _recover_tool_calls_from_content(content) is None
+
+
+def test_recover_accepts_stringified_json_arguments():
+    """Some leaks ship arguments already stringified — accept and pass through."""
+    content = '<tool_call>{"name":"a","arguments":"{\\"k\\":1}"}</tool_call>'
+    result = _recover_tool_calls_from_content(content)
+    assert result is not None
+    calls, _residual = result
+    # Should preserve the stringified form rather than double-encode
+    assert calls[0]["function"]["arguments"] == '{"k":1}'
+
+
+def test_recover_drops_calls_with_unparseable_string_arguments():
+    """If arguments is a string but not valid JSON, drop the call."""
+    content = '<tool_call>{"name":"a","arguments":"not json"}</tool_call>'
+    assert _recover_tool_calls_from_content(content) is None
+
+
+def test_rewrite_chat_completion_handles_multiple_choices():
+    """Recovery iterates over all `choices` independently."""
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": '<|tool_calls|>[{"name":"a","arguments":{}}]<|/tool_calls|>',
+                    "tool_calls": None,
+                },
+                "finish_reason": "stop",
+            },
+            {
+                "message": {
+                    "content": "regular chat in the second choice",
+                    "tool_calls": None,
+                },
+                "finish_reason": "stop",
+            },
+        ],
+    }
+    rewrite_chat_completion(payload)
+    # First choice: recovery fired
+    assert payload["choices"][0]["message"]["tool_calls"]
+    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+    # Second choice: untouched
+    assert not payload["choices"][1]["message"].get("tool_calls")
+    assert payload["choices"][1]["finish_reason"] == "stop"
+
+
+def test_rewrite_chat_completion_does_not_overwrite_finish_reason_when_already_tool_calls():
+    """If finish_reason was already `tool_calls`, leave it alone (don't double-bump)."""
+    payload = {
+        "choices": [{
+            "message": {
+                "content": '<|tool_calls|>[{"name":"a","arguments":{}}]<|/tool_calls|>',
+                "tool_calls": None,
+            },
+            "finish_reason": "tool_calls",  # already set, somehow
+        }],
+    }
+    rewrite_chat_completion(payload)
+    # Recovery still fires (tool_calls is None initially), and finish_reason
+    # stays "tool_calls" — the "in (stop, length, None)" guard correctly
+    # excludes already-set tool_calls.
+    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+    assert payload["choices"][0]["message"]["tool_calls"]
+
+
+def test_rewrite_chat_completion_preserves_other_finish_reasons():
+    """`content_filter` and other vLLM finish reasons should NOT be bumped."""
+    payload = {
+        "choices": [{
+            "message": {
+                "content": '<|tool_calls|>[{"name":"a","arguments":{}}]<|/tool_calls|>',
+                "tool_calls": None,
+            },
+            "finish_reason": "content_filter",
+        }],
+    }
+    rewrite_chat_completion(payload)
+    # Recovery doesn't bump this — only `stop`, `length`, `None` are bumped.
+    assert payload["choices"][0]["finish_reason"] == "content_filter"
+
+
+def test_recover_residual_preserves_surrounding_text():
+    """Text before/after the matched block stays in `residual`."""
+    block = '<tool_call>{"name":"a","arguments":{}}</tool_call>'
+    content = "OK calling: " + block
+    # Make sure ratio passes by keeping prefix small
+    result = _recover_tool_calls_from_content(content)
+    assert result is not None
+    _calls, residual = result
+    assert residual == "OK calling:"
+
+
+# ---------------------------------------------------------------------------
+# Fixture-based replay tests — anonymized snapshots of the actual agent
+# request/response shapes that triggered the original bugs in this PR.
+# These exist so a future change can't silently regress against the
+# specific traffic shape that broke things in production.
+# ---------------------------------------------------------------------------
+
+_FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
+
+
+def _load_fixture_json(name: str) -> dict:
+    with open(os.path.join(_FIXTURES_DIR, name)) as f:
+        return json.load(f)
+
+
+def _strip_capture_metadata(payload: dict) -> dict:
+    """Capture metadata is for human readers; strip before passing to rewriter."""
+    payload.pop("_capture_metadata", None)
+    return payload
+
+
+def test_replay_opencode_request_triggers_max_tokens_bump():
+    """Original failure: OpenCode hardcodes max_tokens=8192 against a
+    reasoning model. Without the bump rescue, the model burns its budget
+    inside <think> and never emits final content. The replay confirms the
+    rescue fires for this exact request shape."""
+    body = _strip_capture_metadata(_load_fixture_json("request_opencode_nemotron.json"))
+    assert body["max_tokens"] == 8192, "fixture sanity: should be the starvation value"
+    out = rewrite_request(body, arch="NemotronHForCausalLM", reasoning_parser="nemotron_v3")
+    assert out["max_tokens"] == _REASONING_MAX_TOKENS_BUMP, (
+        "rescue failed to fire on the OpenCode-shaped request that originally wedged"
+    )
+
+
+def test_replay_hermes_uncapped_request_does_not_bump():
+    """Hermes leaves max_tokens=null. Bump must NOT fire — defensive against
+    accidentally rewriting requests that don't need rescue."""
+    body = _strip_capture_metadata(_load_fixture_json("request_hermes_uncapped.json"))
+    assert body["max_tokens"] is None, "fixture sanity: should be null"
+    out = rewrite_request(body, arch="NemotronHForCausalLM", reasoning_parser="nemotron_v3")
+    assert out["max_tokens"] is None, "rewriter accidentally bumped a None max_tokens"
+
+
+def test_replay_phi4_pipe_leak_response_recovers_to_structured_tool_calls():
+    """Original failure: Phi-4-mini emits <|tool_calls|>[{...}]<|/tool_calls|>
+    as plain content (per Microsoft's own model card + vllm-project/vllm#14682).
+    Recovery should extract the structured call into message.tool_calls."""
+    payload = _strip_capture_metadata(_load_fixture_json("response_phi4_pipe_leak.json"))
+    msg_before = payload["choices"][0]["message"]
+    assert msg_before["tool_calls"] is None, "fixture sanity: leak shape, no structured calls"
+    assert "<|tool_calls|>" in msg_before["content"], "fixture sanity: leak shape present"
+
+    rewrite_chat_completion(payload)
+
+    msg_after = payload["choices"][0]["message"]
+    assert msg_after["tool_calls"], "recovery failed to extract from phi4 leak shape"
+    assert msg_after["tool_calls"][0]["function"]["name"] == "get_current_weather"
+    assert "Paris" in msg_after["tool_calls"][0]["function"]["arguments"]
+    assert msg_after.get("content") in (None, "")
+    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_replay_qwen3_coder_xml_leak_response_recovers():
+    """Defense-in-depth: even with our detector now routing Qwen3.5+/3.6+
+    MoE to qwen3_coder, if a user manually overrides to hermes (or some
+    future variant misroutes), the qwen3_coder XML leak should still
+    auto-recover into structured tool_calls."""
+    payload = _strip_capture_metadata(_load_fixture_json("response_qwen3_coder_xml_leak.json"))
+    msg_before = payload["choices"][0]["message"]
+    assert not msg_before["tool_calls"], "fixture sanity: leak shape, no structured calls"
+    assert "<function=bash>" in msg_before["content"]
+
+    rewrite_chat_completion(payload)
+
+    msg_after = payload["choices"][0]["message"]
+    assert msg_after["tool_calls"], "recovery failed to extract from qwen3_coder XML leak"
+    assert msg_after["tool_calls"][0]["function"]["name"] == "bash"
+    assert "ls -l" in msg_after["tool_calls"][0]["function"]["arguments"]
+    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_replay_streaming_response_preserves_usage_chunk():
+    """Captured streaming SSE shape (vLLM 0.19.1 emits usage in a separate
+    chunk with empty `choices`, just before [DONE]). Earlier rewriter
+    versions silently dropped this chunk (Hermes context counter never
+    advanced). Replay confirms it now survives."""
+    with open(os.path.join(_FIXTURES_DIR, "response_streaming_with_usage.txt"), "rb") as f:
+        blob = f.read()
+    out = _drive_rewriter(blob, arch="NemotronH").decode()
+    assert '"usage"' in out, "usage chunk dropped by rewriter on captured stream shape"
+    assert '"prompt_tokens":35' in out
+    assert '"completion_tokens":50' in out
+    assert "[DONE]" in out

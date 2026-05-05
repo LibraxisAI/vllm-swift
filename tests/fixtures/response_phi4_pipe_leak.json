@@ -1,0 +1,27 @@
+{
+  "_capture_metadata": {
+    "captured_from": "Phi-4-mini-instruct-4bit emission shape per Microsoft model card and vllm-project/vllm#14682",
+    "purpose": "The exact failure pattern: model emits structured tool-call markup as plain content, vLLM's phi4_mini_json parser fails to extract it, tool_calls stays empty. Recovery MUST synthesize structured tool_calls from the leaked text."
+  },
+  "id": "chatcmpl-phi4leak-fixture",
+  "object": "chat.completion",
+  "created": 1777948000,
+  "model": "/Users/tom/models/Phi-4-mini-instruct-4bit",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "<|tool_calls|>[{\"name\": \"get_current_weather\", \"arguments\": {\"location\": \"Paris, France\", \"format\": \"celsius\"}}]<|/tool_calls|>",
+        "tool_calls": null,
+        "reasoning_content": null
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 78,
+    "completion_tokens": 42,
+    "total_tokens": 120
+  }
+}
