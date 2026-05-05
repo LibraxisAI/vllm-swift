@@ -38,10 +38,10 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator
 
-import aiohttp
-from aiohttp import web
+if TYPE_CHECKING:
+    from aiohttp import web
 
 LOG_PATH = Path(os.path.expanduser("~/.vllm-swift/debug.log"))
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1014,7 +1014,13 @@ async def stream_rewriter(upstream_iter: AsyncIterator[bytes], arch: str) -> Asy
 
 async def _make_app(
     upstream_url: str, arch: str, reasoning_parser: str = "", tool_parser: str = ""
-) -> web.Application:
+) -> "web.Application":
+    # aiohttp is only required when the proxy actually runs. Importing
+    # lazily lets the recovery / streaming functions be tested in CI
+    # without needing aiohttp installed in the test env.
+    import aiohttp
+    from aiohttp import web
+
     timeout = aiohttp.ClientTimeout(total=600)
 
     async def proxy(request: web.Request) -> web.StreamResponse:
@@ -1105,6 +1111,9 @@ def run(
         reasoning_parser or "<none>",
         tool_parser or "<none>",
     )
+    # Lazy aiohttp import — only when the proxy actually runs.
+    from aiohttp import web
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = loop.run_until_complete(_make_app(upstream_url, arch, reasoning_parser, tool_parser))
