@@ -1,0 +1,27 @@
+{
+  "_capture_metadata": {
+    "captured_from": "Synthesized from the hermes-style emission shape — model produces well-formed `<tool_call>{json}</tool_call>` but the configured parser failed to extract it (e.g., user manually overrode to a non-hermes parser, or future Qwen3 variant emits this when our detector misroutes).",
+    "purpose": "Defense-in-depth: even when our auto-detect picks the right parser today, future model variants might ship hermes JSON shape and we should recover gracefully if a misroute leaks it into content."
+  },
+  "id": "chatcmpl-hermes-json-fixture",
+  "object": "chat.completion",
+  "created": 1777948100,
+  "model": "/Users/tom/models/some-future-model",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"ls /tmp/sweep-test\"}}</tool_call>",
+        "tool_calls": null,
+        "reasoning_content": null
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 122,
+    "completion_tokens": 38,
+    "total_tokens": 160
+  }
+}

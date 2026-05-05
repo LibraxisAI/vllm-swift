@@ -552,3 +552,72 @@ def test_replay_streaming_response_preserves_usage_chunk():
     assert '"prompt_tokens":35' in out
     assert '"completion_tokens":50' in out
     assert "[DONE]" in out
+
+
+def test_replay_hermes_json_leak_response_recovers():
+    """Hermes JSON tool-call shape leaked into content (parser misroute /
+    future variant). Defensive: recovery must extract even when the
+    detector picks the right parser today, in case it doesn't tomorrow."""
+    payload = _strip_capture_metadata(_load_fixture_json("response_hermes_json_leak.json"))
+    msg_before = payload["choices"][0]["message"]
+    assert msg_before["tool_calls"] is None, "fixture sanity: leak shape, no structured calls"
+    assert "<tool_call>" in msg_before["content"]
+
+    rewrite_chat_completion(payload)
+
+    msg_after = payload["choices"][0]["message"]
+    assert msg_after["tool_calls"], "recovery failed to extract from hermes JSON leak"
+    assert msg_after["tool_calls"][0]["function"]["name"] == "bash"
+    assert "ls /tmp/sweep-test" in msg_after["tool_calls"][0]["function"]["arguments"]
+    assert msg_after.get("content") in (None, "")
+    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_replay_phi4_healthy_chat_does_not_trigger_recovery():
+    """Real Phi-4-mini chat output (markdown code block + explanation, no
+    leak shape). Recovery MUST NOT fire on healthy traffic — false
+    positives would corrupt legitimate responses by extracting
+    nonsense `tool_calls` from natural language.
+
+    This is the strongest defense the test suite has against a future
+    over-eager regex change. If someone tightens recovery and it starts
+    matching markdown code blocks, this test fails immediately.
+    """
+    payload = _strip_capture_metadata(_load_fixture_json("response_phi4_healthy_chat.json"))
+    original_content = payload["choices"][0]["message"]["content"]
+    original_finish = payload["choices"][0]["finish_reason"]
+
+    rewrite_chat_completion(payload)
+
+    msg = payload["choices"][0]["message"]
+    # Content must be untouched; tool_calls must remain None/empty;
+    # finish_reason must not be bumped to tool_calls.
+    assert msg["content"] == original_content, (
+        "recovery false-positively rewrote healthy chat content"
+    )
+    assert not msg.get("tool_calls"), (
+        "recovery false-positively synthesized tool_calls from chat text"
+    )
+    assert payload["choices"][0]["finish_reason"] == original_finish, (
+        "recovery false-positively bumped finish_reason on healthy response"
+    )
+
+
+def test_replay_truncated_leak_response_skips_recovery_gracefully():
+    """vLLM hit max_tokens mid-emission. The leak shape is partial — no
+    closing tag — so the regex shape match fails. Recovery must skip
+    cleanly rather than try to half-parse the truncated content.
+    finish_reason=length stays as-is (don't promote to tool_calls)."""
+    payload = _strip_capture_metadata(_load_fixture_json("response_truncated_leak.json"))
+    original_content = payload["choices"][0]["message"]["content"]
+    assert payload["choices"][0]["finish_reason"] == "length", "fixture sanity"
+    assert "<|tool_calls|>" in original_content, "fixture sanity: partial leak"
+    assert "<|/tool_calls|>" not in original_content, "fixture sanity: no closing tag"
+
+    rewrite_chat_completion(payload)
+
+    msg = payload["choices"][0]["message"]
+    # Content untouched, no synthesized tool_calls, finish_reason stays length
+    assert msg["content"] == original_content
+    assert not msg.get("tool_calls")
+    assert payload["choices"][0]["finish_reason"] == "length"
