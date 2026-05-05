@@ -33,6 +33,17 @@ def _arch_to_parser(arch: str) -> str:
         # Qwen family
         ("Qwen3CoderForCausalLM", "qwen3_coder"),
         ("Qwen3Coder", "qwen3_coder"),
+        # Qwen3.5/3.6 MoE variants (Qwen3_5MoeForConditionalGeneration,
+        # Qwen3_6MoeForConditionalGeneration) ship the qwen3_coder XML
+        # shape: <tool_call><function=name><parameter=k>v</parameter>...
+        # The hermes parser expects JSON inside <tool_call> and silently
+        # fails to extract this XML, leaking the whole block as plaintext
+        # into message.content. Empirically verified against
+        # Qwen3.6-35B-A3B-4bit chat_template.jinja which is identical to
+        # Qwen3-Coder's tool-call instructions.
+        ("Qwen3_5Moe", "qwen3_coder"),
+        ("Qwen3_6Moe", "qwen3_coder"),
+        ("Qwen3MoeForCausalLM", "qwen3_coder"),
         ("Qwen3", "hermes"),
         ("Qwen2_5", "hermes"),
         ("Qwen2", "hermes"),

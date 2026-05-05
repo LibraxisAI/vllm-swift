@@ -30,12 +30,18 @@ EXPECTED: tuple[tuple[str, str, str, str], ...] = (
     ("Qwen3-4B-4bit", "hermes", "qwen3", "Qwen3-4B"),
     ("Qwen3.5-2B-4bit", "hermes", "qwen3", "Qwen3.5-2B (arch: Qwen3_5ForConditionalGeneration)"),
     ("Qwen3.5-9B-4bit", "hermes", "qwen3", "Qwen3.5-9B"),
-    ("Qwen3.5-35B-A3B-4bit", "hermes", "qwen3", "Qwen3.5 MoE"),
-    ("Qwen3.6-35B-A3B-4bit", "hermes", "qwen3", "Qwen3.6 MoE"),
-    # MLX build of Qwen3-Coder ships `Qwen3MoeForCausalLM` (not Qwen3Coder*)
-    # so detector relies on the directory-name discriminator to bump
-    # hermes -> qwen3_coder. tokenizer_config.json has <think>/</think> as
-    # special tokens, so reasoning detector correctly fires too.
+    # Qwen3.5/3.6 35B-A3B MoE variants (arch: Qwen3_5MoeForConditionalGeneration)
+    # ship the qwen3_coder XML tool-call shape per their chat_template.jinja
+    # (same `<tool_call><function=name><parameter=k>v</parameter>` template
+    # text as Qwen3-Coder). Empirically verified Nov 2026: hermes parser
+    # silently drops these XML calls into message.content with `tool_calls=[]`,
+    # so the routing must be qwen3_coder.
+    ("Qwen3.5-35B-A3B-4bit", "qwen3_coder", "qwen3", "Qwen3.5 MoE (Qwen3_5Moe arch)"),
+    ("Qwen3.6-35B-A3B-4bit", "qwen3_coder", "qwen3", "Qwen3.6 MoE (Qwen3_5Moe arch)"),
+    # MLX build of Qwen3-Coder ships `Qwen3MoeForCausalLM` (not Qwen3Coder*).
+    # The Qwen3MoeForCausalLM prefix mapping now catches it directly without
+    # needing the dirname discriminator. tokenizer_config.json has <think>/
+    # </think> as special tokens, so reasoning detector correctly fires too.
     (
         "Qwen3-Coder-30B-A3B-Instruct-MLX-6bit",
         "qwen3_coder",

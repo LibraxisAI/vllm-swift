@@ -63,14 +63,18 @@ FIXTURES: tuple[ModelFixture, ...] = (
         name="qwen3.5-moe-30b",
         architecture="Qwen3_5MoeForConditionalGeneration",
         chat_template=_TOOLS_AND_THINK,
-        # "Qwen3" prefix in the tool table catches all Qwen3.x architectures.
-        expected_tool="hermes",
+        # MoE-style Qwen3.5/3.6 ship qwen3_coder XML in their chat template
+        # (verified Nov 2026 against Qwen3.5-35B-A3B-4bit & Qwen3.6-35B-A3B-4bit).
+        # The `Qwen3_5Moe` prefix catches them; dense Qwen3.5 still routes to hermes.
+        expected_tool="qwen3_coder",
         expected_reasoning="qwen3",
     ),
     ModelFixture(
         name="qwen3.6-35b-a3b",
         architecture="Qwen3_6ForCausalLM",
         chat_template=_TOOLS_AND_THINK,
+        # Dense Qwen3.6 (no MoE in arch) keeps hermes; only the MoE
+        # Qwen3_6Moe variants get bumped to qwen3_coder.
         expected_tool="hermes",
         expected_reasoning="qwen3",
     ),
