@@ -282,6 +282,15 @@ async def stream_rewriter(
                 yield (event + "\n\n").encode()
                 continue
 
+            # Pass through metadata-only chunks unchanged. vLLM emits the
+            # final `usage` block in a chunk with `choices: []`; if we ran
+            # the choice-rewrite path on it we'd swallow it silently and
+            # the client would lose all token-usage telemetry (visible as
+            # Hermes' context counter never advancing).
+            if not chunk.get("choices"):
+                yield (event + "\n\n").encode()
+                continue
+
             # Process each choice in this chunk
             new_choices = []
             for c in chunk.get("choices", []):

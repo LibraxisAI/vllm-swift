@@ -14,12 +14,15 @@ the model has headroom for a real answer / tool_call.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from vllm_swift.response_rewriter import (
     _REASONING_MAX_TOKENS_BUMP,
     _REASONING_MAX_TOKENS_FLOOR,
     rewrite_request,
+    stream_rewriter,
 )
 
 REASONING_PARSER = "nemotron_v3"
@@ -93,3 +96,65 @@ def test_negative_max_tokens_left_alone():
     body = {"max_tokens": -1}
     out = rewrite_request(body, arch="", reasoning_parser=REASONING_PARSER)
     assert out["max_tokens"] == -1
+
+
+# ---------------------------------------------------------------------------
+# Streaming rewriter — usage-chunk preservation
+# ---------------------------------------------------------------------------
+
+
+def _ssestream(events: list[str]) -> bytes:
+    """Encode a list of SSE event payloads into a single byte stream."""
+    return b"".join(f"data: {e}\n\n".encode() for e in events)
+
+
+def _drive_rewriter(blob: bytes, arch: str) -> bytes:
+    """Run stream_rewriter end-to-end on `blob`, return the joined output.
+
+    Wraps the async machinery in `asyncio.run` so this stays a plain
+    synchronous test — no pytest-asyncio dependency.
+    """
+    async def _async_iter_bytes():
+        yield blob
+
+    async def _collect():
+        out = []
+        async for chunk in stream_rewriter(_async_iter_bytes(), arch):
+            out.append(chunk)
+        return b"".join(out)
+
+    return asyncio.run(_collect())
+
+
+def test_stream_rewriter_preserves_usage_chunk():
+    """Regression: vLLM emits the final `usage` block in a chunk with
+    `choices: []`. Earlier rewriter versions silently dropped these
+    metadata-only chunks because the per-choice loop never ran and the
+    `if new_choices:` guard skipped the yield. Without this fix, Hermes'
+    context counter never advances because token totals never reach the
+    client.
+    """
+    content_chunk = (
+        '{"id":"x","object":"chat.completion.chunk","created":1,'
+        '"model":"m","choices":[{"index":0,"delta":{"content":"hi"},'
+        '"finish_reason":"stop"}]}'
+    )
+    usage_chunk = (
+        '{"id":"x","object":"chat.completion.chunk","created":1,'
+        '"model":"m","choices":[],'
+        '"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}'
+    )
+    blob = _ssestream([content_chunk, usage_chunk, "[DONE]"])
+    joined = _drive_rewriter(blob, arch="NemotronH").decode()
+    assert "usage" in joined, "usage chunk dropped by rewriter"
+    assert '"prompt_tokens":10' in joined
+    assert '"completion_tokens":2' in joined
+    assert "[DONE]" in joined
+
+
+def test_stream_rewriter_passes_through_for_non_rewrite_arch():
+    """Sanity: non-Nemotron arches go through the fast-path passthrough
+    branch (no JSON parsing at all)."""
+    payload = b"data: anything goes\n\n"
+    out = _drive_rewriter(payload, arch="LlamaForCausalLM")
+    assert out == payload
