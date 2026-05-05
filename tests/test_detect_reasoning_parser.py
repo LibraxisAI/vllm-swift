@@ -57,7 +57,10 @@ from vllm_swift import detect_reasoning_parser as drp
         ("Ernie45ForCausalLM", "ernie45"),
         ("GptOssForCausalLM", "openai_gptoss"),
         ("Holo2ForCausalLM", "holo2"),
-        ("MiMoForCausalLM", "mimo"),
+        # MiMo `mimo` reasoning parser is not in vLLM's registered set; route
+        # to qwen3 per Xiaomi's official MiMo-V2-Flash / MiMo-V2.5 vLLM recipe.
+        ("MiMoForCausalLM", "qwen3"),
+        ("Glm47ForCausalLM", "glm45"),  # workaround for vllm-project/vllm#33348
     ],
 )
 def test_arch_to_parser(arch, expected):

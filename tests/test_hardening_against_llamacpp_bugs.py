@@ -155,7 +155,9 @@ def test_step35_arch_resolves_to_step3p5(tmp_path):
     ("MagistralForCausalLM", "mistral", "mistral"),
     ("GptOssForCausalLM", "openai", "openai_gptoss"),
     ("Holo2ForCausalLM", "hermes", "holo2"),
-    ("MiMoForCausalLM", "hermes", "mimo"),
+    # MiMo: tool=qwen3_xml, reasoning=qwen3 per Xiaomi's official MiMo-V2-Flash
+    # vLLM recipe (the `mimo` parser name is not in vLLM's registered set).
+    ("MiMoForCausalLM", "qwen3_xml", "qwen3"),
     ("SeedOssForCausalLM", "seed_oss", "seed_oss"),
     ("KimiK2ThinkingForCausalLM", "kimi_k2", "kimi_k2"),
     ("KimiK25ForCausalLM", "kimi_k2", "kimi_k2"),

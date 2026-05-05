@@ -94,8 +94,15 @@ _ARCH_TO_REASONING_PARSER: tuple[tuple[str, str], ...] = (
     # Mistral reasoning models (Magistral et al)
     ("Magistral", "mistral"),
     ("Mistral", "mistral"),
-    # GLM 4.5 / 5.1 thinking
+    # GLM 4.5 / 4.7 / 5.1 thinking. GLM-4.7 specifically has no `glm47`
+    # reasoning parser registered in vLLM yet (see vllm-project/vllm#33348);
+    # the official deployment guide says to use `--reasoning-parser glm45`
+    # as a workaround until vLLM ships glm47 reasoning. Per the same bug
+    # report the `right` answer is DeepSeekR1ReasoningParser, but glm45
+    # works on Apple Silicon today and shipping the workaround keeps users
+    # unblocked.
     ("GlmMoeDsa", "glm45"),  # GLM-5.1
+    ("Glm47", "glm45"),  # GLM-4.7 — workaround for vllm-project/vllm#33348
     ("Glm45", "glm45"),
     ("Glm4_5", "glm45"),
     # Granite reasoning
@@ -129,8 +136,14 @@ _ARCH_TO_REASONING_PARSER: tuple[tuple[str, str], ...] = (
     ("GptOss", "openai_gptoss"),
     ("OpenaiMoe", "openai_gptoss"),
     ("Holo2", "holo2"),
-    ("MiMo", "mimo"),
-    ("Mimo", "mimo"),
+    # MiMo (Xiaomi) — `mimo` reasoning parser is NOT in vLLM's registered set
+    # (verified against vLLM 0.19.1's `_REASONING_PARSERS_TO_REGISTER`); using
+    # it would fail server startup. Per Xiaomi's own vLLM recipe for
+    # MiMo-V2-Flash and MiMo-V2.5, the recommended pairing is
+    # `--reasoning-parser qwen3 --tool-call-parser qwen3_xml`. Route to
+    # qwen3 reasoning here; tool-side stays in detect_tool_parser.
+    ("MiMo", "qwen3"),
+    ("Mimo", "qwen3"),
 )
 
 

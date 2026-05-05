@@ -113,12 +113,23 @@ def _arch_to_parser(arch: str) -> str:
         # GPT-OSS — vLLM uses this name for both tool and reasoning paths
         ("GptOss", "openai"),
         ("OpenaiMoe", "openai"),
-        # Holo / MiMo / SeedOSS / Mimo (reasoning-side parsers exist; tool-
-        # side falls through to closest format approximation)
+        # Holo / MiMo / SeedOSS — closest format approximation when no
+        # dedicated tool parser is registered for the family.
         ("Holo2", "hermes"),
-        ("MiMo", "hermes"),
+        # MiMo (Xiaomi) — V2-Flash/V2.5 official recipe is qwen3_xml:
+        # https://docs.vllm.ai/projects/recipes/en/latest/MiMo/MiMo-V2-Flash.html
+        ("MiMo", "qwen3_xml"),
+        ("Mimo", "qwen3_xml"),
         ("SeedOss", "seed_oss"),
         ("SeedOSS", "seed_oss"),
+        # LongCat (Meituan) — LongCat-Flash family uses dedicated longcat parser
+        # https://docs.vllm.ai/projects/recipes/en/latest/Meituan/Longcat.html
+        ("LongcatFlash", "longcat"),
+        ("LongCatFlash", "longcat"),
+        ("Longcat", "longcat"),
+        # Salesforce xLAM family ships as Llama-arch with a dedicated tool
+        # parser. Caught by directory-name discriminator (see _name_discriminator
+        # below) since the architecture string is generic LlamaForCausalLM.
         # Misc
         ("InternLM", "internlm"),
         ("Jamba", "jamba"),
@@ -239,6 +250,12 @@ def _name_discriminator(parser: str, model_dir_name: str) -> str:
         or "-k2" in name_lower
     ):
         return "kimi_k2"
+    # Salesforce xLAM family ships as LlamaForCausalLM (which our detector
+    # routes to llama3_json) but has a dedicated `xlam` tool parser in vLLM.
+    # Detection: dirname includes "xlam" — covers Salesforce/xLAM-1b-fc-r,
+    # Salesforce/xLAM-2-3b-fc-r, Salesforce/Llama-xLAM-2-8b-fc-r-* etc.
+    if parser in ("llama3_json", "llama4_json", "hermes") and "xlam" in name_lower:
+        return "xlam"
     return parser
 
 
