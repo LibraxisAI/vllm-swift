@@ -44,7 +44,12 @@ EXPECTED: tuple[tuple[str, str, str, str], ...] = (
     ),
     ("Qwen2.5-3B-Instruct-4bit", "hermes", "", "Qwen2.5 (no native reasoning)"),
     # ===== Nemotron =====
-    ("Nemotron-Cascade-2-30B-A3B-4bit", "hermes", "qwen3", "Nemotron-Cascade Qwen3.6 derivative"),
+    (
+        "Nemotron-Cascade-2-30B-A3B-4bit",
+        "qwen3_coder",
+        "nemotron_v3",
+        "Nemotron-Cascade Qwen3.6 derivative; NVIDIA-recommended parsers per HF #7",
+    ),
     # ===== Llama =====
     ("Llama-3.2-1B-Instruct-hf", "llama3_json", "", "Llama 3.2 1B"),
     ("Llama-3.2-3B-Instruct-4bit", "llama3_json", "", "Llama 3.2 3B"),

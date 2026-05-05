@@ -224,3 +224,67 @@ def test_main_uses_sys_argv_by_default(monkeypatch):
     with patch("vllm_swift.cli._version", return_value=0) as mock_v:
         cli.main()
     mock_v.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# Port helpers + rewriter routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        (["--port", "9000"], 9000),
+        (["--port=9001"], 9001),
+        (["--max-model-len", "8192"], 8000),
+        ([], 8000),
+        (["--port", "not-a-number"], 8000),
+    ],
+)
+def test_extract_port(args, expected):
+    assert cli._extract_port(args) == expected
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        (["--port", "9000", "--max-model-len", "8192"], ["--max-model-len", "8192"]),
+        (["--port=9001", "--foo"], ["--foo"]),
+        (["--max-model-len", "4096"], ["--max-model-len", "4096"]),
+        ([], []),
+    ],
+)
+def test_strip_port(args, expected):
+    assert cli._strip_port(args) == expected
+
+
+def test_serve_routes_through_rewriter_when_reasoning_parser_set(tmp_path):
+    """Reasoning-parser auto-injection should trigger the proxy path."""
+    model_dir = tmp_path / "fake-model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"architectures":["NemotronHForCausalLM"]}')
+
+    with patch("vllm_swift.cli.detect_parser", return_value=""), \
+         patch("vllm_swift.cli.detect_reasoning_parser", return_value="nemotron_v3"), \
+         patch("vllm_swift.cli._serve_with_rewriter", return_value=0) as mock_proxy, \
+         patch("subprocess.call", return_value=0) as mock_call:
+        rc = cli._serve([str(model_dir)])
+    assert rc == 0
+    mock_proxy.assert_called_once()
+    mock_call.assert_not_called()
+
+
+def test_serve_skips_rewriter_for_plain_chat_model(tmp_path):
+    """Llama-style non-reasoning models should bypass the proxy."""
+    model_dir = tmp_path / "llama"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"architectures":["LlamaForCausalLM"]}')
+
+    with patch("vllm_swift.cli.detect_parser", return_value=""), \
+         patch("vllm_swift.cli.detect_reasoning_parser", return_value=""), \
+         patch("vllm_swift.cli._serve_with_rewriter", return_value=0) as mock_proxy, \
+         patch("subprocess.call", return_value=0) as mock_call:
+        rc = cli._serve([str(model_dir)])
+    assert rc == 0
+    mock_proxy.assert_not_called()
+    mock_call.assert_called_once()

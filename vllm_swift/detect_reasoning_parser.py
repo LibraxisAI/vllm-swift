@@ -66,9 +66,13 @@ _ARCH_TO_REASONING_PARSER: tuple[tuple[str, str], ...] = (
     ("Qwen3_5", "qwen3"),
     ("Qwen3_6", "qwen3"),
     ("Qwen3", "qwen3"),
-    # Nemotron derivatives also use Qwen3-style thinking blocks
-    ("NemotronH", "qwen3"),
-    ("Nemotron", "qwen3"),
+    # Nemotron-H (Cascade-2, Nemotron-3 Super/Nano) — NVIDIA's purpose-built
+    # parser, NOT qwen3. Source: vLLM PR #36393 (Shaun Kotek, NVIDIA) +
+    # HF discussion confirming qwen3 is wrong choice:
+    # https://huggingface.co/nvidia/Nemotron-Cascade-2-30B-A3B/discussions/7
+    # nemotron_v3 == DeepSeekR1 (<think>/</think>) + enable_thinking swap.
+    ("NemotronH", "nemotron_v3"),
+    ("Nemotron", "nemotron_v3"),
     # Gemma 4 has its own native reasoning format
     ("Gemma4", "gemma4"),
     # Mistral reasoning models (Magistral et al)

@@ -64,6 +64,14 @@ _REASONING_TOOL_COMBO_ISSUES: tuple[tuple[str, str, str, str, str], ...] = (
         "https://github.com/vllm-project/vllm/issues/39056",
         "if tool calls go missing on a thinking model, drop --reasoning-parser",
     ),
+    (
+        "nemotron_v3",
+        "qwen3_coder",
+        "qwen3_coder XML emitted inside <think> blocks can be stripped before "
+        "the tool parser sees it (Nemotron-Cascade-2 hits this combo by default)",
+        "https://github.com/vllm-project/vllm/issues/39056",
+        "if tool calls go missing on a thinking response, retry with reasoning disabled",
+    ),
 )
 
 
@@ -73,6 +81,12 @@ _REASONING_PARSER_ISSUES: tuple[KnownIssue, ...] = (
         "extract_reasoning_streaming assumes no <think> start tag (broken on M2.5)",
         "https://github.com/vllm-project/vllm/issues/38212",
         "for MiniMax M2.5 specifically, prefer non-streaming or pin to vLLM with the fix",
+    ),
+    (
+        "nemotron_v3",
+        "--reasoning-config breaks parser; reasoning_effort silently ignored",
+        "https://github.com/vllm-project/vllm/issues/39103",
+        "do not pass --reasoning-config with nemotron_v3 until #40424 lands",
     ),
 )
 

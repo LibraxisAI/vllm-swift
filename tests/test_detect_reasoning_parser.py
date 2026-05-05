@@ -30,8 +30,8 @@ from vllm_swift import detect_reasoning_parser as drp
         ("Qwen3_5MoeForConditionalGeneration", "qwen3"),
         ("Qwen3_6ForCausalLM", "qwen3"),
         # Nemotron derivatives use Qwen3-style thinking blocks
-        ("NemotronHForCausalLM", "qwen3"),
-        ("NemotronForCausalLM", "qwen3"),
+        ("NemotronHForCausalLM", "nemotron_v3"),
+        ("NemotronForCausalLM", "nemotron_v3"),
         # Gemma 4
         ("Gemma4ForCausalLM", "gemma4"),
         # Mistral reasoning
@@ -164,15 +164,18 @@ def test_detect_parser_full_match_deepseek_r1(tmp_path):
     assert drp.detect_parser(str(tmp_path)) == "deepseek_r1"
 
 
-def test_detect_parser_nemotron_h_resolves_to_qwen3(tmp_path):
-    """Nemotron-Cascade is Qwen3.6-derivative; reasoning format is qwen3-style."""
+def test_detect_parser_nemotron_h_resolves_to_nemotron_v3(tmp_path):
+    """Nemotron-Cascade is Qwen3.6-derivative but ships its own dedicated
+    reasoning parser per NVIDIA (vLLM PR #36393). nemotron_v3 subclasses
+    DeepSeekR1 with enable_thinking swap; qwen3 would also fire on the
+    <think> markers, but nemotron_v3 is NVIDIA's recommended choice."""
     (tmp_path / "config.json").write_text(
         json.dumps({"architectures": ["NemotronHForCausalLM"]})
     )
     (tmp_path / "chat_template.jinja").write_text(
         "Here's a thinking process: <think>plan</think> answer"
     )
-    assert drp.detect_parser(str(tmp_path)) == "qwen3"
+    assert drp.detect_parser(str(tmp_path)) == "nemotron_v3"
 
 
 def test_main_no_args_returns_0(monkeypatch):

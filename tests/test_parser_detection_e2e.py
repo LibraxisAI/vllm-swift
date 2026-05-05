@@ -146,13 +146,16 @@ FIXTURES: tuple[ModelFixture, ...] = (
         expected_tool="deepseek_v32",
         expected_reasoning="deepseek_v3",
     ),
-    # ===== Nemotron-Cascade (Qwen3.6 derivative) =====
+    # ===== Nemotron-Cascade (Qwen3.6 derivative, but uses NVIDIA's parsers) =====
+    # NVIDIA recommends qwen3_coder + nemotron_v3 (HF discussion #7).
+    # The model emits <function=name><parameter=k>v</parameter></function>
+    # which only qwen3_coder parses; hermes silently fails on this XML shape.
     ModelFixture(
         name="nemotron-cascade-2-30b",
         architecture="NemotronHForCausalLM",
         chat_template=_TOOLS_AND_THINK,
-        expected_tool="hermes",
-        expected_reasoning="qwen3",
+        expected_tool="qwen3_coder",
+        expected_reasoning="nemotron_v3",
     ),
     # ===== Phi-4 =====
     ModelFixture(

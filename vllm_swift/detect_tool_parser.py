@@ -36,9 +36,14 @@ def _arch_to_parser(arch: str) -> str:
         ("Qwen3", "hermes"),
         ("Qwen2_5", "hermes"),
         ("Qwen2", "hermes"),
-        # Nemotron family — Cascade / H variants are Qwen3-derivative
-        ("NemotronH", "hermes"),
-        ("Nemotron", "hermes"),
+        # Nemotron family — Cascade-2 / H variants emit qwen3_coder XML shape:
+        # <tool_call><function=name><parameter=k>v</parameter></function></tool_call>
+        # Confirmed by chat_template.jinja line 93 in Nemotron-Cascade-2-30B-A3B
+        # and HF discussion #7 (NVIDIA DongfuJiang). The hermes parser expects
+        # JSON inside <tool_call> and silently fails to extract this XML shape,
+        # leaking the whole block as plaintext into message.content.
+        ("NemotronH", "qwen3_coder"),
+        ("Nemotron", "qwen3_coder"),
         # Hermes itself
         ("HermesForCausalLM", "hermes"),
         # Llama
