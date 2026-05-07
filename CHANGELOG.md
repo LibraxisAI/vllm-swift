@@ -1,5 +1,69 @@
 # Release History
 
+## v0.5.2 — May 7, 2026
+
+**Patch: alpha-tester regression sweep.** Field reports from the v0.5.1 alpha
+surfaced 5 obvious bugs and 2 non-obvious ones (Metal-side; tracked separately).
+This release fixes the obvious ones and locks them down with regression tests.
+
+- **vllm not declared as a runtime dep** (#1). `pip install vllm-swift==0.5.1` left
+  users staring at `ModuleNotFoundError: No module named 'vllm'` on first
+  `vllm-swift serve`. `pyproject.toml` now declares `vllm>=0.10` directly. As a
+  bonus this narrows pip's resolver window and stops it pulling rc/dev versions
+  of safetensors/tokenizers/transformers under `--pre`.
+
+- **Reasoning-budget bump clobbered explicit small `max_tokens`** (#3). A client
+  sending `max_tokens=64` got `completion_tokens=20480` because
+  `rewrite_request` unconditionally bumped any `max_tokens < 16384` (the
+  starvation-prevention floor). Now respected when the client sets <1024 —
+  that's clearly intentional (curl smoke tests, "say hello", token-count
+  probes). The OpenCode/Hermes 4K-8K starvation case still bumps as before.
+
+- **`message.reasoning` not normalized to `reasoning_content`** (#7). Some vLLM
+  versions emit `message.reasoning` (their newer naming) instead of the
+  OpenAI-standard `message.reasoning_content`. `rewrite_chat_completion` now
+  copies `reasoning` → `reasoning_content` when the standard field is missing,
+  preserving the original for back-compat. OpenAI clients (Hermes,
+  openai-python) see the field they expect.
+
+- **longctx splice spammed 8 chunks regardless of relevance** (#6). A trivial
+  "say hello" query produced `prompt_tokens=5423` because every retrieve
+  request returned 8 chunks, splice-cap or not. Added a relevance floor
+  (default cosine score >= 0.20, env-tunable via `LONGCTX_RELEVANCE_FLOOR`)
+  that drops noise chunks before splicing.
+
+- **`--max-model-len` exceeding the model's `max_position_embeddings`** (#2).
+  Pre-flight now reads the model's `config.json` and warns with the actual
+  numbers ("65536 exceeds 40960; recommend --max-model-len 40960"), instead of
+  letting vLLM reject prompts later with a less specific error.
+
+8 new tests in `tests/test_longctx_endpoint.py` pin all five behaviors:
+
+- `test_enrich_filters_chunks_below_relevance_floor` (#6)
+- `test_enrich_keeps_chunks_at_or_above_floor` (#6)
+- `test_enrich_relevance_floor_overridable_by_env` (#6)
+- `test_rewrite_request_honors_explicit_small_max_tokens` (#3)
+- `test_rewrite_request_still_bumps_default_starvation_budget` (#3)
+- `test_rewrite_chat_completion_normalizes_reasoning_field` (#7)
+- `test_rewrite_chat_completion_leaves_reasoning_content_alone` (#7)
+- `test_warn_when_max_model_len_exceeds_model_cap` + 2 sibling cases (#2)
+
+Plus a CI-fixing pass: `tests/test_longctx_endpoint.py` had stale `import json`
++ unused imports flagged by ruff F811/F401 (the v0.5.1 commit's CI failed on
+this). All ruff lint clean now. **502/502 tests pass.**
+
+**NOT fixed in this release** (separate Metal-kernel investigation):
+
+- **#4 KV-cache corruption signature under turbo4v2 4-bit + sustained decode.**
+  Buddy reported that for "Say hello in one short sentence." the model produced
+  `Hello.` then `.2.2.2.2...` for thousands of tokens until cap. Classic
+  turbo4v2-4bit drift. Workaround for testers: drop `--additional-config`
+  entirely, or bump to `kv_bits: 8` (asymmetric K8/V4) for the same scheme.
+- **#5 4× decode throughput decay** (128 → 30 tok/s monotonic) — likely the
+  same root cause as #4. Same workaround.
+
+`pip install vllm-swift==0.5.2` and rebuilt bottle ship the obvious fixes.
+
 ## v0.5.1 — May 7, 2026
 
 **Patch: BatchedKVCache memory leak under sustained Hermes load.** Tom's Hermes alpha session hit a macOS application-memory OOM after ~14 turns. EngineCore RSS climbed 20 GB → 85 GB at ~4.6 GB/turn while every other knob (`--max-num-seqs 1`, `--gpu-memory-utilization 0.5`, `--no-enable-prefix-caching`) said it shouldn't.

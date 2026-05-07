@@ -500,6 +500,13 @@ def rewrite_chat_completion(payload: dict) -> dict:
     for choice in choices:
         msg = choice.get("message") or {}
         content = msg.get("content") or ""
+        # Bug #7 from 0.5.1 alpha: some vLLM versions emit reasoning as
+        # `message.reasoning` instead of the OpenAI-standard
+        # `message.reasoning_content`. Normalize to the standard so
+        # downstream OpenAI clients (Hermes, OpenCode, openai-python)
+        # don't break. Keep both fields populated for back-compat.
+        if msg.get("reasoning") and not msg.get("reasoning_content"):
+            msg["reasoning_content"] = msg["reasoning"]
         existing_reasoning = msg.get("reasoning_content") or ""
 
         # Pass 1: Thinking: prefix split
@@ -569,6 +576,21 @@ def rewrite_request(
     if not isinstance(requested, int) or requested <= 0:
         return body
     if requested >= _REASONING_MAX_TOKENS_FLOOR:
+        return body
+    # Don't override an explicit small max_tokens. The bump is meant to
+    # rescue OpenCode/Hermes-style defaults (typically 4K-8K) that
+    # starve reasoning models. If the client asks for <1024, that's an
+    # intentional bound (curl smoke, "say hello", token-count tests) —
+    # honoring it matters more than feeding the <think> block.
+    # Bug #3 from 0.5.1 alpha: client sent max_tokens=64 and got 20480
+    # because the bump clobbered the explicit value.
+    _EXPLICIT_SMALL_THRESHOLD = 1024
+    if requested < _EXPLICIT_SMALL_THRESHOLD:
+        logger.info(
+            "honoring explicit small max_tokens=%d "
+            "(reasoning_parser=%s; bump would have raised to floor=%d)",
+            requested, reasoning_parser, _REASONING_MAX_TOKENS_FLOOR,
+        )
         return body
     # When max_model_len is known, the bump ceiling is constrained by
     # the total context window: prompt_tokens + output_tokens must fit.
@@ -1289,6 +1311,29 @@ async def _enrich_with_longctx(  # pragma: no cover
         chunks_n, scope, status,
     )
     chunks = data.get("chunks") or []
+    # Bug #6 from 0.5.1 alpha: a trivial query like "say hello in one
+    # short sentence" got 8 chunks and prompt_tokens=5423 spliced in.
+    # Drop chunks below a relevance floor so off-topic queries don't
+    # carry irrelevant code into the prompt. Cosine scores from
+    # MiniLM-L6-v2 + bge-rerank usually land in [0.3, 0.8] for genuinely
+    # relevant matches; <0.20 is noise.
+    _RELEVANCE_FLOOR = float(
+        os.environ.get("LONGCTX_RELEVANCE_FLOOR", "0.20")
+    )
+    if chunks:
+        relevant = [c for c in chunks
+                    if float(c.get("score", 0.0)) >= _RELEVANCE_FLOOR]
+        if not relevant and chunks:
+            # Keep the highest-scoring chunk so we never silently
+            # produce zero context for a borderline query — the user
+            # can read the score in the debug header and decide.
+            relevant = [max(chunks,
+                            key=lambda c: float(c.get("score", 0.0)))]
+            top = float(relevant[0].get("score", 0.0))
+            if top < _RELEVANCE_FLOOR:
+                # Even the best chunk is below floor — drop everything.
+                relevant = []
+        chunks = relevant
     debug = {
         "x-longctx-session": data.get("session_id") or sid or "ephemeral",
         "x-longctx-scope": data.get("scope_path") or "",

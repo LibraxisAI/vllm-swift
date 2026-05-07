@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-swift"
-version = "0.5.1"
+version = "0.5.2"
 description = "vLLM Metal plugin powered by mlx-swift — high-performance LLM inference on Apple Silicon"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -36,7 +36,13 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []  # vLLM installed separately (build from source is complex)
+dependencies = [
+    # vLLM is the engine vllm-swift plugs into via the platform-plugin
+    # entry point. Without it, `vllm-swift serve` dies with
+    # ModuleNotFoundError: No module named 'vllm'. Pin a floor that
+    # matches the V1 EngineCore + scheduler_config API we use.
+    "vllm>=0.10",
+]
 
 [project.optional-dependencies]
 download = ["huggingface-hub>=0.20"]

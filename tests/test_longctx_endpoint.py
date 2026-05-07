@@ -18,10 +18,6 @@ We test:
 from __future__ import annotations
 
 import asyncio
-import json
-import os
-
-import pytest
 
 from vllm_swift.cli import (
     _extract_enable_longctx,
@@ -35,7 +31,6 @@ from vllm_swift.response_rewriter import (
     _last_user_text,
     _splice_longctx_into_messages,
 )
-
 
 # ---------------------------------------------------------------------------
 # CLI flag parsing
@@ -420,3 +415,210 @@ def test_enrich_no_chunks_no_splice():
     assert body2["messages"] == body["messages"]
     assert hdrs["x-longctx-chunks-used"] == "0"
     assert hdrs["x-longctx-scope-status"] == "no-scope"
+
+
+# ---------------------------------------------------------------------------
+# v0.5.2 alpha-tester regressions (bugs #6, #3, #7)
+# ---------------------------------------------------------------------------
+# Buddy ran v0.5.1 alpha and found these. Lock them down so they don't
+# come back. Bugs #1 (vllm not declared), #2 (max_model_len docs), #5
+# (decode decay) are infra/docs/Metal-side and tested elsewhere or via
+# the live repro flow.
+
+def test_enrich_filters_chunks_below_relevance_floor():
+    """Bug #6: trivial query → 8 chunks of irrelevant code spliced in,
+    prompt_tokens=5423 for "say hello". Floor at 0.20 drops noise."""
+    body = {"messages": [
+        {"role": "user", "content": "say hello in one short sentence"},
+    ]}
+    payload = {
+        "chunks": [
+            {"text": "irrelevant", "file_path": "/p/a.py",
+             "start_line": 1, "end_line": 50, "score": 0.05},
+            {"text": "also irrelevant", "file_path": "/p/b.py",
+             "start_line": 1, "end_line": 50, "score": 0.10},
+        ],
+        "scope_path": "/p", "scope_status": "ready", "session_id": None,
+    }
+    sess = _FakeSession(_FakeAioResp(200, payload))
+    body2, hdrs = asyncio.run(_enrich_with_longctx(
+        body, endpoint="http://h:8765", request_headers={},
+        aiohttp_session=sess,
+    ))
+    # All chunks below 0.20 floor → no splice
+    assert body2["messages"] == body["messages"]
+    assert hdrs["x-longctx-chunks-used"] == "0"
+
+
+def test_enrich_keeps_chunks_at_or_above_floor():
+    """Counter to the above — when the best chunk is decent, splice it."""
+    body = {"messages": [
+        {"role": "user", "content": "explain authMiddleware"},
+    ]}
+    payload = {
+        "chunks": [
+            {"text": "function authMiddleware() {}", "file_path": "/p/a.py",
+             "start_line": 1, "end_line": 1, "score": 0.45},
+            {"text": "noise", "file_path": "/p/b.py",
+             "start_line": 1, "end_line": 1, "score": 0.05},
+        ],
+        "scope_path": "/p", "scope_status": "ready", "session_id": None,
+    }
+    sess = _FakeSession(_FakeAioResp(200, payload))
+    body2, hdrs = asyncio.run(_enrich_with_longctx(
+        body, endpoint="http://h:8765", request_headers={},
+        aiohttp_session=sess,
+    ))
+    assert hdrs["x-longctx-chunks-used"] == "1"
+    assert "authMiddleware" in body2["messages"][0]["content"]
+
+
+def test_enrich_relevance_floor_overridable_by_env(monkeypatch):
+    """LONGCTX_RELEVANCE_FLOOR env tunes the threshold per-deployment."""
+    monkeypatch.setenv("LONGCTX_RELEVANCE_FLOOR", "0.50")
+    body = {"messages": [{"role": "user", "content": "x"}]}
+    payload = {
+        "chunks": [
+            {"text": "borderline", "file_path": "/p/a.py",
+             "start_line": 1, "end_line": 1, "score": 0.40},
+        ],
+        "scope_path": "/p", "scope_status": "ready", "session_id": None,
+    }
+    sess = _FakeSession(_FakeAioResp(200, payload))
+    _, hdrs = asyncio.run(_enrich_with_longctx(
+        body, endpoint="http://h:8765", request_headers={},
+        aiohttp_session=sess,
+    ))
+    # 0.40 < 0.50 floor → dropped
+    assert hdrs["x-longctx-chunks-used"] == "0"
+
+
+# ---------------------------------------------------------------------------
+# Bug #3: rewrite_request must not bump explicit small max_tokens
+# ---------------------------------------------------------------------------
+
+def test_rewrite_request_honors_explicit_small_max_tokens():
+    """Buddy sent max_tokens=64, got completion_tokens=20480 because the
+    reasoning bump fired regardless. Below 1024 = explicit user intent."""
+    from vllm_swift.response_rewriter import rewrite_request
+    body = {
+        "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
+        "max_tokens": 64,
+    }
+    out = rewrite_request(body, arch="qwen3", reasoning_parser="qwen3",
+                          max_model_len=40960)
+    assert out["max_tokens"] == 64, "explicit small max_tokens was bumped"
+
+
+def test_rewrite_request_still_bumps_default_starvation_budget():
+    """The bump was added for a reason — OpenCode-style 4K-8K defaults
+    starve reasoning models. Make sure that case still bumps."""
+    from vllm_swift.response_rewriter import rewrite_request
+    body = {
+        "messages": [{"role": "user", "content": "x"}],
+        "max_tokens": 4096,   # OpenCode default; well below floor
+    }
+    out = rewrite_request(body, arch="qwen3", reasoning_parser="qwen3",
+                          max_model_len=40960)
+    assert out["max_tokens"] > 4096, "OpenCode-style default should bump"
+
+
+def test_rewrite_request_bypasses_when_no_reasoning_parser():
+    from vllm_swift.response_rewriter import rewrite_request
+    body = {
+        "messages": [{"role": "user", "content": "x"}],
+        "max_tokens": 64,
+    }
+    out = rewrite_request(body, arch="qwen3", reasoning_parser="",
+                          max_model_len=40960)
+    assert out["max_tokens"] == 64
+
+
+# ---------------------------------------------------------------------------
+# Bug #7: normalize message.reasoning → message.reasoning_content
+# ---------------------------------------------------------------------------
+
+def test_rewrite_chat_completion_normalizes_reasoning_field():
+    """Some vLLM versions emit `message.reasoning` instead of the
+    OpenAI-standard `message.reasoning_content`. Normalize on the way
+    out so OpenAI clients (Hermes, openai-python, etc.) see the
+    expected field."""
+    from vllm_swift.response_rewriter import rewrite_chat_completion
+    payload = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "the answer is 42",
+                "reasoning": "thought about it. then more thinking.",
+            },
+            "finish_reason": "stop",
+        }],
+    }
+    rewrite_chat_completion(payload)
+    msg = payload["choices"][0]["message"]
+    assert msg["reasoning_content"] == "thought about it. then more thinking."
+    # back-compat: original `reasoning` field preserved
+    assert msg["reasoning"] == "thought about it. then more thinking."
+
+
+def test_rewrite_chat_completion_leaves_reasoning_content_alone():
+    """When upstream already produces the standard field, we don't
+    duplicate-write or change anything."""
+    from vllm_swift.response_rewriter import rewrite_chat_completion
+    payload = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "ok",
+                "reasoning_content": "already standard",
+            },
+            "finish_reason": "stop",
+        }],
+    }
+    rewrite_chat_completion(payload)
+    msg = payload["choices"][0]["message"]
+    assert msg["reasoning_content"] == "already standard"
+
+
+# ---------------------------------------------------------------------------
+# Bug #2: pre-flight max_model_len > max_position_embeddings warning
+# ---------------------------------------------------------------------------
+
+def test_warn_when_max_model_len_exceeds_model_cap(tmp_path, capsys):
+    """Buddy hit: --max-model-len 65536 against a model with
+    max_position_embeddings=40960. vLLM rejects later — we should warn
+    upfront with the actual numbers."""
+    import json
+
+    from vllm_swift.cli import _warn_if_max_model_len_exceeds_model
+    model_dir = tmp_path / "fake-model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({
+        "max_position_embeddings": 40960,
+    }))
+    _warn_if_max_model_len_exceeds_model(str(model_dir), 65536)
+    err = capsys.readouterr().err
+    assert "65536" in err
+    assert "40960" in err
+    assert "Recommend" in err
+
+
+def test_no_warn_when_max_model_len_within_cap(tmp_path, capsys):
+    import json
+
+    from vllm_swift.cli import _warn_if_max_model_len_exceeds_model
+    model_dir = tmp_path / "fake-model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({
+        "max_position_embeddings": 65536,
+    }))
+    _warn_if_max_model_len_exceeds_model(str(model_dir), 32768)
+    assert capsys.readouterr().err == ""
+
+
+def test_no_warn_when_config_missing(tmp_path, capsys):
+    """A missing config.json (HF cache layout, etc.) shouldn't crash —
+    we just skip the check silently."""
+    from vllm_swift.cli import _warn_if_max_model_len_exceeds_model
+    _warn_if_max_model_len_exceeds_model(str(tmp_path / "no-such"), 65536)
+    assert capsys.readouterr().err == ""

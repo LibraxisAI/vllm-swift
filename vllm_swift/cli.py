@@ -224,6 +224,59 @@ def _extract_max_model_len(args: list[str]) -> int | None:
     return None
 
 
+def _model_max_position_embeddings(model_path: str) -> int | None:
+    """Read `max_position_embeddings` (or `model_max_length`) from the
+    model's config.json. Returns None on any error so callers can skip
+    the check rather than fail-stop on a missing/odd config.
+
+    Used by the pre-flight warn that catches the bug #2 footgun: a user
+    setting `--max-model-len 65536` for a model whose config caps at
+    40960. vLLM raises a not-very-specific error in that case; we'd
+    rather warn upfront with the actual numbers.
+    """
+    if not model_path:
+        return None
+    expanded = os.path.expanduser(model_path)
+    candidates = [
+        Path(expanded) / "config.json",
+        Path(expanded),  # if user already pointed at config.json
+    ]
+    for p in candidates:
+        if not p.is_file():
+            continue
+        try:
+            import json as _json
+            cfg = _json.loads(p.read_text())
+            for key in ("max_position_embeddings", "model_max_length"):
+                v = cfg.get(key)
+                if isinstance(v, int) and v > 0:
+                    return v
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def _warn_if_max_model_len_exceeds_model(
+    model_path: str, requested_max_model_len: int | None,
+) -> None:
+    """Pre-flight warn for bug #2: `--max-model-len` larger than the
+    model's declared positional embedding budget. Warning, not error —
+    some long-context fine-tunes legitimately extend the model's
+    declared position embeddings.
+    """
+    if requested_max_model_len is None or requested_max_model_len <= 0:
+        return
+    cap = _model_max_position_embeddings(model_path)
+    if cap is None or requested_max_model_len <= cap:
+        return
+    sys.stderr.write(
+        f"vllm-swift: --max-model-len {requested_max_model_len} exceeds "
+        f"this model's max_position_embeddings ({cap}). vLLM will likely "
+        f"reject prompts at that length. Recommend "
+        f"--max-model-len {cap} or smaller.\n"
+    )
+
+
 def _wait_for_vllm_ready(port: int, timeout: float = 600.0) -> bool:
     """Poll the vLLM /health endpoint until it responds or we time out."""
     url = f"http://127.0.0.1:{port}/health"
@@ -310,6 +363,12 @@ def _serve(args: list[str]) -> int:
     retrieval_endpoint, passthrough = _extract_retrieval_endpoint(passthrough)
     enable_longctx, passthrough = _extract_enable_longctx(passthrough)
     longctx_scope_override, passthrough = _extract_longctx_scope(passthrough)
+    # Bug #2 from 0.5.1 alpha: `--max-model-len 65536` against a model
+    # with max_position_embeddings=40960 → vLLM rejects prompts. Warn
+    # up front with the actual numbers instead of failing later.
+    _warn_if_max_model_len_exceeds_model(
+        model, _extract_max_model_len(passthrough),
+    )
     longctx_sidecar = None
     if enable_longctx and not retrieval_endpoint:
         try:
