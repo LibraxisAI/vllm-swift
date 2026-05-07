@@ -74,6 +74,7 @@ def _get_lib():
         ctypes.c_char_p,
         ctypes.c_int32,
         ctypes.c_float,
+        ctypes.c_int32,    # max_num_seqs (NEW: caps BatchedKVCache slots)
     ]
     _lib.vsm_engine_destroy.restype = None
     _lib.vsm_engine_destroy.argtypes = [ctypes.c_void_p]
@@ -205,6 +206,7 @@ class SwiftInferenceEngine:
         kv_scheme: str | None = None,
         kv_bits: int = 0,
         memory_fraction: float = 0.9,
+        max_num_seqs: int = 0,
     ):
         lib = _get_lib()
         self._lib = lib
@@ -215,6 +217,7 @@ class SwiftInferenceEngine:
             kv_scheme.encode() if kv_scheme else None,
             kv_bits,
             memory_fraction,
+            max_num_seqs,
         )
         if not self._handle:
             raise RuntimeError(f"Failed to create Swift engine for {model_path}")

@@ -25,6 +25,7 @@ import pytest
 
 from vllm_swift.cli import (
     _extract_enable_longctx,
+    _extract_longctx_scope,
     _extract_retrieval_endpoint,
 )
 from vllm_swift.response_rewriter import (
@@ -119,6 +120,103 @@ def test_extract_enable_longctx_no_disables(monkeypatch):
     ])
     assert enabled is False
     assert rest == ["--port", "8000"]
+
+
+# ---------------------------------------------------------------------------
+# --longctx-scope flag (auto-fallback for tool-using agents)
+# ---------------------------------------------------------------------------
+
+def test_extract_longctx_scope_default_empty(monkeypatch):
+    """No flag, no env → empty string. cli.py supplies cwd at boot when
+    --enable-longctx is on; this helper just parses."""
+    monkeypatch.delenv("LONGCTX_DEFAULT_SCOPE", raising=False)
+    scope, rest = _extract_longctx_scope(["--port", "8000"])
+    assert scope == ""
+    assert rest == ["--port", "8000"]
+
+
+def test_extract_longctx_scope_space_form(monkeypatch):
+    monkeypatch.delenv("LONGCTX_DEFAULT_SCOPE", raising=False)
+    scope, rest = _extract_longctx_scope([
+        "--port", "8000",
+        "--longctx-scope", "/Users/x/dev/myapp",
+        "--max-model-len", "4096",
+    ])
+    assert scope == "/Users/x/dev/myapp"
+    assert rest == ["--port", "8000", "--max-model-len", "4096"]
+
+
+def test_extract_longctx_scope_equals_form(monkeypatch):
+    monkeypatch.delenv("LONGCTX_DEFAULT_SCOPE", raising=False)
+    scope, rest = _extract_longctx_scope([
+        "--longctx-scope=/abs/path", "--port", "8000",
+    ])
+    assert scope == "/abs/path"
+    assert rest == ["--port", "8000"]
+
+
+def test_extract_longctx_scope_env_fallback(monkeypatch):
+    monkeypatch.setenv("LONGCTX_DEFAULT_SCOPE", "/from/env")
+    scope, rest = _extract_longctx_scope(["--port", "8000"])
+    assert scope == "/from/env"
+
+
+def test_extract_longctx_scope_flag_overrides_env(monkeypatch):
+    monkeypatch.setenv("LONGCTX_DEFAULT_SCOPE", "/from/env")
+    scope, _ = _extract_longctx_scope([
+        "--longctx-scope", "/from/flag",
+    ])
+    assert scope == "/from/flag"
+
+
+# ---------------------------------------------------------------------------
+# default_scope passed to /retrieve when set
+# ---------------------------------------------------------------------------
+
+def test_enrich_forwards_default_scope_when_set():
+    """The fallback path: when default_scope is provided, every call
+    forwards it so longctx-svc can fall back when no path is mentioned."""
+    body = {"messages": [
+        {"role": "user", "content": "what does the app do?"},  # no path
+    ]}
+    payload = {
+        "chunks": [{
+            "text": "function hi() {}",
+            "file_path": "/Users/x/dev/myapp/index.ts",
+            "start_line": 1, "end_line": 1, "score": 0.5,
+        }],
+        "scope_path": "/Users/x/dev/myapp",
+        "scope_status": "ready",
+        "session_id": None,
+    }
+    sess = _FakeSession(_FakeAioResp(200, payload))
+    body2, hdrs = asyncio.run(_enrich_with_longctx(
+        body, endpoint="http://h:8765",
+        request_headers={},
+        aiohttp_session=sess,
+        default_scope="/Users/x/dev/myapp",
+    ))
+    assert sess.captured["json"].get("default_scope") == "/Users/x/dev/myapp"
+    msgs = body2["messages"]
+    assert msgs[0]["role"] == "system"
+    assert "Retrieved code context" in msgs[0]["content"]
+    assert hdrs["x-longctx-chunks-used"] == "1"
+
+
+def test_enrich_omits_default_scope_when_unset():
+    """Default behavior: no default_scope key in the body."""
+    body = {"messages": [
+        {"role": "user", "content": "see /Users/x/auth.ts"},
+    ]}
+    payload = {"chunks": [], "scope_status": "no-scope", "session_id": None}
+    sess = _FakeSession(_FakeAioResp(200, payload))
+    asyncio.run(_enrich_with_longctx(
+        body, endpoint="http://h:8765",
+        request_headers={},
+        aiohttp_session=sess,
+        # default_scope omitted
+    ))
+    assert "default_scope" not in sess.captured["json"]
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@
 import os
 import sys
 
-__version__ = "0.4.2"
+__version__ = "0.5.1"
 
 
 def _apply_macos_defaults() -> None:

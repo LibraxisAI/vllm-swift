@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-swift"
-version = "0.5.0"
+version = "0.5.1"
 description = "vLLM Metal plugin powered by mlx-swift — high-performance LLM inference on Apple Silicon"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -43,7 +43,7 @@ download = ["huggingface-hub>=0.20"]
 # longctx (alpha): optional retrieval companion, enables
 # `--retrieval-endpoint URL` and `--enable-longctx` flags. Pre-alpha;
 # pinned to >=0.3.0a2 for the sidecar API contract.
-longctx = ["longctx-svc>=0.3.0a2"]
+longctx = ["longctx-svc>=0.3.0a3"]
 
 [project.scripts]
 vllm-swift = "vllm_swift.cli:main"

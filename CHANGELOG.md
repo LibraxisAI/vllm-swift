@@ -1,5 +1,27 @@
 # Release History
 
+## v0.5.1 — May 7, 2026
+
+**Patch: BatchedKVCache memory leak under sustained Hermes load.** Tom's Hermes alpha session hit a macOS application-memory OOM after ~14 turns. EngineCore RSS climbed 20 GB → 85 GB at ~4.6 GB/turn while every other knob (`--max-num-seqs 1`, `--gpu-memory-utilization 0.5`, `--no-enable-prefix-caching`) said it shouldn't.
+
+Root cause: `Bridge.swift`'s `init_batched`, `initBatchedHybrid`, and the `prefill_batched_*` ctx-stub paths all hardcoded `max(B, 64)` for the BatchedKVCache slot dimension. With `--max-num-seqs 1` that pre-allocates 64 slots regardless of actual concurrency. At max_seq = 64K, B=1, bf16 K+V across 28 layers, the unused-but-allocated slack is ~60 GB. Worse: `maxSeq` was sized off the first batch's longest prefill (`max(2048, prefill + 512)`), so subsequent longer prefills forced re-grows. On Metal each re-grow stacks new backing storage in the heap before the old one is reclaimed — the per-turn growth.
+
+Fix:
+
+- `InferenceEngine` gains `maxConcurrentRequests` (driven by `vllm_config.scheduler_config.max_num_seqs`) and `maxKVSize` (driven by `model_config.max_model_len`), threaded through `vsm_engine_create` over the C-FFI.
+- All three over-alloc sites now use `max(B, engine.maxConcurrentRequests)` instead of `max(B, 64)`.
+- `maxSeq` is pinned to `engine.maxKVSize` at init, so subsequent prefills can't re-grow the underlying tensors.
+
+Verified live: 19.5 → 78.6 GB in 3 turns pre-fix; 19.5 ↔ 21–37 GB oscillating band post-fix (Metal heap reuse, no monotonic growth).
+
+Wire-level changes:
+
+- `vsm_engine_create` C signature gains a trailing `Int32 maxNumSeqs` parameter (additive — old callers pass 0 → legacy 64-slot behavior preserved).
+- `vllm_swift.engine_bridge.SwiftInferenceEngine.__init__` gains `max_num_seqs: int = 0`.
+- `vllm_swift.worker.SwiftMetalWorker.load_model` reads from `vllm_config.scheduler_config.max_num_seqs`.
+
+Bottle SHA cleared — needs rebuild before brew users get the fix. `pip install vllm-swift==0.5.1` carries it on the wheel side.
+
 ## v0.5.0 — May 7, 2026
 
 **Feature: optional longctx retrieval companion.** vllm-swift can now wire up `TheTom/longctx` (alpha) so chat-completion prompts get retrieved code chunks spliced in automatically. The companion is **optional everywhere** — flag absent + env unset = bit-for-bit unchanged engine behavior. 487/487 existing tests still green.

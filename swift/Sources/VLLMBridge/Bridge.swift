@@ -69,6 +69,15 @@ final class InferenceEngine {
     var sessions: [String: RequestSession] = [:]
     var generateParams: GenerateParameters
 
+    /// Cap on concurrent batched-decode slots. Drives BatchedKVCache
+    /// pre-allocation. Threaded from Python (vLLM scheduler_config.
+    /// max_num_seqs). Default 64 retains pre-fix behavior for callers
+    /// that don't set it.
+    var maxConcurrentRequests: Int = 64
+    /// Cap on per-slot KV depth. Pinned to max_kv_size at engine create
+    /// so BatchedKVCache doesn't have to re-grow turn-to-turn.
+    var maxKVSize: Int = 0
+
     /// Batched KV caches: one per layer, shared across all requests.
     /// Used by fullyBatchedDecode when model is Qwen3.
     var batchedCaches: [BatchedKVCache]?
@@ -116,7 +125,8 @@ public func vsm_engine_create(
     maxKVSize: Int32,
     kvScheme: UnsafePointer<CChar>?,
     kvBits: Int32,
-    memoryFraction: Float
+    memoryFraction: Float,
+    maxNumSeqs: Int32
 ) -> UnsafeMutableRawPointer? {
     guard let modelPath else { return nil }
     let modelId = String(cString: modelPath)
@@ -191,6 +201,13 @@ public func vsm_engine_create(
         configuration: ModelConfiguration(id: modelId),
         params: params
     )
+    // Cap concurrent batched-decode slots from the scheduler's
+    // max_num_seqs. Falls back to legacy behavior (64) if Python
+    // didn't pass anything sensible.
+    engine.maxConcurrentRequests = (maxNumSeqs > 0) ? Int(maxNumSeqs) : 64
+    engine.maxKVSize = (maxKVSize > 0) ? Int(maxKVSize) : 0
+    print("[vsm] Engine create: maxNumSeqs=\(engine.maxConcurrentRequests) "
+          + "maxKVSize=\(engine.maxKVSize)")
 
     // Create stable pointer as opaque handle
     let ptr = Unmanaged.passRetained(engine).toOpaque()
@@ -758,19 +775,26 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
               let firstKeys = firstCache.peek()?.0 else { return Int32(0) }
         let kvHeads = firstKeys.dim(1)
         let headDim = firstKeys.dim(3)
-        // Size cache from longest actual prefill + decode margin. Single flat
-        // tensor per layer; per-slot lazy allocation was tried and regressed
-        // decode by ~46% (see BatchedKVCache.swift).
+        // Size cache from longest actual prefill + decode margin. Pin to
+        // engine.maxKVSize when known so subsequent prefills can't force
+        // a re-grow (which on Metal stacks the old backing in the heap
+        // and shows up as a GB/turn unified-mem leak).
         let maxPrefillOffset = rids.compactMap {
             engine.sessions[$0]?.iterator.cache.first?.offset
         }.max() ?? 0
         let decodeMargin = 512
-        let maxSeq = max(2048, maxPrefillOffset + decodeMargin)
+        let maxSeq = engine.maxKVSize > 0
+            ? engine.maxKVSize
+            : max(2048, maxPrefillOffset + decodeMargin)
+        // Respect scheduler max_num_seqs instead of forcing 64 slots.
+        // 64-slot pre-alloc on max_num_seqs=1 wastes (64-1)× per-layer
+        // KV bytes — at maxSeq=64K that's ~60 GB unused-but-allocated.
+        let maxBatch = max(B, engine.maxConcurrentRequests)
 
         var bCaches = [BatchedKVCache]()
         for _ in 0..<numLayers {
             bCaches.append(BatchedKVCache(
-                maxBatch: max(B, 64), kvHeads: kvHeads, headDim: headDim,
+                maxBatch: maxBatch, kvHeads: kvHeads, headDim: headDim,
                 maxSeq: maxSeq, dtype: firstKeys.dtype
             ))
         }
@@ -780,7 +804,7 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
         // 4B/8K). Holding them across the copy doubles KV memory and OOMs at
         // long-ctx high-B cells.
         engine.batchSlots.removeAll()
-        engine.batchTokens = Array(repeating: 0, count: max(B, 64))
+        engine.batchTokens = Array(repeating: 0, count: maxBatch)
 
         for (slotIdx, rid) in rids.enumerated() {
             guard let session = engine.sessions[rid] else { continue }
@@ -1378,8 +1402,12 @@ private func prefillBatchedUniformQwen3(
     let cacheLen = firstSimple.offset  // = T + 1
 
     // Allocate BatchedKVCache sized for prefill + decode margin.
+    // Pin to engine.maxKVSize when set so we don't re-grow per turn.
     let decodeMargin = 512
-    let maxSeq = max(2048, cacheLen + decodeMargin)
+    let maxSeq = engine.maxKVSize > 0
+        ? engine.maxKVSize
+        : max(2048, cacheLen + decodeMargin)
+    let maxBatch = max(B, engine.maxConcurrentRequests)
     var bCaches = [BatchedKVCache]()
     bCaches.reserveCapacity(numLayers)
     // Use a wrapped caches array we can nil out per-layer — drops the
@@ -1389,7 +1417,7 @@ private func prefillBatchedUniformQwen3(
     var transientCaches: [KVCache?] = caches.map { $0 }
     for layer in 0..<numLayers {
         let bc = BatchedKVCache(
-            maxBatch: max(B, 64), kvHeads: kvHeads, headDim: headDim,
+            maxBatch: maxBatch, kvHeads: kvHeads, headDim: headDim,
             maxSeq: maxSeq, dtype: firstPeek.0.dtype
         )
         guard let simple = transientCaches[layer] as? KVCacheSimple,
@@ -1416,7 +1444,7 @@ private func prefillBatchedUniformQwen3(
     engine.batchedCaches = bCaches
     engine.batchedHybridCaches = nil
     engine.batchSlots.removeAll()
-    engine.batchTokens = Array(repeating: 0, count: max(B, 64))
+    engine.batchTokens = Array(repeating: 0, count: maxBatch)
 
     // Stash sampled first tokens — they're returned by the first decode_all
     // (same previousY pattern as sequential prefill_req).
@@ -1478,9 +1506,9 @@ private func prefillBatchedUniformHybrid(
     let firstTokens = argMax(secondLogits, axis: -1)        // [B]
     eval(firstTokens)
 
-    // Build a fresh BatchedHybridCache sized for at least B (header room
-    // capped to 64 for parity with the Qwen3 path).
-    let maxBatch = max(B, 64)
+    // Build a fresh BatchedHybridCache sized to the scheduler's
+    // max_num_seqs (was hardcoded 64 — over-alloc on small concurrency).
+    let maxBatch = max(B, engine.maxConcurrentRequests)
     let hCaches = model.newBatchedHybridCache(
         maxBatch: maxBatch, parameters: engine.generateParams)
 
@@ -1638,9 +1666,10 @@ private func initBatchedHybrid(
 ) -> Int32 {
     let B = rids.count
 
-    // Build the BatchedHybridCache. We size it for at least B but bump to 64
-    // for parity with the Qwen3 path (header-room for dynamic add/remove).
-    let maxBatch = max(B, 64)
+    // Build the BatchedHybridCache. Respect scheduler max_num_seqs to avoid
+    // over-allocating slots no one will use (drove the GB/turn unified-mem
+    // leak when running with max_num_seqs=1).
+    let maxBatch = max(B, engine.maxConcurrentRequests)
     let hCaches = model.newBatchedHybridCache(
         maxBatch: maxBatch, parameters: engine.generateParams)
 

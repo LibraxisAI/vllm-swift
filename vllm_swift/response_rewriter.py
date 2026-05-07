@@ -37,10 +37,106 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator
+
+
+def _engine_pid() -> int | None:
+    """Find the EngineCore worker pid (the process that holds KV)."""
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "VLLM::EngineCore"], text=True, timeout=2,
+        )
+        for line in out.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _vmmap_dirty_gb(pid: int) -> float:
+    """Use vmmap --summary to get DIRTY SIZE (private dirty pages).
+
+    macOS DIRTY SIZE = bytes of writable pages mutated since alloc, i.e.
+    NOT file-backed mmap, NOT shared cache. This is the true "leak"
+    signal — if it grows monotonically, we have a real heap/buffer leak.
+    """
+    try:
+        out = subprocess.check_output(
+            ["vmmap", "--summary", str(pid)],
+            text=True, timeout=4, stderr=subprocess.DEVNULL,
+        )
+    except Exception:  # noqa: BLE001
+        return 0.0
+    # Look for the TOTAL line:
+    #   TOTAL                  854.4G    21.2G   12.5G    0K     0K   0K
+    # columns: VIRTUAL  RESIDENT  DIRTY  SWAPPED  VOLATILE  NONVOL
+    for line in out.splitlines():
+        if line.strip().startswith("TOTAL "):
+            parts = line.split()
+            # parts[3] is DIRTY in human-readable (e.g. '12.5G', '500M', '0K')
+            for cell in parts:
+                if cell.endswith("G") and cell[:-1].replace(".", "").isdigit():
+                    # First G value = VIRTUAL; we want 3rd. Skip ahead.
+                    pass
+            # Strict positional parse: TOTAL is parts[0], then 6 values
+            try:
+                dirty = parts[3]
+                if dirty.endswith("G"):
+                    return float(dirty[:-1])
+                if dirty.endswith("M"):
+                    return float(dirty[:-1]) / 1024
+                if dirty.endswith("K"):
+                    return float(dirty[:-1]) / 1024 / 1024
+            except (ValueError, IndexError):
+                pass
+    return 0.0
+
+
+def _mem_snapshot() -> str:
+    """Per-request mem sample: ps RSS + macOS-aware DIRTY (true private)
+    + system free. ps RSS undercounts shared mmap; DIRTY is the leak
+    signal you actually care about."""
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "rss,command"], text=True, timeout=2,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    vllm_rss = 0
+    engine_rss = 0
+    for line in out.splitlines():
+        if "vllm_swift.cli serve" in line:
+            try:
+                vllm_rss = max(vllm_rss, int(line.split()[0]))
+            except (ValueError, IndexError):
+                pass
+        elif "VLLM::EngineCore" in line:
+            try:
+                engine_rss += int(line.split()[0])
+            except (ValueError, IndexError):
+                pass
+    epid = _engine_pid()
+    dirty_gb = _vmmap_dirty_gb(epid) if epid else 0.0
+    free_gb = 0.0
+    try:
+        vm = subprocess.check_output(["vm_stat"], text=True, timeout=2)
+        for ln in vm.splitlines():
+            if ln.startswith("Pages free"):
+                pages = int(ln.split()[2].rstrip("."))
+                free_gb = pages * 16384 / 1024 / 1024 / 1024
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    return (f"vllm={vllm_rss/1024/1024:.2f}GB "
+            f"engine_rss={engine_rss/1024/1024:.2f}GB "
+            f"engine_dirty={dirty_gb:.2f}GB "
+            f"free={free_gb:.2f}GB")
 
 if TYPE_CHECKING:
     from aiohttp import web
@@ -1054,19 +1150,33 @@ async def stream_rewriter(upstream_iter: AsyncIterator[bytes], arch: str) -> Asy
 # =============================================================================
 
 
-def _format_longctx_block(chunks: list[dict]) -> str:
+def _format_longctx_block(chunks: list[dict],
+                          max_chars: int = 16384) -> str:
+    """Render chunks as fenced system block, capped at ~max_chars.
+
+    Default 16384 chars ≈ 4K tokens. Without this cap, 8 chunks × 50-line
+    windows balloon to ~12K tokens of splice per turn, blowing out small-
+    context Hermes sessions. Highest-rank chunks fully kept; later ones
+    truncated or dropped.
+    """
     parts = ["## Retrieved code context", ""]
+    used = sum(len(p) + 1 for p in parts)  # +1 for newline joiner
     for c in chunks:
         fp = c.get("file_path", "")
         sl = c.get("start_line", 0)
         el = c.get("end_line", 0)
-        text = c.get("text", "")
-        parts.append(f"// {fp}:{sl}-{el}")
-        parts.append("```")
-        parts.append(text.rstrip())
-        parts.append("```")
-        parts.append("")
-    return "\n".join(parts).rstrip() + "\n\n"
+        text = c.get("text", "").rstrip()
+        header = f"// {fp}:{sl}-{el}"
+        chunk_overhead = len(header) + 12
+        remaining = max_chars - used - chunk_overhead
+        if remaining <= 200:
+            break
+        if len(text) > remaining:
+            text = text[:remaining] + "\n... [truncated]"
+        block = f"{header}\n```\n{text}\n```\n\n"
+        parts.append(block)
+        used += len(block)
+    return "".join(parts).rstrip() + "\n\n"
 
 
 def _splice_longctx_into_messages(messages: list[dict], block: str) -> list[dict]:
@@ -1110,13 +1220,18 @@ def _flatten_prefill(messages: list[dict]) -> str:
 
 async def _enrich_with_longctx(  # pragma: no cover
     body: dict, *, endpoint: str, request_headers: dict[str, str],
-    aiohttp_session,
+    aiohttp_session, default_scope: str = "",
 ) -> tuple[dict, dict[str, str]]:
     """Optionally splice longctx chunks into the chat-completions body.
 
     Tool is optional. Network failures degrade silently — request goes
     through unmodified and the engine answers from its own context.
     Returns (rewritten_body, debug_headers).
+
+    `default_scope` (when set) is forwarded to /retrieve so longctx-svc
+    falls back to that path when the user message contains no absolute
+    path. Lets tool-using agents (Hermes etc.) get retrieval without
+    forcing path mentions.
     """
     messages = body.get("messages") or []
     if not messages:
@@ -1134,6 +1249,8 @@ async def _enrich_with_longctx(  # pragma: no cover
         "query": query,
         "top_k": int(body.get("longctx_top_k", 8)),
     }
+    if default_scope:
+        payload["default_scope"] = default_scope
     fwd_hdrs = {"content-type": "application/json"}
     if sid:
         fwd_hdrs["x-session-affinity"] = sid
@@ -1160,9 +1277,11 @@ async def _enrich_with_longctx(  # pragma: no cover
     # Tester-visible signal: print straight to stderr (not the python
     # logger) so it shows up regardless of vLLM's log config. One line
     # per chat completion when retrieval fires — that's the "is it
-    # working?" signal alpha testers watch for.
+    # working?" signal alpha testers watch for. Includes a memory
+    # snapshot so we can grep growth across turns under load.
+    mem = _mem_snapshot()
     sys.stderr.write(
-        f"[longctx] {chunks_n} chunk(s) from {scope} ({status})\n"
+        f"[longctx] {chunks_n} chunk(s) from {scope} ({status}) | {mem}\n"
     )
     sys.stderr.flush()
     logger.warning(
@@ -1189,6 +1308,7 @@ async def _make_app(  # pragma: no cover
     tool_parser: str = "",
     max_model_len: int | None = None,
     retrieval_endpoint: str = "",
+    longctx_default_scope: str = "",
 ) -> "web.Application":
     # aiohttp is only required when the proxy actually runs. Importing
     # lazily lets the recovery / streaming functions be tested in CI
@@ -1201,6 +1321,20 @@ async def _make_app(  # pragma: no cover
 
     timeout = aiohttp.ClientTimeout(total=600)
 
+    # SHARED ClientSession for upstream vLLM. Critical: per-request
+    # ClientSession leaks connection pools / FDs across hundreds of
+    # turns and shows up as a unified-memory leak under heavy Hermes
+    # fan-out. Reuse a single connector instead.
+    upstream_connector = aiohttp.TCPConnector(
+        limit=64,                # total open conns to upstream
+        limit_per_host=64,
+        ttl_dns_cache=300,
+        force_close=False,
+        enable_cleanup_closed=True,
+    )
+    upstream_session = aiohttp.ClientSession(
+        timeout=timeout, connector=upstream_connector,
+    )
     longctx_session = aiohttp.ClientSession(timeout=timeout) \
         if retrieval_endpoint else None
     longctx_debug_dump = os.environ.get("LONGCTX_DEBUG_DUMP")
@@ -1218,6 +1352,7 @@ async def _make_app(  # pragma: no cover
                         endpoint=retrieval_endpoint,
                         request_headers=dict(request.headers),
                         aiohttp_session=longctx_session,
+                        default_scope=longctx_default_scope,
                     )
                     if longctx_debug_dump:
                         try:
@@ -1242,14 +1377,15 @@ async def _make_app(  # pragma: no cover
         headers = {
             k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")
         }
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.request(
-                request.method,
-                url,
-                data=body if body else None,
-                headers=headers,
-                allow_redirects=False,
-            ) as upstream_resp:
+        # Reuse the app-level shared session — DO NOT spawn one per
+        # request (leaks connection pools / FDs).
+        async with upstream_session.request(
+            request.method,
+            url,
+            data=body if body else None,
+            headers=headers,
+            allow_redirects=False,
+        ) as upstream_resp:
                 ct = upstream_resp.headers.get("content-type", "")
                 # Helper: merge longctx debug headers onto any response.
                 def _with_longctx(h: dict) -> dict:
@@ -1267,12 +1403,52 @@ async def _make_app(  # pragma: no cover
                     await response.prepare(request)
                     # Chain: thinking-split → tool-call streaming recovery
                     thinking_split = stream_rewriter(upstream_resp.content.iter_any(), arch)
-                    async for out_chunk in stream_tool_recovery(thinking_split, tool_parser):
-                        await response.write(out_chunk)
-                    await response.write_eof()
+                    try:
+                        async for out_chunk in stream_tool_recovery(thinking_split, tool_parser):
+                            await response.write(out_chunk)
+                        await response.write_eof()
+                    except (ConnectionResetError,
+                            aiohttp.ClientConnectionResetError) as exc:
+                        # Client disconnected mid-stream (Hermes context-
+                        # overflow retry, ctrl-C, request timeout, etc.).
+                        # We MUST forcibly close the upstream connection
+                        # here — otherwise vLLM keeps generating into a
+                        # void, holding a decode slot that splits compute
+                        # with every other concurrent request and clogs
+                        # the queue with zombies. Closing the upstream
+                        # response triggers vLLM's is_disconnected() check
+                        # and cancels the in-flight generation.
+                        logger.warning(
+                            "client disconnected mid-stream — cancelling "
+                            "upstream generation: %s",
+                            type(exc).__name__,
+                        )
+                        try:
+                            upstream_resp.close()
+                        except Exception:  # noqa: BLE001
+                            pass
                     return response
                 if is_chat and "application/json" in ct:
-                    raw = await upstream_resp.read()
+                    try:
+                        raw = await upstream_resp.read()
+                    except (ConnectionResetError,
+                            aiohttp.ClientConnectionResetError) as exc:
+                        # Client gave up before vLLM finished. Kill the
+                        # upstream gen so it doesn't pollute the queue.
+                        logger.warning(
+                            "client disconnected during non-streaming "
+                            "response — cancelling upstream: %s",
+                            type(exc).__name__,
+                        )
+                        try:
+                            upstream_resp.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        # We can't write a response (client is gone), but
+                        # aiohttp expects us to return one. An empty 499
+                        # ("Client Closed Request", nginx convention) is
+                        # the least-misleading status.
+                        return web.Response(status=499)
                     try:
                         payload = json.loads(raw.decode())
                         rewrite_chat_completion(payload)
@@ -1314,6 +1490,7 @@ def run(  # pragma: no cover
     tool_parser: str = "",
     max_model_len: int | None = None,
     retrieval_endpoint: str = "",
+    longctx_default_scope: str = "",
 ) -> None:
     """Run the rewriter proxy. Blocks until killed."""
     upstream_url = f"http://127.0.0.1:{upstream_port}"
@@ -1335,6 +1512,7 @@ def run(  # pragma: no cover
     asyncio.set_event_loop(loop)
     app = loop.run_until_complete(
         _make_app(upstream_url, arch, reasoning_parser, tool_parser,
-                  max_model_len, retrieval_endpoint)
+                  max_model_len, retrieval_endpoint,
+                  longctx_default_scope)
     )
     web.run_app(app, host="127.0.0.1", port=user_port, print=lambda *_: None, loop=loop)

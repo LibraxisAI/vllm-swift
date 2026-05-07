@@ -149,6 +149,14 @@ class SwiftMetalWorker:
         """Load model via Swift engine."""
         model_path = _resolve_model_path(self.model_config.model)
         logger.info("Loading model via Swift engine: %s", model_path)
+        # max_num_seqs caps BatchedKVCache slot pre-allocation. Without
+        # this, Bridge.swift defaulted to 64 slots regardless of actual
+        # concurrency, blowing GBs of unified mem on small-concurrency
+        # configs and showing as a per-turn leak under Hermes load.
+        max_num_seqs = getattr(
+            getattr(self.vllm_config, "scheduler_config", None),
+            "max_num_seqs", 0,
+        ) or 0
 
         self.engine = SwiftInferenceEngine(
             model_path=model_path,
@@ -157,6 +165,7 @@ class SwiftMetalWorker:
             kv_scheme=self._kv_scheme,
             kv_bits=self._kv_bits,
             memory_fraction=self.cache_config.gpu_memory_utilization,
+            max_num_seqs=int(max_num_seqs),
         )
         logger.info(
             "Swift engine loaded: layers=%d, head_dim=%d, memory=%.1fGB",

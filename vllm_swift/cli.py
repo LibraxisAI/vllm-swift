@@ -173,6 +173,39 @@ def _extract_enable_longctx(args: list[str]) -> tuple[bool, list[str]]:
     return enabled, out
 
 
+def _extract_longctx_scope(args: list[str]) -> tuple[str, list[str]]:
+    """Pull `--longctx-scope PATH` out of `args`. PRD §5.8.
+
+    When set, every chat completion's /retrieve call gets `default_scope`
+    set to PATH so retrieval fires even when the user message contains
+    no absolute paths. Lets tool-using agents (Hermes, OpenCode agentic)
+    get retrieval without needing path mentions.
+
+    If unset and `--enable-longctx` is on, vllm-swift falls back to
+    `os.getcwd()` at boot. The flag exists for users who want to pin a
+    different project than where they happen to be standing.
+
+    Returns (scope_path_or_empty, args_with_flag_removed).
+    """
+    out: list[str] = []
+    scope = os.environ.get("LONGCTX_DEFAULT_SCOPE", "")
+    skip_next = False
+    for i, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--longctx-scope":
+            if i + 1 < len(args):
+                scope = args[i + 1]
+                skip_next = True
+            continue
+        if arg.startswith("--longctx-scope="):
+            scope = arg.split("=", 1)[1]
+            continue
+        out.append(arg)
+    return scope, out
+
+
 def _extract_max_model_len(args: list[str]) -> int | None:
     """Find --max-model-len in args, else None."""
     prev = ""
@@ -273,9 +306,10 @@ def _serve(args: list[str]) -> int:
     else:
         model = _extract_model(args) or ""
         passthrough = args
-    # Strip --retrieval-endpoint before vLLM sees it.
+    # Strip --retrieval-endpoint and friends before vLLM sees them.
     retrieval_endpoint, passthrough = _extract_retrieval_endpoint(passthrough)
     enable_longctx, passthrough = _extract_enable_longctx(passthrough)
+    longctx_scope_override, passthrough = _extract_longctx_scope(passthrough)
     longctx_sidecar = None
     if enable_longctx and not retrieval_endpoint:
         try:
@@ -304,11 +338,23 @@ def _serve(args: list[str]) -> int:
         # Tie sidecar lifecycle to this process: it dies when we die.
         import atexit
         atexit.register(longctx_sidecar.stop)
+    # Resolve the default-scope: explicit flag/env wins, else os.getcwd()
+    # when --enable-longctx is on. Path-in-message still overrides.
+    longctx_default_scope = longctx_scope_override
+    if retrieval_endpoint and not longctx_default_scope:
+        longctx_default_scope = os.getcwd()
     if retrieval_endpoint:
         print(
             f"vllm-swift: longctx retrieval enabled "
             f"(endpoint: {retrieval_endpoint})"
         )
+        if longctx_default_scope:
+            print(
+                f"vllm-swift: default scope = {longctx_default_scope} "
+                "(used when no path is mentioned in the message; "
+                "override with --longctx-scope PATH or "
+                "LONGCTX_DEFAULT_SCOPE env)"
+            )
         print(
             "  → To verify it's working: include an absolute file path in "
             "your chat message,\n"
@@ -389,6 +435,7 @@ def _serve(args: list[str]) -> int:
         tool_parser=injected_tool,
         max_model_len=_extract_max_model_len(passthrough),
         retrieval_endpoint=retrieval_endpoint,
+        longctx_default_scope=longctx_default_scope,
     )
 
 
@@ -403,6 +450,7 @@ def _serve_with_rewriter(  # pragma: no cover
     tool_parser: str = "",
     max_model_len: int | None = None,
     retrieval_endpoint: str = "",
+    longctx_default_scope: str = "",
 ) -> int:
     """Spawn vLLM on an internal port and the rewriter on the user port.
 
@@ -471,6 +519,7 @@ def _serve_with_rewriter(  # pragma: no cover
             tool_parser=tool_parser,
             max_model_len=max_model_len,
             retrieval_endpoint=retrieval_endpoint,
+            longctx_default_scope=longctx_default_scope,
         )
         return 0
     finally:

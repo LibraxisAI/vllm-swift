@@ -11,7 +11,7 @@ class VllmSwift < Formula
   desc "Native Swift/Metal backend for vLLM on Apple Silicon"
   homepage "https://github.com/TheTom/vllm-swift"
   url "https://github.com/TheTom/vllm-swift.git", branch: "main"
-  version "0.5.0"
+  version "0.5.1"
   license "Apache-2.0"
 
   # bottle do
@@ -19,10 +19,10 @@ class VllmSwift < Formula
   #   sha256 cellar: :any, arm64_tahoe:   "<rebuild-pending>"
   #   sha256 cellar: :any, arm64_sequoia: "<rebuild-pending>"
   # end
-  # NOTE: bottle SHAs cleared for 0.5.0 — rebuild the bottle once the
-  # tag lands so brew installs pick up the new --retrieval-endpoint /
-  # --enable-longctx flags. Until then, formula installs from-source
-  # (HOMEBREW_NO_SANDBOX=1 brew install vllm-swift).
+  # NOTE: bottle SHAs cleared for 0.5.1 — rebuild the bottle once the
+  # tag lands so brew installs pick up the BatchedKVCache leak fix
+  # (and the longctx flags from 0.5.0). Until then, formula installs
+  # from-source (HOMEBREW_NO_SANDBOX=1 brew install vllm-swift).
 
   depends_on xcode: ["15.0", :build]
   depends_on "python@3.12"
@@ -114,7 +114,7 @@ class VllmSwift < Formula
           exec "#{libexec}/scripts/integration_test.sh" "$@"
           ;;
         version)
-          echo "vllm-swift 0.5.0"
+          echo "vllm-swift 0.5.1"
           echo "dylib: #{lib}/libVLLMBridge.dylib"
           "$VENV_PYTHON" -c "import vllm; print(f'vLLM: {vllm.__version__}')" 2>/dev/null || true
           "$VENV_PYTHON" -c "import longctx_svc; print(f'longctx-svc: {longctx_svc.__version__}')" 2>/dev/null || echo "longctx-svc: not installed (pip install longctx-svc to enable --enable-longctx)"
@@ -169,6 +169,6 @@ class VllmSwift < Formula
   test do
     assert_predicate lib/"libVLLMBridge.dylib", :exist?
     assert_match "vllm-swift", shell_output("#{bin}/vllm-swift")
-    assert_match "0.5.0", shell_output("#{bin}/vllm-swift version")
+    assert_match "0.5.1", shell_output("#{bin}/vllm-swift version")
   end
 end
