@@ -49,20 +49,20 @@ jobs:
         # and downgrading them only for our build keeps coverage honest.
         run: |
           cd swift && swift build -Xswiftc -strict-concurrency=minimal
+          # SPM doesn't compile .metal files. mlx-swift-lm ships a
+          # build-metallib.sh that does the metal-compile + metallib-archive
+          # dance; invoke it for debug so the metallib lands next to the
+          # debug dylib (where tests/test_install.py checks the
+          # install-time sibling-pair invariant).
+          .build/checkouts/mlx-swift-lm/scripts/build-metallib.sh debug
           DYLIB=$(find .build -name "libVLLMBridge.dylib" -print -quit)
           DYLIB_DIR=$(dirname "$DYLIB")
           mkdir -p ../vllm_swift/_lib
           cp "$DYLIB" ../vllm_swift/_lib/libVLLMBridge.dylib
-          # Copy metallib both into _lib (where the wheel ships it) AND
-          # next to the debug dylib (where tests/test_install.py checks
-          # for it as the install-time sibling-pair invariant). SPM keeps
-          # the metallib in the mlx-swift checkout's resource bundle so
-          # it doesn't naturally land next to our dylib.
-          METALLIB=$(find .build -name "mlx.metallib" -print -quit 2>/dev/null || true)
-          if [ -n "$METALLIB" ]; then
-            cp "$METALLIB" ../vllm_swift/_lib/mlx.metallib
-            cp "$METALLIB" "$DYLIB_DIR/mlx.metallib"
-          fi
+          METALLIB=$(find .build -name "mlx.metallib" -print -quit)
+          cp "$METALLIB" ../vllm_swift/_lib/mlx.metallib
+          # Also stage next to the debug dylib so test_install.py finds it.
+          [ -f "$DYLIB_DIR/mlx.metallib" ] || cp "$METALLIB" "$DYLIB_DIR/mlx.metallib"
 
       - name: Run tests
         run: |
