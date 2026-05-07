@@ -14,15 +14,13 @@ class VllmSwift < Formula
   version "0.5.4"
   license "Apache-2.0"
 
-  # Bottle SHAs cleared on version bump — re-fill once the v0.5.4 bottle
-  # is built + uploaded. Until then, formula installs from-source
-  # (HOMEBREW_NO_SANDBOX=1 brew install vllm-swift).
-  # bottle do
-  #   root_url "https://github.com/TheTom/homebrew-tap/releases/download/bottles"
-  #   sha256 cellar: :any, arm64_tahoe:   ""
-  #   sha256 cellar: :any, arm64_sequoia: ""
-  #   sha256 cellar: :any, arm64_sonoma:  ""
-  # end
+  bottle do
+    root_url "https://github.com/TheTom/homebrew-tap/releases/download/bottles"
+    sha256 cellar: :any, arm64_tahoe:   "80425ed0d42db2972d0e6351a03a55aa7748f8f043b02e825429d076936823bd"
+    # arm64_sequoia + arm64_sonoma SHAs to be filled by mirror builds on
+    # those macOS versions. Until then, sequoia / sonoma users build from
+    # source (HOMEBREW_NO_SANDBOX=1 brew install vllm-swift).
+  end
 
   depends_on xcode: ["15.0", :build]
   depends_on "python@3.12"
