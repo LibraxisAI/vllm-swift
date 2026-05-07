@@ -1,5 +1,46 @@
 # Release History
 
+## v0.5.4 — May 7, 2026
+
+**Fix: turbo KV schemes on dense Qwen3 no longer emit degenerate output.**
+Defilan reported on the v0.5.3 alpha that `--additional-config
+'{"kv_scheme":"turbo4v2","kv_bits":4}'` on Qwen3-4B-4bit produced
+`"<think>1\n1\n1..."` — the same garbage on `turbo8v4` and even with
+longctx removed at `prompt_tokens=19`. v0.5.3 had wired the scheme into
+the **batched-prefill** paths (`prefill_batched_uniform` /
+`hybrid init_batched`), but the dense Qwen3 *serve* flow goes through
+a different path: `prefill_req` → `init_batched` → `decode_all`. Both
+stages drop turbo on dense:
+
+- `init_batched` casts each per-request cache to `KVCacheSimple`, which
+  fails when `kvScheme=turbo*` is set (mlx-swift-lm uses
+  `RotatingKVCache` for that case). The cast guard returns 0 silently
+  and `engine.batchedCaches` stays nil.
+- `decode_all`'s Qwen3 fully-batched path skips (no `batchedCaches`).
+  The Qwen3 *semi-batched* fallback then runs
+  `Qwen3Attention.batchedForward`, whose per-request RoPE+update loop
+  corrupts on rotating-window K/V dequant semantics. Decode degenerates.
+
+**Fix:** `decode_all` now gates both Qwen3 batched paths on
+`engine.generateParams.kvScheme?.hasPrefix("turbo")`. When turbo is set,
+fall through to the sequential `stepAsync` `TokenIterator` path — the
+well-tested turbo decode path every standalone mlx-swift-lm consumer
+uses. Trade-off: no batched SDPA across concurrent requests on dense
+Qwen3 + turbo, so high-concurrency throughput regresses on that
+specific cell. Hardening `Qwen3Attention.batchedForward` for turbo K/V
+is v0.5.5+ work.
+
+Verified locally on Qwen3-4B-4bit:
+
+| config | output |
+|--------|--------|
+| `kv_scheme=turbo4v2` short prompt | `<think>\nOkay, the user wants...` clean |
+| `kv_scheme=turbo4v2` longer prompt | clean |
+| no `kv_scheme` | clean (no regression) |
+
+No mlx-swift-lm changes — pure Bridge.swift gate. Wheel + bottle
+rebuild only.
+
 ## v0.5.3 — May 7, 2026
 
 **Fix: turbo KV schemes no longer silently bypassed on the batched-decode
