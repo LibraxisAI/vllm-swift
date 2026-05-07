@@ -23,10 +23,16 @@ jobs:
           # `aiohttp` covers the longctx proxy path that response_rewriter
           # tests exercise (the v0.5.3 inner-import fix made this no longer
           # mandatory, but installing it in CI lets the proxy code branches
-          # actually run under coverage — without it response_rewriter sat at
-          # 71% and dragged the total below the 80% gate).
+          # actually run under coverage).
           pip install pytest pytest-cov ruff psutil numpy aiohttp
           pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # vllm declared as runtime dep in v0.5.2; install here so the
+          # platform plugin + worker + executor branches in
+          # response_rewriter / cli / engine_bridge / worker exercise
+          # under coverage. Without it, response_rewriter coverage was
+          # 71% and total was 76-78% (under the 80% gate).
+          CFLAGS="-Wno-parentheses" CXXFLAGS="-Wno-parentheses" \
+            pip install "vllm>=0.10"
 
       - name: Lint
         run: |
