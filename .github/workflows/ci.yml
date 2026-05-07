@@ -20,7 +20,12 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-cov ruff psutil numpy
+          # `aiohttp` covers the longctx proxy path that response_rewriter
+          # tests exercise (the v0.5.3 inner-import fix made this no longer
+          # mandatory, but installing it in CI lets the proxy code branches
+          # actually run under coverage — without it response_rewriter sat at
+          # 71% and dragged the total below the 80% gate).
+          pip install pytest pytest-cov ruff psutil numpy aiohttp
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Lint

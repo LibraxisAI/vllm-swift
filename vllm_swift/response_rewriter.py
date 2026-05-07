@@ -1292,16 +1292,17 @@ async def _enrich_with_longctx(  # pragma: no cover
     if sid:
         fwd_hdrs["x-session-affinity"] = sid
     try:
-        import aiohttp as _aiohttp
-
         # First /retrieve call on cold longctx-svc loads the embedder
-        # (and optionally a 568M reranker). Give it room.
-        timeout = _aiohttp.ClientTimeout(total=120.0)
+        # (and optionally a 568M reranker). Give it room. Plain-float
+        # timeout (vs aiohttp.ClientTimeout) keeps the call path import-
+        # clean — tests exercise this function with a _FakeSession in CI
+        # envs that don't have aiohttp installed, and a top-level
+        # `import aiohttp` here would fail before reaching the fake.
         async with aiohttp_session.post(
             f"{endpoint.rstrip('/')}/retrieve",
             json=payload,
             headers=fwd_hdrs,
-            timeout=timeout,
+            timeout=120.0,
         ) as r:
             if r.status != 200:
                 logger.warning("longctx /retrieve returned %d", r.status)
