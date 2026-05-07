@@ -14,17 +14,10 @@ class VllmSwift < Formula
   version "0.5.2"
   license "Apache-2.0"
 
-  # bottle do
-  #   root_url "https://github.com/TheTom/homebrew-tap/releases/download/bottles"
-  #   sha256 cellar: :any, arm64_tahoe:   "<rebuild-pending>"
-  #   sha256 cellar: :any, arm64_sequoia: "<rebuild-pending>"
-  # end
-  # NOTE: bottle SHAs cleared for 0.5.2 — rebuild the bottle once the
-  # tag lands so brew installs pick up the alpha-tester bug fixes (vllm
-  # dep declared, reasoning-bump honors explicit small max_tokens,
-  # message.reasoning normalized, longctx relevance floor, max_model_len
-  # pre-flight warn). Until then, formula installs from-source
-  # (HOMEBREW_NO_SANDBOX=1 brew install vllm-swift).
+  bottle do
+    root_url "https://github.com/TheTom/homebrew-tap/releases/download/bottles"
+    sha256 cellar: :any, arm64_tahoe: "4c4db16055dcb07a84499ce3f438a3ed9bb163d47ac2443e5e322c848d12ac14"
+  end
 
   depends_on xcode: ["15.0", :build]
   depends_on "python@3.12"
