@@ -37,6 +37,8 @@ import json
 import logging
 import os
 import re
+import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator
 
@@ -1052,12 +1054,141 @@ async def stream_rewriter(upstream_iter: AsyncIterator[bytes], arch: str) -> Asy
 # =============================================================================
 
 
+def _format_longctx_block(chunks: list[dict]) -> str:
+    parts = ["## Retrieved code context", ""]
+    for c in chunks:
+        fp = c.get("file_path", "")
+        sl = c.get("start_line", 0)
+        el = c.get("end_line", 0)
+        text = c.get("text", "")
+        parts.append(f"// {fp}:{sl}-{el}")
+        parts.append("```")
+        parts.append(text.rstrip())
+        parts.append("```")
+        parts.append("")
+    return "\n".join(parts).rstrip() + "\n\n"
+
+
+def _splice_longctx_into_messages(messages: list[dict], block: str) -> list[dict]:
+    out = [dict(m) for m in messages]
+    for m in out:
+        if m.get("role") == "system":
+            content = m.get("content", "")
+            if isinstance(content, list):
+                m["content"] = [{"type": "text", "text": block}] + content
+            else:
+                m["content"] = block + str(content)
+            return out
+    return [{"role": "system", "content": block.rstrip()}] + out
+
+
+def _last_user_text(messages: list[dict]) -> str:
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            content = m.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        return c.get("text", "")
+    return ""
+
+
+def _flatten_prefill(messages: list[dict]) -> str:
+    parts: list[str] = []
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(
+                c.get("text", "") for c in content
+                if isinstance(c, dict) and c.get("type") == "text"
+            )
+        parts.append(f"[{m.get('role', 'user')}]\n{content}")
+    return "\n\n".join(parts)
+
+
+async def _enrich_with_longctx(  # pragma: no cover
+    body: dict, *, endpoint: str, request_headers: dict[str, str],
+    aiohttp_session,
+) -> tuple[dict, dict[str, str]]:
+    """Optionally splice longctx chunks into the chat-completions body.
+
+    Tool is optional. Network failures degrade silently — request goes
+    through unmodified and the engine answers from its own context.
+    Returns (rewritten_body, debug_headers).
+    """
+    messages = body.get("messages") or []
+    if not messages:
+        return body, {}
+    query = _last_user_text(messages)
+    prefill = _flatten_prefill(messages)
+    if not query:
+        return body, {}
+    # aiohttp's dict(request.headers) yields title-cased keys; lowercase
+    # them once so we can look up regardless of how the client cased them.
+    rh = {k.lower(): v for k, v in request_headers.items()}
+    sid = rh.get("x-session-affinity") or rh.get("x-session-id") or ""
+    payload = {
+        "prefill_text": prefill,
+        "query": query,
+        "top_k": int(body.get("longctx_top_k", 8)),
+    }
+    fwd_hdrs = {"content-type": "application/json"}
+    if sid:
+        fwd_hdrs["x-session-affinity"] = sid
+    try:
+        import aiohttp as _aiohttp
+        # First /retrieve call on cold longctx-svc loads the embedder
+        # (and optionally a 568M reranker). Give it room.
+        timeout = _aiohttp.ClientTimeout(total=120.0)
+        async with aiohttp_session.post(
+            f"{endpoint.rstrip('/')}/retrieve",
+            json=payload, headers=fwd_hdrs, timeout=timeout,
+        ) as r:
+            if r.status != 200:
+                logger.warning("longctx /retrieve returned %d", r.status)
+                return body, {"x-longctx-error": f"status={r.status}"}
+            data = await r.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("longctx call failed: %s: %s",
+                       type(exc).__name__, exc)
+        return body, {"x-longctx-error": type(exc).__name__}
+    chunks_n = len(data.get("chunks") or [])
+    scope = data.get("scope_path") or "<none>"
+    status = data.get("scope_status") or "<none>"
+    # Tester-visible signal: print straight to stderr (not the python
+    # logger) so it shows up regardless of vLLM's log config. One line
+    # per chat completion when retrieval fires — that's the "is it
+    # working?" signal alpha testers watch for.
+    sys.stderr.write(
+        f"[longctx] {chunks_n} chunk(s) from {scope} ({status})\n"
+    )
+    sys.stderr.flush()
+    logger.warning(
+        "longctx ok: chunks=%d scope=%s status=%s",
+        chunks_n, scope, status,
+    )
+    chunks = data.get("chunks") or []
+    debug = {
+        "x-longctx-session": data.get("session_id") or sid or "ephemeral",
+        "x-longctx-scope": data.get("scope_path") or "",
+        "x-longctx-chunks-used": str(len(chunks)),
+        "x-longctx-scope-status": data.get("scope_status") or "no-scope",
+    }
+    if chunks:
+        block = _format_longctx_block(chunks)
+        body["messages"] = _splice_longctx_into_messages(messages, block)
+    return body, debug
+
+
 async def _make_app(  # pragma: no cover
     upstream_url: str,
     arch: str,
     reasoning_parser: str = "",
     tool_parser: str = "",
     max_model_len: int | None = None,
+    retrieval_endpoint: str = "",
 ) -> "web.Application":
     # aiohttp is only required when the proxy actually runs. Importing
     # lazily lets the recovery / streaming functions be tested in CI
@@ -1070,12 +1201,36 @@ async def _make_app(  # pragma: no cover
 
     timeout = aiohttp.ClientTimeout(total=600)
 
+    longctx_session = aiohttp.ClientSession(timeout=timeout) \
+        if retrieval_endpoint else None
+    longctx_debug_dump = os.environ.get("LONGCTX_DEBUG_DUMP")
+
     async def proxy(request: web.Request) -> web.StreamResponse:
         body = await request.read()
         is_chat = "chat/completions" in request.path and request.method == "POST"
+        longctx_headers: dict[str, str] = {}
         if is_chat and body:
             try:
                 req_payload = json.loads(body.decode())
+                if retrieval_endpoint:
+                    req_payload, longctx_headers = await _enrich_with_longctx(
+                        req_payload,
+                        endpoint=retrieval_endpoint,
+                        request_headers=dict(request.headers),
+                        aiohttp_session=longctx_session,
+                    )
+                    if longctx_debug_dump:
+                        try:
+                            from pathlib import Path as _P
+                            d = _P(longctx_debug_dump)
+                            d.mkdir(parents=True, exist_ok=True)
+                            ts = f"{int(time.time() * 1000):013d}"
+                            (d / f"{ts}-vllm-swift.json").write_text(
+                                json.dumps(req_payload, indent=2,
+                                           ensure_ascii=False),
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                 req_payload = rewrite_request(req_payload, arch, reasoning_parser, max_model_len)
                 body = json.dumps(req_payload).encode()
             except Exception as exc:
@@ -1096,10 +1251,18 @@ async def _make_app(  # pragma: no cover
                 allow_redirects=False,
             ) as upstream_resp:
                 ct = upstream_resp.headers.get("content-type", "")
+                # Helper: merge longctx debug headers onto any response.
+                def _with_longctx(h: dict) -> dict:
+                    if longctx_headers:
+                        h = {**h, **longctx_headers}
+                    return h
+
                 if is_chat and "text/event-stream" in ct:
                     response = web.StreamResponse(
                         status=upstream_resp.status,
-                        headers={"Content-Type": ct, "Cache-Control": "no-cache"},
+                        headers=_with_longctx({
+                            "Content-Type": ct, "Cache-Control": "no-cache",
+                        }),
                     )
                     await response.prepare(request)
                     # Chain: thinking-split → tool-call streaming recovery
@@ -1117,18 +1280,20 @@ async def _make_app(  # pragma: no cover
                         return web.Response(
                             status=upstream_resp.status,
                             body=new_body,
-                            headers={"Content-Type": "application/json"},
+                            headers=_with_longctx({
+                                "Content-Type": "application/json"}),
                         )
                     except Exception as exc:
                         logger.warning("response rewrite failed, returning raw: %s", exc)
                         return web.Response(
                             status=upstream_resp.status,
                             body=raw,
-                            headers=dict(upstream_resp.headers),
+                            headers=_with_longctx(dict(upstream_resp.headers)),
                         )
                 # Pass-through for everything else
                 response = web.StreamResponse(
-                    status=upstream_resp.status, headers=dict(upstream_resp.headers)
+                    status=upstream_resp.status,
+                    headers=_with_longctx(dict(upstream_resp.headers)),
                 )
                 await response.prepare(request)
                 async for ch in upstream_resp.content.iter_any():
@@ -1148,18 +1313,20 @@ def run(  # pragma: no cover
     reasoning_parser: str = "",
     tool_parser: str = "",
     max_model_len: int | None = None,
+    retrieval_endpoint: str = "",
 ) -> None:
     """Run the rewriter proxy. Blocks until killed."""
     upstream_url = f"http://127.0.0.1:{upstream_port}"
     logger.info(
         "rewriter starting: user_port=%d upstream=%s arch=%s reasoning_parser=%s "
-        "tool_parser=%s max_model_len=%s",
+        "tool_parser=%s max_model_len=%s retrieval=%s",
         user_port,
         upstream_url,
         arch,
         reasoning_parser or "<none>",
         tool_parser or "<none>",
         max_model_len if max_model_len else "<unknown>",
+        retrieval_endpoint or "<off>",
     )
     # Lazy aiohttp import — only when the proxy actually runs.
     from aiohttp import web
@@ -1167,6 +1334,7 @@ def run(  # pragma: no cover
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = loop.run_until_complete(
-        _make_app(upstream_url, arch, reasoning_parser, tool_parser, max_model_len)
+        _make_app(upstream_url, arch, reasoning_parser, tool_parser,
+                  max_model_len, retrieval_endpoint)
     )
     web.run_app(app, host="127.0.0.1", port=user_port, print=lambda *_: None, loop=loop)

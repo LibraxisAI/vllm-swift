@@ -1,5 +1,28 @@
 # Release History
 
+## v0.5.0 — May 7, 2026
+
+**Feature: optional longctx retrieval companion.** vllm-swift can now wire up `TheTom/longctx` (alpha) so chat-completion prompts get retrieved code chunks spliced in automatically. The companion is **optional everywhere** — flag absent + env unset = bit-for-bit unchanged engine behavior. 487/487 existing tests still green.
+
+Two integration paths:
+
+- **`--retrieval-endpoint URL`** (or `LONGCTX_ENDPOINT` env): point at an already-running `longctx-svc`. The transparent rewriter calls `/retrieve`, splices retrieved chunks into the system message, forwards to vLLM unchanged.
+- **`--enable-longctx`** (or `LONGCTX_ENABLE=1` env): one-flag UX. vllm-swift auto-spawns a `longctx-svc` subprocess on a free port, manages its lifecycle, tears it down on shutdown. Requires `pip install longctx-svc` (alpha; ~50 MB plus sentence-transformers / bge-reranker-v2-m3 / watchdog / pathspec).
+
+```bash
+# explicit endpoint
+vllm-swift serve ~/models/Qwen3-4B-4bit --retrieval-endpoint http://127.0.0.1:8765
+
+# one-flag
+vllm-swift serve ~/models/Qwen3-4B-4bit --enable-longctx
+```
+
+The rewriter exposes four debug headers on every chat-completion response so testers can see what happened: `x-longctx-session`, `x-longctx-scope`, `x-longctx-chunks-used`, `x-longctx-scope-status`. End-to-end smoke harness in `services/longctx-svc/integration/harness.py` covers proxy + embedded modes; both verified locally on `Qwen3-4B-4bit` and on Mac mini M2 with `Qwen3.5-2B-4bit`.
+
+22 new tests in `tests/test_longctx_endpoint.py` pin flag parsing (=-form / space-form / env fallback / `--no-` opt-out / flag-overrides-env), splice format, network-failure degradation, non-200 degradation, no-chunks no-splice, header case-insensitivity, splice into existing system message vs prepended new system message, OpenAI vision-style content arrays.
+
+`pip install vllm-swift==0.5.0` and `brew upgrade vllm-swift` (after the bottle is rebuilt) ship it. `pip install longctx-svc` is needed alongside if you want to use either flag.
+
 ## v0.4.2 — May 5, 2026
 
 **Patch: skip max_tokens bump when max_model_len is too small for reasoning headroom.** Follow-up to 0.4.1's clamp. Mac Mini M2 testing surfaced that even after clamping the bump against `max_model_len`, a small context window (e.g. Qwen3.5-2B with `--max-model-len 4096`) still 400'd: `prompt_tokens + max_tokens > max_model_len`. The 0.4.1 safety margin (256 tokens) wasn't enough headroom for realistic prompts.

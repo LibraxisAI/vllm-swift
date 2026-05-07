@@ -123,6 +123,56 @@ def _strip_port(args: list[str]) -> list[str]:
     return out
 
 
+def _extract_retrieval_endpoint(args: list[str]) -> tuple[str, list[str]]:
+    """Pull `--retrieval-endpoint URL` out of `args`. Optional flag.
+
+    When set, vllm-swift's transparent rewriter calls longctx-svc on every
+    chat-completion to splice retrieved code chunks into the prompt before
+    forwarding to vLLM. Tool is optional — flag absent → no-op.
+
+    Returns (url_or_empty, args_with_flag_removed).
+    """
+    out: list[str] = []
+    url = os.environ.get("LONGCTX_ENDPOINT", "")
+    skip_next = False
+    for i, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--retrieval-endpoint":
+            if i + 1 < len(args):
+                url = args[i + 1]
+                skip_next = True
+            continue
+        if arg.startswith("--retrieval-endpoint="):
+            url = arg.split("=", 1)[1]
+            continue
+        out.append(arg)
+    return url, out
+
+
+def _extract_enable_longctx(args: list[str]) -> tuple[bool, list[str]]:
+    """Pull `--enable-longctx` boolean flag out of `args`. Optional.
+
+    When set, vllm-swift auto-spawns a longctx-svc subprocess on a
+    free local port and wires its own --retrieval-endpoint to that
+    port. Saves users the "start two terminals" dance.
+
+    Returns (enabled, args_with_flag_removed).
+    """
+    out: list[str] = []
+    enabled = os.environ.get("LONGCTX_ENABLE", "").lower() in ("1", "true", "yes")
+    for arg in args:
+        if arg == "--enable-longctx":
+            enabled = True
+            continue
+        if arg == "--no-enable-longctx":
+            enabled = False
+            continue
+        out.append(arg)
+    return enabled, out
+
+
 def _extract_max_model_len(args: list[str]) -> int | None:
     """Find --max-model-len in args, else None."""
     prev = ""
@@ -223,6 +273,51 @@ def _serve(args: list[str]) -> int:
     else:
         model = _extract_model(args) or ""
         passthrough = args
+    # Strip --retrieval-endpoint before vLLM sees it.
+    retrieval_endpoint, passthrough = _extract_retrieval_endpoint(passthrough)
+    enable_longctx, passthrough = _extract_enable_longctx(passthrough)
+    longctx_sidecar = None
+    if enable_longctx and not retrieval_endpoint:
+        try:
+            from longctx_svc.sidecar import spawn_sidecar
+        except ImportError:
+            sys.stderr.write(
+                "vllm-swift: --enable-longctx needs the optional retrieval "
+                "companion, which isn't installed yet. Install with:\n\n"
+                "  vllm-swift longctx-install\n\n"
+                "or directly:\n\n"
+                "  pip install longctx-svc\n"
+                "  # (or: pip install vllm-swift[longctx])\n"
+            )
+            return 2
+        print("vllm-swift: --enable-longctx set, spawning longctx-svc sidecar...")
+        try:
+            longctx_sidecar = spawn_sidecar(boot_timeout=30.0)
+        except RuntimeError as exc:
+            sys.stderr.write(f"vllm-swift: failed to start longctx-svc: {exc}\n")
+            return 1
+        retrieval_endpoint = longctx_sidecar.url
+        print(
+            f"vllm-swift: longctx-svc sidecar healthy at {retrieval_endpoint} "
+            f"(pid {longctx_sidecar.proc.pid}); will be torn down on shutdown"
+        )
+        # Tie sidecar lifecycle to this process: it dies when we die.
+        import atexit
+        atexit.register(longctx_sidecar.stop)
+    if retrieval_endpoint:
+        print(
+            f"vllm-swift: longctx retrieval enabled "
+            f"(endpoint: {retrieval_endpoint})"
+        )
+        print(
+            "  → To verify it's working: include an absolute file path in "
+            "your chat message,\n"
+            "    then watch this terminal for a `[longctx] N chunk(s) "
+            "from /path ...` line\n"
+            "    after each request. You can also `curl "
+            f"{retrieval_endpoint}/longctx/status -H \"accept: text/plain\"`\n"
+            "    for a live snapshot of indexed scopes."
+        )
     auto_args: list[str] = []
     short = os.path.basename(model.rstrip("/")) if model else ""
     injected_tool: str = ""
@@ -271,6 +366,7 @@ def _serve(args: list[str]) -> int:
         injected_reasoning in _REASONING_PARSERS_NEEDING_BUDGET
         or needs_rewrite(arch)
         or injected_tool in _LEAKY_TOOL_PARSERS
+        or bool(retrieval_endpoint)
     )
     env = _prepare_dyld_env()
     if not needs_proxy:
@@ -292,6 +388,7 @@ def _serve(args: list[str]) -> int:
         reasoning_parser=injected_reasoning,
         tool_parser=injected_tool,
         max_model_len=_extract_max_model_len(passthrough),
+        retrieval_endpoint=retrieval_endpoint,
     )
 
 
@@ -305,6 +402,7 @@ def _serve_with_rewriter(  # pragma: no cover
     reasoning_parser: str,
     tool_parser: str = "",
     max_model_len: int | None = None,
+    retrieval_endpoint: str = "",
 ) -> int:
     """Spawn vLLM on an internal port and the rewriter on the user port.
 
@@ -372,6 +470,7 @@ def _serve_with_rewriter(  # pragma: no cover
             reasoning_parser=reasoning_parser,
             tool_parser=tool_parser,
             max_model_len=max_model_len,
+            retrieval_endpoint=retrieval_endpoint,
         )
         return 0
     finally:
@@ -416,14 +515,141 @@ def _help() -> int:
     print("vllm-swift — Native Swift/Metal backend for vLLM on Apple Silicon")
     print()
     print("Usage:")
-    print("  vllm-swift serve <model> [args]   Start OpenAI-compatible API server")
-    print("  vllm-swift download <model-id>    Download model from HuggingFace")
-    print("  vllm-swift version                Show version info")
+    print("  vllm-swift serve <model> [args]    Start OpenAI-compatible API server")
+    print("  vllm-swift download <model-id>     Download model from HuggingFace")
+    print("  vllm-swift longctx-status [URL]    Show live longctx-svc status")
+    print("  vllm-swift version                 Show version info")
     print()
     print("Examples:")
     print("  vllm-swift download mlx-community/Qwen3-4B-4bit")
     print("  vllm-swift serve ~/models/Qwen3-4B-4bit --max-model-len 4096")
+    print("  vllm-swift serve ~/models/Qwen3-4B-4bit --enable-longctx")
     return 0
+
+
+def _longctx_test(rest: list[str]) -> int:
+    """Self-test: spawn longctx-svc, run a synthetic /retrieve against
+    a real project, and print a clear PASS/FAIL summary.
+
+    Use:
+        vllm-swift longctx-test                   # generates a tmp project
+        vllm-swift longctx-test /path/to/project  # tests against your repo
+    """
+    import json
+    import tempfile
+    import urllib.request
+    from pathlib import Path
+
+    try:
+        from longctx_svc.sidecar import managed_sidecar
+    except ImportError:
+        sys.stderr.write(
+            "vllm-swift: longctx-svc isn't installed. Run "
+            "`vllm-swift longctx-install` first.\n"
+        )
+        return 2
+
+    if rest:
+        project = Path(rest[0]).expanduser().resolve()
+        if not project.is_dir():
+            sys.stderr.write(f"vllm-swift: not a directory: {project}\n")
+            return 2
+        # Find any real source file inside the project for the prefill
+        candidates = list(project.rglob("*.py"))[:3] \
+            + list(project.rglob("*.ts"))[:3] \
+            + list(project.rglob("*.js"))[:3] \
+            + list(project.rglob("*.go"))[:3]
+        if not candidates:
+            sys.stderr.write(
+                f"vllm-swift: no .py/.ts/.js/.go files found in {project}\n"
+            )
+            return 2
+        target_path = candidates[0]
+    else:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="vllm-swift-longctx-test-"))
+        project = tmp_dir / "smokeapp"
+        (project / "src").mkdir(parents=True)
+        (project / "package.json").write_text('{"name":"smokeapp"}\n')
+        target_path = project / "src" / "auth.ts"
+        target_path.write_text(
+            "export function authMiddleware() {\n"
+            "  // unique self-test marker UNICORN_KIWI_TEST_TOKEN\n"
+            "  return true;\n"
+            "}\n"
+        )
+
+    print(f"vllm-swift: longctx self-test against {project}")
+    print(f"  target file: {target_path}")
+    print("  spawning longctx-svc sidecar...")
+    try:
+        with managed_sidecar(boot_timeout=30.0) as sc:
+            print(f"  sidecar healthy at {sc.url}")
+            req = urllib.request.Request(
+                f"{sc.url}/retrieve",
+                data=json.dumps({
+                    "prefill_text": f"explain the function in {target_path}",
+                    "query": "what does this code do",
+                    "top_k": 4,
+                }).encode(),
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as r:
+                data = json.loads(r.read())
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"vllm-swift: self-test FAILED: {exc!s}\n")
+        return 1
+
+    n_chunks = len(data.get("chunks") or [])
+    scope_path = data.get("scope_path") or "<none>"
+    status = data.get("scope_status") or "<none>"
+    sentinel = data.get("scope_sentinel") or "<none>"
+    print(f"  scope detected: {scope_path}")
+    print(f"  sentinel: {sentinel}")
+    print(f"  status: {status}")
+    print(f"  chunks retrieved: {n_chunks}")
+    if n_chunks > 0 and status in ("ready", "empty"):
+        print()
+        print("  ✓ PASS — longctx is working end-to-end.")
+        print("  When you `serve --enable-longctx`, you'll see "
+              "`[longctx] N chunk(s) ...` lines per chat completion.")
+        return 0
+    print()
+    sys.stderr.write(
+        "  ✗ FAIL — retrieval returned 0 chunks. Is your --target path "
+        "absolute and does its parent have a sentinel "
+        "(.git, package.json, pyproject.toml, …)?\n"
+    )
+    return 1
+
+
+def _longctx_status(rest: list[str]) -> int:
+    """Hit the longctx-svc /longctx/status endpoint and pretty-print.
+
+    Defaults to http://127.0.0.1:8765 (the address vllm-swift's
+    --enable-longctx sidecar uses by default). Override with a positional
+    URL: `vllm-swift longctx-status http://other-host:9000`.
+    """
+    import urllib.error
+    import urllib.request
+    base = rest[0].rstrip("/") if rest else "http://127.0.0.1:8765"
+    try:
+        req = urllib.request.Request(
+            f"{base}/longctx/status",
+            headers={"accept": "text/plain"},
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as r:
+            sys.stdout.write(r.read().decode("utf-8", errors="replace"))
+            if not sys.stdout.isatty():
+                return 0
+            sys.stdout.write("\n")
+        return 0
+    except urllib.error.URLError as e:
+        sys.stderr.write(
+            f"vllm-swift: longctx-svc not reachable at {base} ({e}).\n"
+            f"Is `--enable-longctx` running, or pass the URL explicitly.\n"
+        )
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -437,6 +663,10 @@ def main(argv: list[str] | None = None) -> int:
         return _download(rest)
     if cmd == "version":
         return _version()
+    if cmd in ("longctx-status", "longctx-stat"):
+        return _longctx_status(rest)
+    if cmd == "longctx-test":
+        return _longctx_test(rest)
     sys.stderr.write(f"Unknown command: {cmd}\n")
     _help()
     return 2
