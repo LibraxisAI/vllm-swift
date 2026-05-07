@@ -246,6 +246,7 @@ def _model_max_position_embeddings(model_path: str) -> int | None:
             continue
         try:
             import json as _json
+
             cfg = _json.loads(p.read_text())
             for key in ("max_position_embeddings", "model_max_length"):
                 v = cfg.get(key)
@@ -257,7 +258,8 @@ def _model_max_position_embeddings(model_path: str) -> int | None:
 
 
 def _warn_if_max_model_len_exceeds_model(
-    model_path: str, requested_max_model_len: int | None,
+    model_path: str,
+    requested_max_model_len: int | None,
 ) -> None:
     """Pre-flight warn for bug #2: `--max-model-len` larger than the
     model's declared positional embedding budget. Warning, not error —
@@ -367,7 +369,8 @@ def _serve(args: list[str]) -> int:
     # with max_position_embeddings=40960 → vLLM rejects prompts. Warn
     # up front with the actual numbers instead of failing later.
     _warn_if_max_model_len_exceeds_model(
-        model, _extract_max_model_len(passthrough),
+        model,
+        _extract_max_model_len(passthrough),
     )
     longctx_sidecar = None
     if enable_longctx and not retrieval_endpoint:
@@ -396,6 +399,7 @@ def _serve(args: list[str]) -> int:
         )
         # Tie sidecar lifecycle to this process: it dies when we die.
         import atexit
+
         atexit.register(longctx_sidecar.stop)
     # Resolve the default-scope: explicit flag/env wins, else os.getcwd()
     # when --enable-longctx is on. Path-in-message still overrides.
@@ -403,10 +407,7 @@ def _serve(args: list[str]) -> int:
     if retrieval_endpoint and not longctx_default_scope:
         longctx_default_scope = os.getcwd()
     if retrieval_endpoint:
-        print(
-            f"vllm-swift: longctx retrieval enabled "
-            f"(endpoint: {retrieval_endpoint})"
-        )
+        print(f"vllm-swift: longctx retrieval enabled (endpoint: {retrieval_endpoint})")
         if longctx_default_scope:
             print(
                 f"vllm-swift: default scope = {longctx_default_scope} "
@@ -420,7 +421,7 @@ def _serve(args: list[str]) -> int:
             "    then watch this terminal for a `[longctx] N chunk(s) "
             "from /path ...` line\n"
             "    after each request. You can also `curl "
-            f"{retrieval_endpoint}/longctx/status -H \"accept: text/plain\"`\n"
+            f'{retrieval_endpoint}/longctx/status -H "accept: text/plain"`\n'
             "    for a live snapshot of indexed scopes."
         )
     auto_args: list[str] = []
@@ -652,8 +653,7 @@ def _longctx_test(rest: list[str]) -> int:
         from longctx_svc.sidecar import managed_sidecar
     except ImportError:
         sys.stderr.write(
-            "vllm-swift: longctx-svc isn't installed. Run "
-            "`vllm-swift longctx-install` first.\n"
+            "vllm-swift: longctx-svc isn't installed. Run `vllm-swift longctx-install` first.\n"
         )
         return 2
 
@@ -663,14 +663,14 @@ def _longctx_test(rest: list[str]) -> int:
             sys.stderr.write(f"vllm-swift: not a directory: {project}\n")
             return 2
         # Find any real source file inside the project for the prefill
-        candidates = list(project.rglob("*.py"))[:3] \
-            + list(project.rglob("*.ts"))[:3] \
-            + list(project.rglob("*.js"))[:3] \
+        candidates = (
+            list(project.rglob("*.py"))[:3]
+            + list(project.rglob("*.ts"))[:3]
+            + list(project.rglob("*.js"))[:3]
             + list(project.rglob("*.go"))[:3]
+        )
         if not candidates:
-            sys.stderr.write(
-                f"vllm-swift: no .py/.ts/.js/.go files found in {project}\n"
-            )
+            sys.stderr.write(f"vllm-swift: no .py/.ts/.js/.go files found in {project}\n")
             return 2
         target_path = candidates[0]
     else:
@@ -694,11 +694,13 @@ def _longctx_test(rest: list[str]) -> int:
             print(f"  sidecar healthy at {sc.url}")
             req = urllib.request.Request(
                 f"{sc.url}/retrieve",
-                data=json.dumps({
-                    "prefill_text": f"explain the function in {target_path}",
-                    "query": "what does this code do",
-                    "top_k": 4,
-                }).encode(),
+                data=json.dumps(
+                    {
+                        "prefill_text": f"explain the function in {target_path}",
+                        "query": "what does this code do",
+                        "top_k": 4,
+                    }
+                ).encode(),
                 headers={"content-type": "application/json"},
                 method="POST",
             )
@@ -719,8 +721,10 @@ def _longctx_test(rest: list[str]) -> int:
     if n_chunks > 0 and status in ("ready", "empty"):
         print()
         print("  ✓ PASS — longctx is working end-to-end.")
-        print("  When you `serve --enable-longctx`, you'll see "
-              "`[longctx] N chunk(s) ...` lines per chat completion.")
+        print(
+            "  When you `serve --enable-longctx`, you'll see "
+            "`[longctx] N chunk(s) ...` lines per chat completion."
+        )
         return 0
     print()
     sys.stderr.write(
@@ -740,6 +744,7 @@ def _longctx_status(rest: list[str]) -> int:
     """
     import urllib.error
     import urllib.request
+
     base = rest[0].rstrip("/") if rest else "http://127.0.0.1:8765"
     try:
         req = urllib.request.Request(

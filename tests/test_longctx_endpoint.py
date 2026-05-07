@@ -15,6 +15,7 @@ We test:
      guarantee).
   5. _format_longctx_block round-trip + system-message merge ordering.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -36,22 +37,32 @@ from vllm_swift.response_rewriter import (
 # CLI flag parsing
 # ---------------------------------------------------------------------------
 
+
 def test_extract_retrieval_endpoint_space_form(monkeypatch):
     monkeypatch.delenv("LONGCTX_ENDPOINT", raising=False)
-    url, rest = _extract_retrieval_endpoint([
-        "--port", "8000",
-        "--retrieval-endpoint", "http://localhost:8765",
-        "--max-model-len", "4096",
-    ])
+    url, rest = _extract_retrieval_endpoint(
+        [
+            "--port",
+            "8000",
+            "--retrieval-endpoint",
+            "http://localhost:8765",
+            "--max-model-len",
+            "4096",
+        ]
+    )
     assert url == "http://localhost:8765"
     assert rest == ["--port", "8000", "--max-model-len", "4096"]
 
 
 def test_extract_retrieval_endpoint_equals_form(monkeypatch):
     monkeypatch.delenv("LONGCTX_ENDPOINT", raising=False)
-    url, rest = _extract_retrieval_endpoint([
-        "--retrieval-endpoint=http://h:8765", "--port", "8000",
-    ])
+    url, rest = _extract_retrieval_endpoint(
+        [
+            "--retrieval-endpoint=http://h:8765",
+            "--port",
+            "8000",
+        ]
+    )
     assert url == "http://h:8765"
     assert rest == ["--port", "8000"]
 
@@ -73,15 +84,19 @@ def test_extract_retrieval_endpoint_missing(monkeypatch):
 
 def test_extract_retrieval_endpoint_flag_overrides_env(monkeypatch):
     monkeypatch.setenv("LONGCTX_ENDPOINT", "http://env:1")
-    url, _ = _extract_retrieval_endpoint([
-        "--retrieval-endpoint", "http://flag:2",
-    ])
+    url, _ = _extract_retrieval_endpoint(
+        [
+            "--retrieval-endpoint",
+            "http://flag:2",
+        ]
+    )
     assert url == "http://flag:2"
 
 
 # ---------------------------------------------------------------------------
 # --enable-longctx flag (auto-spawn sidecar)
 # ---------------------------------------------------------------------------
+
 
 def test_extract_enable_longctx_default_off(monkeypatch):
     """Tool optional: flag absent + env unset → False, no auto-spawn."""
@@ -93,9 +108,13 @@ def test_extract_enable_longctx_default_off(monkeypatch):
 
 def test_extract_enable_longctx_flag_on(monkeypatch):
     monkeypatch.delenv("LONGCTX_ENABLE", raising=False)
-    enabled, rest = _extract_enable_longctx([
-        "--enable-longctx", "--port", "8000",
-    ])
+    enabled, rest = _extract_enable_longctx(
+        [
+            "--enable-longctx",
+            "--port",
+            "8000",
+        ]
+    )
     assert enabled is True
     assert rest == ["--port", "8000"]
 
@@ -110,9 +129,13 @@ def test_extract_enable_longctx_env(monkeypatch):
 def test_extract_enable_longctx_no_disables(monkeypatch):
     """--no-enable-longctx wins over env var (explicit user opt-out)."""
     monkeypatch.setenv("LONGCTX_ENABLE", "1")
-    enabled, rest = _extract_enable_longctx([
-        "--no-enable-longctx", "--port", "8000",
-    ])
+    enabled, rest = _extract_enable_longctx(
+        [
+            "--no-enable-longctx",
+            "--port",
+            "8000",
+        ]
+    )
     assert enabled is False
     assert rest == ["--port", "8000"]
 
@@ -120,6 +143,7 @@ def test_extract_enable_longctx_no_disables(monkeypatch):
 # ---------------------------------------------------------------------------
 # --longctx-scope flag (auto-fallback for tool-using agents)
 # ---------------------------------------------------------------------------
+
 
 def test_extract_longctx_scope_default_empty(monkeypatch):
     """No flag, no env → empty string. cli.py supplies cwd at boot when
@@ -132,20 +156,29 @@ def test_extract_longctx_scope_default_empty(monkeypatch):
 
 def test_extract_longctx_scope_space_form(monkeypatch):
     monkeypatch.delenv("LONGCTX_DEFAULT_SCOPE", raising=False)
-    scope, rest = _extract_longctx_scope([
-        "--port", "8000",
-        "--longctx-scope", "/Users/x/dev/myapp",
-        "--max-model-len", "4096",
-    ])
+    scope, rest = _extract_longctx_scope(
+        [
+            "--port",
+            "8000",
+            "--longctx-scope",
+            "/Users/x/dev/myapp",
+            "--max-model-len",
+            "4096",
+        ]
+    )
     assert scope == "/Users/x/dev/myapp"
     assert rest == ["--port", "8000", "--max-model-len", "4096"]
 
 
 def test_extract_longctx_scope_equals_form(monkeypatch):
     monkeypatch.delenv("LONGCTX_DEFAULT_SCOPE", raising=False)
-    scope, rest = _extract_longctx_scope([
-        "--longctx-scope=/abs/path", "--port", "8000",
-    ])
+    scope, rest = _extract_longctx_scope(
+        [
+            "--longctx-scope=/abs/path",
+            "--port",
+            "8000",
+        ]
+    )
     assert scope == "/abs/path"
     assert rest == ["--port", "8000"]
 
@@ -158,9 +191,12 @@ def test_extract_longctx_scope_env_fallback(monkeypatch):
 
 def test_extract_longctx_scope_flag_overrides_env(monkeypatch):
     monkeypatch.setenv("LONGCTX_DEFAULT_SCOPE", "/from/env")
-    scope, _ = _extract_longctx_scope([
-        "--longctx-scope", "/from/flag",
-    ])
+    scope, _ = _extract_longctx_scope(
+        [
+            "--longctx-scope",
+            "/from/flag",
+        ]
+    )
     assert scope == "/from/flag"
 
 
@@ -168,29 +204,39 @@ def test_extract_longctx_scope_flag_overrides_env(monkeypatch):
 # default_scope passed to /retrieve when set
 # ---------------------------------------------------------------------------
 
+
 def test_enrich_forwards_default_scope_when_set():
     """The fallback path: when default_scope is provided, every call
     forwards it so longctx-svc can fall back when no path is mentioned."""
-    body = {"messages": [
-        {"role": "user", "content": "what does the app do?"},  # no path
-    ]}
+    body = {
+        "messages": [
+            {"role": "user", "content": "what does the app do?"},  # no path
+        ]
+    }
     payload = {
-        "chunks": [{
-            "text": "function hi() {}",
-            "file_path": "/Users/x/dev/myapp/index.ts",
-            "start_line": 1, "end_line": 1, "score": 0.5,
-        }],
+        "chunks": [
+            {
+                "text": "function hi() {}",
+                "file_path": "/Users/x/dev/myapp/index.ts",
+                "start_line": 1,
+                "end_line": 1,
+                "score": 0.5,
+            }
+        ],
         "scope_path": "/Users/x/dev/myapp",
         "scope_status": "ready",
         "session_id": None,
     }
     sess = _FakeSession(_FakeAioResp(200, payload))
-    body2, hdrs = asyncio.run(_enrich_with_longctx(
-        body, endpoint="http://h:8765",
-        request_headers={},
-        aiohttp_session=sess,
-        default_scope="/Users/x/dev/myapp",
-    ))
+    body2, hdrs = asyncio.run(
+        _enrich_with_longctx(
+            body,
+            endpoint="http://h:8765",
+            request_headers={},
+            aiohttp_session=sess,
+            default_scope="/Users/x/dev/myapp",
+        )
+    )
     assert sess.captured["json"].get("default_scope") == "/Users/x/dev/myapp"
     msgs = body2["messages"]
     assert msgs[0]["role"] == "system"
@@ -200,17 +246,22 @@ def test_enrich_forwards_default_scope_when_set():
 
 def test_enrich_omits_default_scope_when_unset():
     """Default behavior: no default_scope key in the body."""
-    body = {"messages": [
-        {"role": "user", "content": "see /Users/x/auth.ts"},
-    ]}
+    body = {
+        "messages": [
+            {"role": "user", "content": "see /Users/x/auth.ts"},
+        ]
+    }
     payload = {"chunks": [], "scope_status": "no-scope", "session_id": None}
     sess = _FakeSession(_FakeAioResp(200, payload))
-    asyncio.run(_enrich_with_longctx(
-        body, endpoint="http://h:8765",
-        request_headers={},
-        aiohttp_session=sess,
-        # default_scope omitted
-    ))
+    asyncio.run(
+        _enrich_with_longctx(
+            body,
+            endpoint="http://h:8765",
+            request_headers={},
+            aiohttp_session=sess,
+            # default_scope omitted
+        )
+    )
     assert "default_scope" not in sess.captured["json"]
 
 
@@ -218,12 +269,16 @@ def test_enrich_omits_default_scope_when_unset():
 # Helpers: splice + format
 # ---------------------------------------------------------------------------
 
+
 def test_format_longctx_block_includes_path_and_lines():
-    chunks = [{
-        "text": "x = 1\n",
-        "file_path": "/p/a.py",
-        "start_line": 1, "end_line": 1,
-    }]
+    chunks = [
+        {
+            "text": "x = 1\n",
+            "file_path": "/p/a.py",
+            "start_line": 1,
+            "end_line": 1,
+        }
+    ]
     block = _format_longctx_block(chunks)
     assert "/p/a.py:1-1" in block
     assert "x = 1" in block
@@ -252,9 +307,12 @@ def test_splice_inserts_system_when_absent():
 def test_splice_handles_list_content():
     """OpenAI vision-style content arrays: stay as arrays after splice."""
     msgs = [
-        {"role": "system", "content": [
-            {"type": "text", "text": "be helpful"},
-        ]},
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "be helpful"},
+            ],
+        },
         {"role": "user", "content": "hi"},
     ]
     out = _splice_longctx_into_messages(msgs, "BLOCK")
@@ -272,9 +330,15 @@ def test_last_user_text_string_form():
 
 
 def test_last_user_text_list_form():
-    msgs = [{"role": "user", "content": [
-        {"type": "text", "text": "hello"}, {"type": "image_url"},
-    ]}]
+    msgs = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "image_url"},
+            ],
+        }
+    ]
     assert _last_user_text(msgs) == "hello"
 
 
@@ -292,24 +356,28 @@ def test_flatten_prefill_includes_role_tags():
 # _enrich_with_longctx — optional behavior
 # ---------------------------------------------------------------------------
 
+
 class _FakeAioResp:
     def __init__(self, status: int, payload: dict):
         self.status = status
         self._payload = payload
+
     async def __aenter__(self):
         return self
+
     async def __aexit__(self, *args):
         return False
+
     async def json(self):
         return self._payload
 
 
 class _FakeSession:
-    def __init__(self, resp: _FakeAioResp | None = None,
-                 raise_exc: Exception | None = None):
+    def __init__(self, resp: _FakeAioResp | None = None, raise_exc: Exception | None = None):
         self._resp = resp
         self._raise = raise_exc
         self.captured: dict = {}
+
     def post(self, url, json=None, headers=None, timeout=None):
         self.captured.update({"url": url, "json": json, "headers": headers})
         if self._raise is not None:
@@ -319,20 +387,28 @@ class _FakeSession:
 
 def test_enrich_returns_unchanged_on_empty_messages():
     body = {"messages": []}
-    body2, hdrs = asyncio.run(_enrich_with_longctx(
-        body, endpoint="http://x:1", request_headers={},
-        aiohttp_session=_FakeSession(),
-    ))
+    body2, hdrs = asyncio.run(
+        _enrich_with_longctx(
+            body,
+            endpoint="http://x:1",
+            request_headers={},
+            aiohttp_session=_FakeSession(),
+        )
+    )
     assert body2 is body
     assert hdrs == {}
 
 
 def test_enrich_returns_unchanged_when_no_user_msg():
     body = {"messages": [{"role": "system", "content": "be helpful"}]}
-    body2, hdrs = asyncio.run(_enrich_with_longctx(
-        body, endpoint="http://x:1", request_headers={},
-        aiohttp_session=_FakeSession(),
-    ))
+    body2, hdrs = asyncio.run(
+        _enrich_with_longctx(
+            body,
+            endpoint="http://x:1",
+            request_headers={},
+            aiohttp_session=_FakeSession(),
+        )
+    )
     assert body2 is body
     assert hdrs == {}
 
@@ -340,26 +416,32 @@ def test_enrich_returns_unchanged_when_no_user_msg():
 def test_enrich_splices_on_success():
     body = {
         "messages": [
-            {"role": "user", "content":
-             "explain authMiddleware in /Users/tom/p/auth.ts"},
+            {"role": "user", "content": "explain authMiddleware in /Users/tom/p/auth.ts"},
         ],
     }
     payload = {
-        "chunks": [{
-            "text": "function authMiddleware() {}",
-            "file_path": "/Users/tom/p/auth.ts",
-            "start_line": 1, "end_line": 1, "score": 0.9,
-        }],
+        "chunks": [
+            {
+                "text": "function authMiddleware() {}",
+                "file_path": "/Users/tom/p/auth.ts",
+                "start_line": 1,
+                "end_line": 1,
+                "score": 0.9,
+            }
+        ],
         "scope_path": "/Users/tom/p",
         "scope_status": "ready",
         "session_id": "sess-1",
     }
     sess = _FakeSession(_FakeAioResp(200, payload))
-    body2, hdrs = asyncio.run(_enrich_with_longctx(
-        body, endpoint="http://h:8765",
-        request_headers={"x-session-affinity": "sess-1"},
-        aiohttp_session=sess,
-    ))
+    body2, hdrs = asyncio.run(
+        _enrich_with_longctx(
+            body,
+            endpoint="http://h:8765",
+            request_headers={"x-session-affinity": "sess-1"},
+            aiohttp_session=sess,
+        )
+    )
     assert sess.captured["url"] == "http://h:8765/retrieve"
     assert sess.captured["json"]["query"].startswith("explain")
     assert sess.captured["headers"]["x-session-affinity"] == "sess-1"
@@ -375,14 +457,20 @@ def test_enrich_splices_on_success():
 
 def test_enrich_silent_on_network_failure():
     """Tool optional: if longctx-svc is down, request flows through."""
-    body = {"messages": [
-        {"role": "user", "content": "see /Users/x/foo.py please"},
-    ]}
+    body = {
+        "messages": [
+            {"role": "user", "content": "see /Users/x/foo.py please"},
+        ]
+    }
     sess = _FakeSession(raise_exc=RuntimeError("connection refused"))
-    body2, hdrs = asyncio.run(_enrich_with_longctx(
-        body, endpoint="http://h:8765", request_headers={},
-        aiohttp_session=sess,
-    ))
+    body2, hdrs = asyncio.run(
+        _enrich_with_longctx(
+            body,
+            endpoint="http://h:8765",
+            request_headers={},
+            aiohttp_session=sess,
+        )
+    )
     # Body untouched, debug header records the failure type
     assert body2["messages"] == body["messages"]
     assert hdrs.get("x-longctx-error") == "RuntimeError"
@@ -391,10 +479,14 @@ def test_enrich_silent_on_network_failure():
 def test_enrich_silent_on_non_200():
     body = {"messages": [{"role": "user", "content": "auth /Users/x/y.py"}]}
     sess = _FakeSession(_FakeAioResp(503, {}))
-    body2, hdrs = asyncio.run(_enrich_with_longctx(
-        body, endpoint="http://h:8765", request_headers={},
-        aiohttp_session=sess,
-    ))
+    body2, hdrs = asyncio.run(
+        _enrich_with_longctx(
+            body,
+            endpoint="http://h:8765",
+            request_headers={},
+            aiohttp_session=sess,
+        )
+    )
     assert body2["messages"] == body["messages"]
     assert hdrs == {"x-longctx-error": "status=503"}
 
@@ -404,14 +496,20 @@ def test_enrich_no_chunks_no_splice():
     still record the visit."""
     body = {"messages": [{"role": "user", "content": "what is 2+2?"}]}
     payload = {
-        "chunks": [], "scope_path": None,
-        "scope_status": "no-scope", "session_id": None,
+        "chunks": [],
+        "scope_path": None,
+        "scope_status": "no-scope",
+        "session_id": None,
     }
     sess = _FakeSession(_FakeAioResp(200, payload))
-    body2, hdrs = asyncio.run(_enrich_with_longctx(
-        body, endpoint="http://h:8765", request_headers={},
-        aiohttp_session=sess,
-    ))
+    body2, hdrs = asyncio.run(
+        _enrich_with_longctx(
+            body,
+            endpoint="http://h:8765",
+            request_headers={},
+            aiohttp_session=sess,
+        )
+    )
     assert body2["messages"] == body["messages"]
     assert hdrs["x-longctx-chunks-used"] == "0"
     assert hdrs["x-longctx-scope-status"] == "no-scope"
@@ -425,26 +523,45 @@ def test_enrich_no_chunks_no_splice():
 # (decode decay) are infra/docs/Metal-side and tested elsewhere or via
 # the live repro flow.
 
+
 def test_enrich_filters_chunks_below_relevance_floor():
     """Bug #6: trivial query → 8 chunks of irrelevant code spliced in,
     prompt_tokens=5423 for "say hello". Floor at 0.20 drops noise."""
-    body = {"messages": [
-        {"role": "user", "content": "say hello in one short sentence"},
-    ]}
+    body = {
+        "messages": [
+            {"role": "user", "content": "say hello in one short sentence"},
+        ]
+    }
     payload = {
         "chunks": [
-            {"text": "irrelevant", "file_path": "/p/a.py",
-             "start_line": 1, "end_line": 50, "score": 0.05},
-            {"text": "also irrelevant", "file_path": "/p/b.py",
-             "start_line": 1, "end_line": 50, "score": 0.10},
+            {
+                "text": "irrelevant",
+                "file_path": "/p/a.py",
+                "start_line": 1,
+                "end_line": 50,
+                "score": 0.05,
+            },
+            {
+                "text": "also irrelevant",
+                "file_path": "/p/b.py",
+                "start_line": 1,
+                "end_line": 50,
+                "score": 0.10,
+            },
         ],
-        "scope_path": "/p", "scope_status": "ready", "session_id": None,
+        "scope_path": "/p",
+        "scope_status": "ready",
+        "session_id": None,
     }
     sess = _FakeSession(_FakeAioResp(200, payload))
-    body2, hdrs = asyncio.run(_enrich_with_longctx(
-        body, endpoint="http://h:8765", request_headers={},
-        aiohttp_session=sess,
-    ))
+    body2, hdrs = asyncio.run(
+        _enrich_with_longctx(
+            body,
+            endpoint="http://h:8765",
+            request_headers={},
+            aiohttp_session=sess,
+        )
+    )
     # All chunks below 0.20 floor → no splice
     assert body2["messages"] == body["messages"]
     assert hdrs["x-longctx-chunks-used"] == "0"
@@ -452,23 +569,41 @@ def test_enrich_filters_chunks_below_relevance_floor():
 
 def test_enrich_keeps_chunks_at_or_above_floor():
     """Counter to the above — when the best chunk is decent, splice it."""
-    body = {"messages": [
-        {"role": "user", "content": "explain authMiddleware"},
-    ]}
+    body = {
+        "messages": [
+            {"role": "user", "content": "explain authMiddleware"},
+        ]
+    }
     payload = {
         "chunks": [
-            {"text": "function authMiddleware() {}", "file_path": "/p/a.py",
-             "start_line": 1, "end_line": 1, "score": 0.45},
-            {"text": "noise", "file_path": "/p/b.py",
-             "start_line": 1, "end_line": 1, "score": 0.05},
+            {
+                "text": "function authMiddleware() {}",
+                "file_path": "/p/a.py",
+                "start_line": 1,
+                "end_line": 1,
+                "score": 0.45,
+            },
+            {
+                "text": "noise",
+                "file_path": "/p/b.py",
+                "start_line": 1,
+                "end_line": 1,
+                "score": 0.05,
+            },
         ],
-        "scope_path": "/p", "scope_status": "ready", "session_id": None,
+        "scope_path": "/p",
+        "scope_status": "ready",
+        "session_id": None,
     }
     sess = _FakeSession(_FakeAioResp(200, payload))
-    body2, hdrs = asyncio.run(_enrich_with_longctx(
-        body, endpoint="http://h:8765", request_headers={},
-        aiohttp_session=sess,
-    ))
+    body2, hdrs = asyncio.run(
+        _enrich_with_longctx(
+            body,
+            endpoint="http://h:8765",
+            request_headers={},
+            aiohttp_session=sess,
+        )
+    )
     assert hdrs["x-longctx-chunks-used"] == "1"
     assert "authMiddleware" in body2["messages"][0]["content"]
 
@@ -479,16 +614,27 @@ def test_enrich_relevance_floor_overridable_by_env(monkeypatch):
     body = {"messages": [{"role": "user", "content": "x"}]}
     payload = {
         "chunks": [
-            {"text": "borderline", "file_path": "/p/a.py",
-             "start_line": 1, "end_line": 1, "score": 0.40},
+            {
+                "text": "borderline",
+                "file_path": "/p/a.py",
+                "start_line": 1,
+                "end_line": 1,
+                "score": 0.40,
+            },
         ],
-        "scope_path": "/p", "scope_status": "ready", "session_id": None,
+        "scope_path": "/p",
+        "scope_status": "ready",
+        "session_id": None,
     }
     sess = _FakeSession(_FakeAioResp(200, payload))
-    _, hdrs = asyncio.run(_enrich_with_longctx(
-        body, endpoint="http://h:8765", request_headers={},
-        aiohttp_session=sess,
-    ))
+    _, hdrs = asyncio.run(
+        _enrich_with_longctx(
+            body,
+            endpoint="http://h:8765",
+            request_headers={},
+            aiohttp_session=sess,
+        )
+    )
     # 0.40 < 0.50 floor → dropped
     assert hdrs["x-longctx-chunks-used"] == "0"
 
@@ -497,16 +643,17 @@ def test_enrich_relevance_floor_overridable_by_env(monkeypatch):
 # Bug #3: rewrite_request must not bump explicit small max_tokens
 # ---------------------------------------------------------------------------
 
+
 def test_rewrite_request_honors_explicit_small_max_tokens():
     """Buddy sent max_tokens=64, got completion_tokens=20480 because the
     reasoning bump fired regardless. Below 1024 = explicit user intent."""
     from vllm_swift.response_rewriter import rewrite_request
+
     body = {
         "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
         "max_tokens": 64,
     }
-    out = rewrite_request(body, arch="qwen3", reasoning_parser="qwen3",
-                          max_model_len=40960)
+    out = rewrite_request(body, arch="qwen3", reasoning_parser="qwen3", max_model_len=40960)
     assert out["max_tokens"] == 64, "explicit small max_tokens was bumped"
 
 
@@ -514,23 +661,23 @@ def test_rewrite_request_still_bumps_default_starvation_budget():
     """The bump was added for a reason — OpenCode-style 4K-8K defaults
     starve reasoning models. Make sure that case still bumps."""
     from vllm_swift.response_rewriter import rewrite_request
+
     body = {
         "messages": [{"role": "user", "content": "x"}],
-        "max_tokens": 4096,   # OpenCode default; well below floor
+        "max_tokens": 4096,  # OpenCode default; well below floor
     }
-    out = rewrite_request(body, arch="qwen3", reasoning_parser="qwen3",
-                          max_model_len=40960)
+    out = rewrite_request(body, arch="qwen3", reasoning_parser="qwen3", max_model_len=40960)
     assert out["max_tokens"] > 4096, "OpenCode-style default should bump"
 
 
 def test_rewrite_request_bypasses_when_no_reasoning_parser():
     from vllm_swift.response_rewriter import rewrite_request
+
     body = {
         "messages": [{"role": "user", "content": "x"}],
         "max_tokens": 64,
     }
-    out = rewrite_request(body, arch="qwen3", reasoning_parser="",
-                          max_model_len=40960)
+    out = rewrite_request(body, arch="qwen3", reasoning_parser="", max_model_len=40960)
     assert out["max_tokens"] == 64
 
 
@@ -538,21 +685,25 @@ def test_rewrite_request_bypasses_when_no_reasoning_parser():
 # Bug #7: normalize message.reasoning → message.reasoning_content
 # ---------------------------------------------------------------------------
 
+
 def test_rewrite_chat_completion_normalizes_reasoning_field():
     """Some vLLM versions emit `message.reasoning` instead of the
     OpenAI-standard `message.reasoning_content`. Normalize on the way
     out so OpenAI clients (Hermes, openai-python, etc.) see the
     expected field."""
     from vllm_swift.response_rewriter import rewrite_chat_completion
+
     payload = {
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": "the answer is 42",
-                "reasoning": "thought about it. then more thinking.",
-            },
-            "finish_reason": "stop",
-        }],
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "the answer is 42",
+                    "reasoning": "thought about it. then more thinking.",
+                },
+                "finish_reason": "stop",
+            }
+        ],
     }
     rewrite_chat_completion(payload)
     msg = payload["choices"][0]["message"]
@@ -565,15 +716,18 @@ def test_rewrite_chat_completion_leaves_reasoning_content_alone():
     """When upstream already produces the standard field, we don't
     duplicate-write or change anything."""
     from vllm_swift.response_rewriter import rewrite_chat_completion
+
     payload = {
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": "ok",
-                "reasoning_content": "already standard",
-            },
-            "finish_reason": "stop",
-        }],
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "ok",
+                    "reasoning_content": "already standard",
+                },
+                "finish_reason": "stop",
+            }
+        ],
     }
     rewrite_chat_completion(payload)
     msg = payload["choices"][0]["message"]
@@ -584,6 +738,7 @@ def test_rewrite_chat_completion_leaves_reasoning_content_alone():
 # Bug #2: pre-flight max_model_len > max_position_embeddings warning
 # ---------------------------------------------------------------------------
 
+
 def test_warn_when_max_model_len_exceeds_model_cap(tmp_path, capsys):
     """Buddy hit: --max-model-len 65536 against a model with
     max_position_embeddings=40960. vLLM rejects later — we should warn
@@ -591,11 +746,16 @@ def test_warn_when_max_model_len_exceeds_model_cap(tmp_path, capsys):
     import json
 
     from vllm_swift.cli import _warn_if_max_model_len_exceeds_model
+
     model_dir = tmp_path / "fake-model"
     model_dir.mkdir()
-    (model_dir / "config.json").write_text(json.dumps({
-        "max_position_embeddings": 40960,
-    }))
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "max_position_embeddings": 40960,
+            }
+        )
+    )
     _warn_if_max_model_len_exceeds_model(str(model_dir), 65536)
     err = capsys.readouterr().err
     assert "65536" in err
@@ -607,11 +767,16 @@ def test_no_warn_when_max_model_len_within_cap(tmp_path, capsys):
     import json
 
     from vllm_swift.cli import _warn_if_max_model_len_exceeds_model
+
     model_dir = tmp_path / "fake-model"
     model_dir.mkdir()
-    (model_dir / "config.json").write_text(json.dumps({
-        "max_position_embeddings": 65536,
-    }))
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "max_position_embeddings": 65536,
+            }
+        )
+    )
     _warn_if_max_model_len_exceeds_model(str(model_dir), 32768)
     assert capsys.readouterr().err == ""
 
@@ -620,5 +785,6 @@ def test_no_warn_when_config_missing(tmp_path, capsys):
     """A missing config.json (HF cache layout, etc.) shouldn't crash —
     we just skip the check silently."""
     from vllm_swift.cli import _warn_if_max_model_len_exceeds_model
+
     _warn_if_max_model_len_exceeds_model(str(tmp_path / "no-such"), 65536)
     assert capsys.readouterr().err == ""

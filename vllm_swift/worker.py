@@ -153,10 +153,14 @@ class SwiftMetalWorker:
         # this, Bridge.swift defaulted to 64 slots regardless of actual
         # concurrency, blowing GBs of unified mem on small-concurrency
         # configs and showing as a per-turn leak under Hermes load.
-        max_num_seqs = getattr(
-            getattr(self.vllm_config, "scheduler_config", None),
-            "max_num_seqs", 0,
-        ) or 0
+        max_num_seqs = (
+            getattr(
+                getattr(self.vllm_config, "scheduler_config", None),
+                "max_num_seqs",
+                0,
+            )
+            or 0
+        )
 
         self.engine = SwiftInferenceEngine(
             model_path=model_path,

@@ -74,7 +74,7 @@ def _get_lib():
         ctypes.c_char_p,
         ctypes.c_int32,
         ctypes.c_float,
-        ctypes.c_int32,    # max_num_seqs (NEW: caps BatchedKVCache slots)
+        ctypes.c_int32,  # max_num_seqs (NEW: caps BatchedKVCache slots)
     ]
     _lib.vsm_engine_destroy.restype = None
     _lib.vsm_engine_destroy.argtypes = [ctypes.c_void_p]

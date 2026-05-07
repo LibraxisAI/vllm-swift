@@ -48,7 +48,9 @@ def _engine_pid() -> int | None:
     """Find the EngineCore worker pid (the process that holds KV)."""
     try:
         out = subprocess.check_output(
-            ["pgrep", "-f", "VLLM::EngineCore"], text=True, timeout=2,
+            ["pgrep", "-f", "VLLM::EngineCore"],
+            text=True,
+            timeout=2,
         )
         for line in out.splitlines():
             line = line.strip()
@@ -69,7 +71,9 @@ def _vmmap_dirty_gb(pid: int) -> float:
     try:
         out = subprocess.check_output(
             ["vmmap", "--summary", str(pid)],
-            text=True, timeout=4, stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=4,
+            stderr=subprocess.DEVNULL,
         )
     except Exception:  # noqa: BLE001
         return 0.0
@@ -104,7 +108,9 @@ def _mem_snapshot() -> str:
     signal you actually care about."""
     try:
         out = subprocess.check_output(
-            ["ps", "-axo", "rss,command"], text=True, timeout=2,
+            ["ps", "-axo", "rss,command"],
+            text=True,
+            timeout=2,
         )
     except Exception:  # noqa: BLE001
         return ""
@@ -133,10 +139,13 @@ def _mem_snapshot() -> str:
                 break
     except Exception:  # noqa: BLE001
         pass
-    return (f"vllm={vllm_rss/1024/1024:.2f}GB "
-            f"engine_rss={engine_rss/1024/1024:.2f}GB "
-            f"engine_dirty={dirty_gb:.2f}GB "
-            f"free={free_gb:.2f}GB")
+    return (
+        f"vllm={vllm_rss / 1024 / 1024:.2f}GB "
+        f"engine_rss={engine_rss / 1024 / 1024:.2f}GB "
+        f"engine_dirty={dirty_gb:.2f}GB "
+        f"free={free_gb:.2f}GB"
+    )
+
 
 if TYPE_CHECKING:
     from aiohttp import web
@@ -589,7 +598,9 @@ def rewrite_request(
         logger.info(
             "honoring explicit small max_tokens=%d "
             "(reasoning_parser=%s; bump would have raised to floor=%d)",
-            requested, reasoning_parser, _REASONING_MAX_TOKENS_FLOOR,
+            requested,
+            reasoning_parser,
+            _REASONING_MAX_TOKENS_FLOOR,
         )
         return body
     # When max_model_len is known, the bump ceiling is constrained by
@@ -1172,8 +1183,7 @@ async def stream_rewriter(upstream_iter: AsyncIterator[bytes], arch: str) -> Asy
 # =============================================================================
 
 
-def _format_longctx_block(chunks: list[dict],
-                          max_chars: int = 16384) -> str:
+def _format_longctx_block(chunks: list[dict], max_chars: int = 16384) -> str:
     """Render chunks as fenced system block, capped at ~max_chars.
 
     Default 16384 chars ≈ 4K tokens. Without this cap, 8 chunks × 50-line
@@ -1233,7 +1243,8 @@ def _flatten_prefill(messages: list[dict]) -> str:
         content = m.get("content", "")
         if isinstance(content, list):
             content = "\n".join(
-                c.get("text", "") for c in content
+                c.get("text", "")
+                for c in content
                 if isinstance(c, dict) and c.get("type") == "text"
             )
         parts.append(f"[{m.get('role', 'user')}]\n{content}")
@@ -1241,8 +1252,12 @@ def _flatten_prefill(messages: list[dict]) -> str:
 
 
 async def _enrich_with_longctx(  # pragma: no cover
-    body: dict, *, endpoint: str, request_headers: dict[str, str],
-    aiohttp_session, default_scope: str = "",
+    body: dict,
+    *,
+    endpoint: str,
+    request_headers: dict[str, str],
+    aiohttp_session,
+    default_scope: str = "",
 ) -> tuple[dict, dict[str, str]]:
     """Optionally splice longctx chunks into the chat-completions body.
 
@@ -1278,20 +1293,22 @@ async def _enrich_with_longctx(  # pragma: no cover
         fwd_hdrs["x-session-affinity"] = sid
     try:
         import aiohttp as _aiohttp
+
         # First /retrieve call on cold longctx-svc loads the embedder
         # (and optionally a 568M reranker). Give it room.
         timeout = _aiohttp.ClientTimeout(total=120.0)
         async with aiohttp_session.post(
             f"{endpoint.rstrip('/')}/retrieve",
-            json=payload, headers=fwd_hdrs, timeout=timeout,
+            json=payload,
+            headers=fwd_hdrs,
+            timeout=timeout,
         ) as r:
             if r.status != 200:
                 logger.warning("longctx /retrieve returned %d", r.status)
                 return body, {"x-longctx-error": f"status={r.status}"}
             data = await r.json()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("longctx call failed: %s: %s",
-                       type(exc).__name__, exc)
+        logger.warning("longctx call failed: %s: %s", type(exc).__name__, exc)
         return body, {"x-longctx-error": type(exc).__name__}
     chunks_n = len(data.get("chunks") or [])
     scope = data.get("scope_path") or "<none>"
@@ -1302,13 +1319,13 @@ async def _enrich_with_longctx(  # pragma: no cover
     # working?" signal alpha testers watch for. Includes a memory
     # snapshot so we can grep growth across turns under load.
     mem = _mem_snapshot()
-    sys.stderr.write(
-        f"[longctx] {chunks_n} chunk(s) from {scope} ({status}) | {mem}\n"
-    )
+    sys.stderr.write(f"[longctx] {chunks_n} chunk(s) from {scope} ({status}) | {mem}\n")
     sys.stderr.flush()
     logger.warning(
         "longctx ok: chunks=%d scope=%s status=%s",
-        chunks_n, scope, status,
+        chunks_n,
+        scope,
+        status,
     )
     chunks = data.get("chunks") or []
     # Bug #6 from 0.5.1 alpha: a trivial query like "say hello in one
@@ -1317,18 +1334,14 @@ async def _enrich_with_longctx(  # pragma: no cover
     # carry irrelevant code into the prompt. Cosine scores from
     # MiniLM-L6-v2 + bge-rerank usually land in [0.3, 0.8] for genuinely
     # relevant matches; <0.20 is noise.
-    _RELEVANCE_FLOOR = float(
-        os.environ.get("LONGCTX_RELEVANCE_FLOOR", "0.20")
-    )
+    _RELEVANCE_FLOOR = float(os.environ.get("LONGCTX_RELEVANCE_FLOOR", "0.20"))
     if chunks:
-        relevant = [c for c in chunks
-                    if float(c.get("score", 0.0)) >= _RELEVANCE_FLOOR]
+        relevant = [c for c in chunks if float(c.get("score", 0.0)) >= _RELEVANCE_FLOOR]
         if not relevant and chunks:
             # Keep the highest-scoring chunk so we never silently
             # produce zero context for a borderline query — the user
             # can read the score in the debug header and decide.
-            relevant = [max(chunks,
-                            key=lambda c: float(c.get("score", 0.0)))]
+            relevant = [max(chunks, key=lambda c: float(c.get("score", 0.0)))]
             top = float(relevant[0].get("score", 0.0))
             if top < _RELEVANCE_FLOOR:
                 # Even the best chunk is below floor — drop everything.
@@ -1371,17 +1384,17 @@ async def _make_app(  # pragma: no cover
     # turns and shows up as a unified-memory leak under heavy Hermes
     # fan-out. Reuse a single connector instead.
     upstream_connector = aiohttp.TCPConnector(
-        limit=64,                # total open conns to upstream
+        limit=64,  # total open conns to upstream
         limit_per_host=64,
         ttl_dns_cache=300,
         force_close=False,
         enable_cleanup_closed=True,
     )
     upstream_session = aiohttp.ClientSession(
-        timeout=timeout, connector=upstream_connector,
+        timeout=timeout,
+        connector=upstream_connector,
     )
-    longctx_session = aiohttp.ClientSession(timeout=timeout) \
-        if retrieval_endpoint else None
+    longctx_session = aiohttp.ClientSession(timeout=timeout) if retrieval_endpoint else None
     longctx_debug_dump = os.environ.get("LONGCTX_DEBUG_DUMP")
 
     async def proxy(request: web.Request) -> web.StreamResponse:
@@ -1402,12 +1415,12 @@ async def _make_app(  # pragma: no cover
                     if longctx_debug_dump:
                         try:
                             from pathlib import Path as _P
+
                             d = _P(longctx_debug_dump)
                             d.mkdir(parents=True, exist_ok=True)
                             ts = f"{int(time.time() * 1000):013d}"
                             (d / f"{ts}-vllm-swift.json").write_text(
-                                json.dumps(req_payload, indent=2,
-                                           ensure_ascii=False),
+                                json.dumps(req_payload, indent=2, ensure_ascii=False),
                             )
                         except Exception:  # noqa: BLE001
                             pass
@@ -1431,96 +1444,96 @@ async def _make_app(  # pragma: no cover
             headers=headers,
             allow_redirects=False,
         ) as upstream_resp:
-                ct = upstream_resp.headers.get("content-type", "")
-                # Helper: merge longctx debug headers onto any response.
-                def _with_longctx(h: dict) -> dict:
-                    if longctx_headers:
-                        h = {**h, **longctx_headers}
-                    return h
+            ct = upstream_resp.headers.get("content-type", "")
 
-                if is_chat and "text/event-stream" in ct:
-                    response = web.StreamResponse(
-                        status=upstream_resp.status,
-                        headers=_with_longctx({
-                            "Content-Type": ct, "Cache-Control": "no-cache",
-                        }),
-                    )
-                    await response.prepare(request)
-                    # Chain: thinking-split → tool-call streaming recovery
-                    thinking_split = stream_rewriter(upstream_resp.content.iter_any(), arch)
-                    try:
-                        async for out_chunk in stream_tool_recovery(thinking_split, tool_parser):
-                            await response.write(out_chunk)
-                        await response.write_eof()
-                    except (ConnectionResetError,
-                            aiohttp.ClientConnectionResetError) as exc:
-                        # Client disconnected mid-stream (Hermes context-
-                        # overflow retry, ctrl-C, request timeout, etc.).
-                        # We MUST forcibly close the upstream connection
-                        # here — otherwise vLLM keeps generating into a
-                        # void, holding a decode slot that splits compute
-                        # with every other concurrent request and clogs
-                        # the queue with zombies. Closing the upstream
-                        # response triggers vLLM's is_disconnected() check
-                        # and cancels the in-flight generation.
-                        logger.warning(
-                            "client disconnected mid-stream — cancelling "
-                            "upstream generation: %s",
-                            type(exc).__name__,
-                        )
-                        try:
-                            upstream_resp.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-                    return response
-                if is_chat and "application/json" in ct:
-                    try:
-                        raw = await upstream_resp.read()
-                    except (ConnectionResetError,
-                            aiohttp.ClientConnectionResetError) as exc:
-                        # Client gave up before vLLM finished. Kill the
-                        # upstream gen so it doesn't pollute the queue.
-                        logger.warning(
-                            "client disconnected during non-streaming "
-                            "response — cancelling upstream: %s",
-                            type(exc).__name__,
-                        )
-                        try:
-                            upstream_resp.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        # We can't write a response (client is gone), but
-                        # aiohttp expects us to return one. An empty 499
-                        # ("Client Closed Request", nginx convention) is
-                        # the least-misleading status.
-                        return web.Response(status=499)
-                    try:
-                        payload = json.loads(raw.decode())
-                        rewrite_chat_completion(payload)
-                        new_body = json.dumps(payload).encode()
-                        return web.Response(
-                            status=upstream_resp.status,
-                            body=new_body,
-                            headers=_with_longctx({
-                                "Content-Type": "application/json"}),
-                        )
-                    except Exception as exc:
-                        logger.warning("response rewrite failed, returning raw: %s", exc)
-                        return web.Response(
-                            status=upstream_resp.status,
-                            body=raw,
-                            headers=_with_longctx(dict(upstream_resp.headers)),
-                        )
-                # Pass-through for everything else
+            # Helper: merge longctx debug headers onto any response.
+            def _with_longctx(h: dict) -> dict:
+                if longctx_headers:
+                    h = {**h, **longctx_headers}
+                return h
+
+            if is_chat and "text/event-stream" in ct:
                 response = web.StreamResponse(
                     status=upstream_resp.status,
-                    headers=_with_longctx(dict(upstream_resp.headers)),
+                    headers=_with_longctx(
+                        {
+                            "Content-Type": ct,
+                            "Cache-Control": "no-cache",
+                        }
+                    ),
                 )
                 await response.prepare(request)
-                async for ch in upstream_resp.content.iter_any():
-                    await response.write(ch)
-                await response.write_eof()
+                # Chain: thinking-split → tool-call streaming recovery
+                thinking_split = stream_rewriter(upstream_resp.content.iter_any(), arch)
+                try:
+                    async for out_chunk in stream_tool_recovery(thinking_split, tool_parser):
+                        await response.write(out_chunk)
+                    await response.write_eof()
+                except (ConnectionResetError, aiohttp.ClientConnectionResetError) as exc:
+                    # Client disconnected mid-stream (Hermes context-
+                    # overflow retry, ctrl-C, request timeout, etc.).
+                    # We MUST forcibly close the upstream connection
+                    # here — otherwise vLLM keeps generating into a
+                    # void, holding a decode slot that splits compute
+                    # with every other concurrent request and clogs
+                    # the queue with zombies. Closing the upstream
+                    # response triggers vLLM's is_disconnected() check
+                    # and cancels the in-flight generation.
+                    logger.warning(
+                        "client disconnected mid-stream — cancelling upstream generation: %s",
+                        type(exc).__name__,
+                    )
+                    try:
+                        upstream_resp.close()
+                    except Exception:  # noqa: BLE001
+                        pass
                 return response
+            if is_chat and "application/json" in ct:
+                try:
+                    raw = await upstream_resp.read()
+                except (ConnectionResetError, aiohttp.ClientConnectionResetError) as exc:
+                    # Client gave up before vLLM finished. Kill the
+                    # upstream gen so it doesn't pollute the queue.
+                    logger.warning(
+                        "client disconnected during non-streaming "
+                        "response — cancelling upstream: %s",
+                        type(exc).__name__,
+                    )
+                    try:
+                        upstream_resp.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # We can't write a response (client is gone), but
+                    # aiohttp expects us to return one. An empty 499
+                    # ("Client Closed Request", nginx convention) is
+                    # the least-misleading status.
+                    return web.Response(status=499)
+                try:
+                    payload = json.loads(raw.decode())
+                    rewrite_chat_completion(payload)
+                    new_body = json.dumps(payload).encode()
+                    return web.Response(
+                        status=upstream_resp.status,
+                        body=new_body,
+                        headers=_with_longctx({"Content-Type": "application/json"}),
+                    )
+                except Exception as exc:
+                    logger.warning("response rewrite failed, returning raw: %s", exc)
+                    return web.Response(
+                        status=upstream_resp.status,
+                        body=raw,
+                        headers=_with_longctx(dict(upstream_resp.headers)),
+                    )
+            # Pass-through for everything else
+            response = web.StreamResponse(
+                status=upstream_resp.status,
+                headers=_with_longctx(dict(upstream_resp.headers)),
+            )
+            await response.prepare(request)
+            async for ch in upstream_resp.content.iter_any():
+                await response.write(ch)
+            await response.write_eof()
+            return response
 
     app = web.Application(client_max_size=50 * 1024 * 1024)
     app.router.add_route("*", "/{tail:.*}", proxy)
@@ -1556,8 +1569,14 @@ def run(  # pragma: no cover
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = loop.run_until_complete(
-        _make_app(upstream_url, arch, reasoning_parser, tool_parser,
-                  max_model_len, retrieval_endpoint,
-                  longctx_default_scope)
+        _make_app(
+            upstream_url,
+            arch,
+            reasoning_parser,
+            tool_parser,
+            max_model_len,
+            retrieval_endpoint,
+            longctx_default_scope,
+        )
     )
     web.run_app(app, host="127.0.0.1", port=user_port, print=lambda *_: None, loop=loop)
