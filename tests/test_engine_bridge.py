@@ -36,21 +36,38 @@ class TestGetLib:
 
     def test_loads_real_dylib_if_exists(self):
         import os
+        from pathlib import Path
 
         import vllm_swift.engine_bridge as eb
 
+        # Find the dylib relative to THIS test file's repo root, not via
+        # `~/dev/vllm-swift` which only resolves on the developer machine.
+        # CI's checkout is at /Users/runner/work/vllm-swift/vllm-swift, and
+        # the package-bundled wheel install lives under
+        # site-packages/vllm_swift/_lib/. Search both layouts.
+        repo_root = Path(__file__).resolve().parents[1]
         candidates = [
-            os.path.expanduser(
-                "~/dev/vllm-swift/swift/.build/arm64-apple-macosx/release/libVLLMBridge.dylib"
-            ),
-            os.path.expanduser(
-                "~/dev/vllm-swift/swift/.build/arm64-apple-macosx/debug/libVLLMBridge.dylib"
-            ),
-            os.path.expanduser("~/dev/vllm-swift/swift/libvllm_swift.dylib"),
+            repo_root
+            / "swift"
+            / ".build"
+            / "arm64-apple-macosx"
+            / "release"
+            / "libVLLMBridge.dylib",
+            repo_root
+            / "swift"
+            / ".build"
+            / "arm64-apple-macosx"
+            / "debug"
+            / "libVLLMBridge.dylib",
+            repo_root / "vllm_swift" / "_lib" / "libVLLMBridge.dylib",
+            repo_root / "swift" / "libvllm_swift.dylib",
         ]
-        dylib = next((p for p in candidates if os.path.exists(p)), None)
+        dylib = next((str(p) for p in candidates if p.exists()), None)
         if dylib is None:
-            pytest.skip("dylib not built")
+            pytest.skip(
+                "dylib not built — searched:\n  "
+                + "\n  ".join(str(p) for p in candidates)
+            )
         old_lib = eb._lib
         old_path = eb._LIB_PATH
         eb._lib = None
