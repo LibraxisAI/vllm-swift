@@ -116,6 +116,27 @@ final class InferenceEngine {
 nonisolated(unsafe) private var engines: [UnsafeMutableRawPointer: InferenceEngine] = [:]
 private let engineQueue = DispatchQueue(label: "vsm.engine.queue")
 
+/// Resolve the `kv_scheme` string carried in `GenerateParameters` into the
+/// `(turboKeyBits, turboValueBits)` tuple that `BatchedKVCache.init` /
+/// `model.newBatchedHybridCache` accept. Returns `(nil, nil)` when no turbo
+/// scheme is set or the scheme is `"none"` — preserving the legacy raw-fp16
+/// batched cache path. Mirrors `parseTurboScheme` in mlx-swift-lm but lives
+/// here because it's the bridge-side decision of which cache flavor to build.
+private func batchedTurboBits(
+    from params: GenerateParameters
+) -> (Int?, Int?) {
+    guard let scheme = params.kvScheme,
+          scheme.hasPrefix("turbo")
+    else { return (nil, nil) }
+    let parsed = parseTurboScheme(scheme)
+    // Symmetric form ("turbo4") returns keyBits == nil → fall back to the
+    // top-level bits value for both K and V. parseTurboScheme uses
+    // `params.kvBits` semantics indirectly via the top-level bits field.
+    let kb = parsed.keyBits ?? parsed.bits
+    let vb = parsed.valueBits ?? parsed.bits
+    return (kb, vb)
+}
+
 // MARK: - C API implementations
 
 @_cdecl("vsm_engine_create")
@@ -1410,6 +1431,12 @@ private func prefillBatchedUniformQwen3(
     let maxBatch = max(B, engine.maxConcurrentRequests)
     var bCaches = [BatchedKVCache]()
     bCaches.reserveCapacity(numLayers)
+    // TODO(v0.5.4): the Qwen3 dense prefill→batched transition still copies
+    // raw fp16 K/V into the BatchedKVCache slot below — kv_scheme is dropped
+    // for dense Qwen3 models on this path. The hybrid path (Qwen3.5/3.6 +
+    // Qwen3Next via newBatchedHybridCache) does honor kv_scheme as of v0.5.3.
+    // Wiring turbo here means bulk-encoding the prefilled K/V (one fusedEncode
+    // dispatch over [B*H*cacheLen, headDim]) into a turbo BatchedKVCache.
     // Use a wrapped caches array we can nil out per-layer — drops the
     // [B, kvHeads, cacheLen, headDim] KVCacheSimple as soon as its layer
     // is copied into the BatchedKVCache slot. Without this, both caches
@@ -1509,8 +1536,16 @@ private func prefillBatchedUniformHybrid(
     // Build a fresh BatchedHybridCache sized to the scheduler's
     // max_num_seqs (was hardcoded 64 — over-alloc on small concurrency).
     let maxBatch = max(B, engine.maxConcurrentRequests)
+    // Honor `--additional-config kv_scheme=turbo*` on the batched-decode
+    // path. Pre v0.5.3 this flag was silently dropped here — newBatched-
+    // HybridCache only knew how to construct raw-fp16 BatchedKVCache, so
+    // the kvScheme set in GenerateParameters never reached the attention
+    // layers' batched cache. Buddy's v0.5.1 alpha report (Qwen3.6 +
+    // turbo4v2 → ".2.2.2.2..." drift) was a symptom of that silent bypass.
+    let (turboKB, turboVB) = batchedTurboBits(from: engine.generateParams)
     let hCaches = model.newBatchedHybridCache(
-        maxBatch: maxBatch, parameters: engine.generateParams)
+        maxBatch: maxBatch, parameters: engine.generateParams,
+        turboKeyBits: turboKB, turboValueBits: turboVB)
 
     guard numLayers == hCaches.layers.count else {
         print("[vsm] prefill_batched_uniform hybrid: layer count mismatch — req=\(numLayers) hybrid=\(hCaches.layers.count)")
@@ -1670,8 +1705,12 @@ private func initBatchedHybrid(
     // over-allocating slots no one will use (drove the GB/turn unified-mem
     // leak when running with max_num_seqs=1).
     let maxBatch = max(B, engine.maxConcurrentRequests)
+    // Mirror the prefill_batched_uniform path: thread kvScheme into the
+    // batched-hybrid cache factory so turbo* schemes actually take effect.
+    let (turboKB, turboVB) = batchedTurboBits(from: engine.generateParams)
     let hCaches = model.newBatchedHybridCache(
-        maxBatch: maxBatch, parameters: engine.generateParams)
+        maxBatch: maxBatch, parameters: engine.generateParams,
+        turboKeyBits: turboKB, turboValueBits: turboVB)
 
     // Sanity: layer count must match the per-request cache layer count.
     guard let firstSession = engine.sessions[rids[0]] else { return Int32(0) }

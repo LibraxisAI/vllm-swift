@@ -1,5 +1,72 @@
 # Release History
 
+## v0.5.3 — May 7, 2026
+
+**Fix: turbo KV schemes no longer silently bypassed on the batched-decode
+path.** Field reports of "Hello." → ".2.2.2.2..." drift on Qwen3.5/3.6
+hybrid models with `--additional-config '{"kv_scheme":"turbo4v2"}'`
+turned out to be a deeper structural bug than v0.5.2's max_tokens-bump
+sweep covered. Tracking it down:
+
+- `BatchedKVCache` (in mlx-swift-lm), the cache class used by Qwen3
+  dense + Qwen3.5 / Qwen3.6 / Qwen3Next hybrid models on the batched-
+  decode path, only knew how to store raw fp16/bf16 K/V. Whatever
+  `kv_scheme` the user set on `--additional-config` was parsed into
+  `GenerateParameters.kvScheme` and then dropped on the floor when the
+  bridge built the BatchedHybridCache. Decode ran on raw fp16 KV no
+  matter what scheme flag was set.
+- This meant alpha-tester benches that compared "raw vs turbo4v2" on
+  hybrid models were comparing raw vs raw. Buddy's drift wasn't a
+  turbo-codec quality issue — it was the raw-KV path interacting badly
+  with v0.5.1's max_tokens-bump on a tiny "Hello" prompt that got
+  pushed to 16K-20K tokens before hitting an EOS.
+
+**Fix shipped in mlx-swift-lm `vllm-swift-stable` (commit
+`d53bfe1`):** `BatchedKVCache` gains an internal `.raw` / `.turbo`
+storage variant. Turbo path allocates packed-byte K/V + per-token L2
+norms, encodes new tokens via the existing batch-parallel `fusedEncode`
+kernel (flatten `[B, kvH, D]` → `[B*kvH, D]`, encode, reshape), and
+runs decode-time attention via a new `attention(queries:scale:mask:)`
+method that mirrors `TurboQuantKVCache.compressedAttention`'s
+dequant-first SDPA (pre-rotate Q with codec's rotation matrix folded
+with attention scale, bulk-dequant K/V via `bulkDequantRotated` into
+rotated codec space, run MLXFast SDPA in rotated space — score-
+preserved under orthogonal rotation `(RQ)·(RK)ᵀ = QKᵀ` — apply inverse
+rotation to output).
+
+Bridge.swift threads `engine.generateParams.kvScheme` through
+`Qwen35TextModel.newBatchedHybridCache(maxBatch:parameters:turboKeyBits:
+turboValueBits:)` and the equivalent Qwen3Next factory. The Qwen3
+*dense* prefill→batched K/V copy path still drops `kvScheme` (TODO
+v0.5.4 — needs a bulk-encode pass over the prefilled fp16 K/V into the
+turbo cache); for hybrid models the fix is complete.
+
+3 model-side callers (Qwen3 / Qwen3.5 / Qwen3Next `fullyBatchedForward`)
+migrated to call `cache.attention(...)` instead of inline-slicing
+`cache.keys`/`cache.values` + `MLXFast.scaledDotProductAttention`. The
+default raw-mode `attention()` impl is bit-identical to the inline
+pattern — pure refactor first, additive turbo storage second. **20/20
+existing batched-hybrid + Qwen35 lockstep + fullyBatchedDecode slot-
+equivalence tests stay green.**
+
+7 new regression tests (`Tests/MLXLMTests/BatchedTurboKVCacheTests.
+swift`) lock down: raw vs turbo flag reporting, raw-key mode (V-only
+compression with `keyBits == 0`), update slot routing for B=1 and
+B=4, and dequant-first attention shape + non-NaN output through the
+real Metal kernel chain.
+
+Live repro vs buddy's exact failing config (Qwen3.5-35B-A3B-4bit +
+turbo4v2 + max-num-seqs=1 + "Say hello in one short sentence."):
+clean output, `Hello!`, `finish_reason=stop`, no drift, no `.2.2.2.2`
+runaway. **The fix works.**
+
+If you were running with `--additional-config '{"kv_scheme":
+"turbo4v2"}'` before v0.5.3, your tok/s and memory-footprint numbers
+on the batched-decode path were raw-fp16 numbers wearing a turbo
+label. v0.5.3 onward, the flag actually compresses.
+
+`pip install vllm-swift==0.5.3` and rebuilt bottle ship the fix.
+
 ## v0.5.2 — May 7, 2026
 
 **Patch: alpha-tester regression sweep.** Field reports from the v0.5.1 alpha
