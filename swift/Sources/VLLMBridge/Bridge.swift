@@ -479,12 +479,42 @@ public func vsm_engine_decode_all(
         }
         guard !rids.isEmpty else { return Int32(0) }
 
+        // v0.5.4 fix: gate the Qwen3 batched/semi-batched decode paths off
+        // when kv_scheme=turbo* is set on a dense (Qwen3) serve flow.
+        //
+        // v0.5.3 wired kv_scheme into the *batched-prefill* paths
+        // (prefill_batched_uniform / hybrid init_batched), but the dense
+        // Qwen3 serve path is prefill_req → init_batched → decode_all, and
+        // both stages drop the scheme:
+        //   - init_batched fails its `as? KVCacheSimple` cast (per-request
+        //     caches are RotatingKVCache when kvScheme is set), returns 0
+        //     silently → batchedCaches stays nil.
+        //   - The Qwen3 semi-batched fallback below calls
+        //     Qwen3Attention.batchedForward, whose per-request RoPE+update
+        //     loop corrupts on rotating-window K/V dequant semantics. Output
+        //     degenerates to "<think>1\n1\n1...".
+        //
+        // Until both paths are turbo-aware, force turbo-on-dense-Qwen3
+        // through the sequential-stepAsync TokenIterator fallback at the
+        // bottom of this function. That's the well-tested turbo decode path
+        // every standalone mlx-swift-lm consumer uses. Slower than batched
+        // SDPA across requests, but correct.
+        //
+        // Use kvScheme directly (not a `cache.first is TurboQuantKVCache`
+        // type-cast): the per-request cache is actually RotatingKVCache —
+        // mlx-swift-lm converts it to TurboQuantKVCache lazily inside
+        // step() via maybeQuantizeKVCache, so an early type-cast misses
+        // turbo'd sessions. kvScheme on generateParams is the durable signal.
+        let hasTurboCache: Bool =
+            engine.generateParams.kvScheme?.hasPrefix("turbo") ?? false
+
         // Cast ordering: Qwen3 fast path FIRST so the verified hot path
         // stays bit-identical (no extra protocol cast in the inner loop).
         // Qwen3Model and BatchedHybridLLM are disjoint conformances —
         // ordering is correctness-neutral, only perf-motivated.
         // Fully batched path for Qwen3 with BatchedKVCache
-        if let qwenModel = engine.model as? Qwen3Model,
+        if !hasTurboCache,
+           let qwenModel = engine.model as? Qwen3Model,
            let bCaches = engine.batchedCaches,
            !engine.batchSlots.isEmpty
         {
@@ -609,8 +639,11 @@ public func vsm_engine_decode_all(
             return count
         }
 
-        // Semi-batched path for Qwen3 with per-request caches
-        if let qwenModel = engine.model as? Qwen3Model {
+        // Semi-batched path for Qwen3 with per-request caches.
+        // Skipped when any per-request cache is TurboQuantKVCache — see the
+        // top-of-function `hasTurboCache` comment. Falls through to the
+        // sequential-stepAsync fallback which IS validated for turbo.
+        if !hasTurboCache, let qwenModel = engine.model as? Qwen3Model {
             var tokens: [Int] = []
             var allCaches: [[KVCache]] = []
             var activeRids: [String] = []
