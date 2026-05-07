@@ -39,17 +39,22 @@ jobs:
           ruff check vllm_swift/ tests/
           ruff format --check vllm_swift/ tests/
 
-      - name: Run tests
-        # cov-fail-under=78 — the GitHub macos-15 runner's Swift
-        # toolchain (Swift 6.x with strict-concurrency) refuses to build
-        # the upstream MLXVLM/MediaProcessing.swift CIContext as
-        # non-Sendable, so we can't realistically build the Swift bridge
-        # in CI without patching upstream. Without the bundled dylib,
-        # engine_bridge.py drops to 68% coverage (46 lines of ctypes
-        # dispatch behind a "dylib exists" guard). 78% is the gate we
-        # can hit reliably without a CI Swift build; locally where the
-        # dylib lives next to the wheel we hit 81%. Track raising this
-        # back to 80% once mlx-swift-lm upstream Sendable annotations
-        # land or we add a CI Swift build.
+      - name: Build Swift bridge (debug — needed for engine_bridge dylib-load coverage)
+        # Without a real dylib next to vllm_swift._lib, engine_bridge.py
+        # short-circuits 46 lines of ctypes dispatch. Pass
+        # -strict-concurrency=minimal so the CI Swift toolchain (6.x,
+        # stricter than local macOS 26 Swift) doesn't fail on upstream
+        # MLXVLM/MediaProcessing.swift's CIContext non-Sendable warnings —
+        # those are correctness lints in dependencies, not vllm-swift bugs,
+        # and downgrading them only for our build keeps coverage honest.
         run: |
-          python -m pytest tests/ --cov=vllm_swift --cov-fail-under=78 -v
+          cd swift && swift build -Xswiftc -strict-concurrency=minimal
+          DYLIB=$(find .build -name "libVLLMBridge.dylib" -print -quit)
+          mkdir -p ../vllm_swift/_lib
+          cp "$DYLIB" ../vllm_swift/_lib/libVLLMBridge.dylib
+          METALLIB=$(find .build -name "mlx.metallib" -print -quit 2>/dev/null || true)
+          if [ -n "$METALLIB" ]; then cp "$METALLIB" ../vllm_swift/_lib/mlx.metallib; fi
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ --cov=vllm_swift --cov-fail-under=80 -v
