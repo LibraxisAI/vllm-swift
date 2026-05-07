@@ -14,18 +14,12 @@ class VllmSwift < Formula
   version "0.5.3"
   license "Apache-2.0"
 
-  # bottle do
-  #   root_url "https://github.com/TheTom/homebrew-tap/releases/download/bottles"
-  #   sha256 cellar: :any, arm64_tahoe:   "<rebuild-pending-v0.5.3>"
-  #   sha256 cellar: :any, arm64_sequoia: "<rebuild-pending-v0.5.3>"
-  #   sha256 cellar: :any, arm64_sonoma:  "<rebuild-pending-v0.5.3>"
-  # end
-  # NOTE: bottle SHAs cleared for v0.5.3 — rebuild + upload after the
-  # tag lands so brew installs pick up the batched-turbo-kv fix
-  # (`--additional-config kv_scheme=turbo*` actually compresses on the
-  # batched-decode path now). Until the bottle is uploaded, formula
-  # falls back to from-source (HOMEBREW_NO_SANDBOX=1 brew install
-  # vllm-swift).
+  bottle do
+    root_url "https://github.com/TheTom/homebrew-tap/releases/download/bottles"
+    sha256 cellar: :any, arm64_tahoe:   "3bd1c1ff7a32cb827bd01e56ef786ec4fe8c3fa38961bc8a94cf8a17e09ac3ef"
+    sha256 cellar: :any, arm64_sequoia: "3bd1c1ff7a32cb827bd01e56ef786ec4fe8c3fa38961bc8a94cf8a17e09ac3ef"
+    sha256 cellar: :any, arm64_sonoma:  "3bd1c1ff7a32cb827bd01e56ef786ec4fe8c3fa38961bc8a94cf8a17e09ac3ef"
+  end
 
   depends_on xcode: ["15.0", :build]
   depends_on "python@3.12"
