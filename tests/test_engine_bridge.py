@@ -35,7 +35,6 @@ class TestGetLib:
             eb._lib = old_lib
 
     def test_loads_real_dylib_if_exists(self):
-        import os
         from pathlib import Path
 
         import vllm_swift.engine_bridge as eb
@@ -65,8 +64,7 @@ class TestGetLib:
         dylib = next((str(p) for p in candidates if p.exists()), None)
         if dylib is None:
             pytest.skip(
-                "dylib not built — searched:\n  "
-                + "\n  ".join(str(p) for p in candidates)
+                "dylib not built — searched:\n  " + "\n  ".join(str(p) for p in candidates)
             )
         old_lib = eb._lib
         old_path = eb._LIB_PATH
