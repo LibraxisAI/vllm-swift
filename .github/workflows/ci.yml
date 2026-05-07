@@ -39,6 +39,21 @@ jobs:
           ruff check vllm_swift/ tests/
           ruff format --check vllm_swift/ tests/
 
+      - name: Build Swift bridge (debug — needed for engine_bridge dylib-load coverage)
+        # Without a real dylib next to vllm_swift._lib, engine_bridge.py
+        # short-circuits on the "dylib doesn't exist" path and 46 lines of
+        # ctypes-call coverage drop out — pulled total coverage below the
+        # 80% gate. Debug build is fine; we don't need release perf for unit
+        # tests, only the dylib's existence + symbol layout.
+        run: |
+          cd swift && swift build
+          DYLIB=$(find .build -name "libVLLMBridge.dylib" -print -quit)
+          mkdir -p ../vllm_swift/_lib
+          cp "$DYLIB" ../vllm_swift/_lib/libVLLMBridge.dylib
+          # Metallib is built next to the dylib by SPM; copy if present.
+          METALLIB=$(find .build -name "mlx.metallib" -print -quit 2>/dev/null || true)
+          if [ -n "$METALLIB" ]; then cp "$METALLIB" ../vllm_swift/_lib/mlx.metallib; fi
+
       - name: Run tests
         run: |
           python -m pytest tests/ --cov=vllm_swift --cov-fail-under=80 -v
