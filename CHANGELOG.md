@@ -1,5 +1,64 @@
 # Release History
 
+## v0.6.0
+
+**TriAttention V3 + longctx ChatSession integration; Gemma 4 MTP drafter.**
+
+This release rebases the bundled `mlx-swift-lm` to v3.33.0-alpha, which
+brings in the V3+longctx rescue path (validated end-to-end via 256K
+NIAH on Apple Silicon) and the first Swift-native port of Google's
+Gemma 4 Multi-Token Prediction drafter for speculative decoding.
+
+### What's new
+
+- **V3 + longctx via ChatSession.** The Tier-3 auto-rehydrate hook
+  (commit `fe1a3b0` in mlx-swift-lm) fires before each turn's prefill
+  using the user's question text as the retrieval query, prepending
+  recovered chunks as a system message. Empirical receipts on
+  Qwen3.5-2B-4bit (M5 Max) at the full 32K → 256K ramp:
+  V3+longctx ✓HIT every rung; V3-only ✗miss every rung; baseline
+  turbo8v4 ✓HIT every rung. V3 alone is unsafe for retrieval
+  workloads — we now document this explicitly in the README and in
+  `mlx-swift-lm`'s "TriAttention V3 + longctx" section.
+
+- **Gemma 4 MTP drafter (Swift port).** New `Gemma4Assistant` model
+  + `MTPSpec` iterator + factory wiring. 41.7 tok/s on Gemma 4 31B
+  4-bit at k=2 with the drafter quantized to 4-bit at load time
+  (1.50× speedup over no-drafter baseline; tied with community
+  Python `mlx-vlm` on absolute throughput). Block-size sweet spot
+  matches Google's analysis (block_size 3 = numDraftTokens 2).
+  Drafter quant noise alignment with target raises acceptance rate
+  from 124% to 132%.
+
+- **Defaults stay safe.** TriAttention V3 is OFF by default. Enable
+  via `VLLM_TRIATT_ENABLED=1` AND `LONGCTX_ENDPOINT=http://...`
+  together. MTP drafter is opt-in via the harness in the bundled
+  benchmark.
+
+### Bumped
+
+- `mlx-swift-lm` (vllm-swift-stable branch) → tip equivalent to
+  v3.33.0-alpha
+- `pyproject.toml` 0.5.4 → 0.6.0
+- `homebrew/vllm-swift.rb` 0.5.4 → 0.6.0 (bottle SHA needs rebuild)
+
+### Reproduction
+
+```bash
+# longctx-svc on the same host
+longctx-svc serve --host 127.0.0.1 --port 5054
+
+# vllm-swift with V3 + longctx
+vllm-swift serve <model> --enable-longctx
+```
+
+See `mlx-swift-lm/README.md` "TriAttention V3 + longctx (long-context
+rescue)" for full env-var reference and the recommended-defaults
+block. Cross-references:
+
+- `turboquant_plus/docs/papers/longctx-1m-and-triattention.md`
+- `turboquant_plus/docs/papers/triattention-v3.md` (§10 addendum)
+
 ## v0.5.4 — May 7, 2026
 
 **Fix: turbo KV schemes on dense Qwen3 no longer emit degenerate output.**

@@ -11,7 +11,7 @@ class VllmSwift < Formula
   desc "Native Swift/Metal backend for vLLM on Apple Silicon"
   homepage "https://github.com/TheTom/vllm-swift"
   url "https://github.com/TheTom/vllm-swift.git", branch: "main"
-  version "0.5.4"
+  version "0.6.0"
   license "Apache-2.0"
 
   bottle do
