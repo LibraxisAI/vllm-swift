@@ -185,49 +185,61 @@ vllm-swift serve ~/models/Qwen3-4B-4bit \
 | `turbo4v2` | ~3× | Recommended — best quality/compression balance |
 | `turbo3` | ~4.6× | Maximum compression, higher PPL trade-off |
 
-### Effectively-unbounded context — TriAttention V3 + longctx (experimental)
+### Long context with rescue — TriAttention V3 + longctx (experimental)
 
-> **Status: experimental.** Both pieces are off by default. Wiring is validated end-to-end on Qwen3.5-2B-4bit (M5 Max + M2 Mac mini) at 32K → 256K planted-fact NIAH. Other model families work but are less exhaustively tested. APIs and defaults may change.
+Both pieces are off by default. Wiring works on Qwen3.5-2B-4bit (M5 Max + M2 Mac mini) up to 256K. Other model families load fine but are less tested. APIs and defaults may change.
 
-Two independent features that compose into one:
+Two independent features that compose:
 
-- **longctx** — code-aware retrieval companion that wraps any chat completion with a `## Retrieved code context` block of the most relevant chunks from the user's repo. RAG, but transparent to the model. [See longctx](https://github.com/TheTom/longctx).
-- **TriAttention V3** — query-aware KV-cache eviction policy. Independent Swift port + hybrid extension of Mao et al., *"TriAttention: Efficient Long Reasoning with Trigonometric KV Compression"* ([arXiv:2604.04921](https://arxiv.org/abs/2604.04921)). Throws away the lowest-salience cells once the cache passes a budget. [Design doc](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/triattention-v3.md).
+- **longctx** — retrieval companion that adds a `## Retrieved code context` block to chat completions, sourced from the user's repo. [See longctx](https://github.com/TheTom/longctx).
+- **TriAttention V3** — query-aware KV-cache eviction policy. Independent Swift port and hybrid extension of Mao et al., *"TriAttention: Efficient Long Reasoning with Trigonometric KV Compression"* ([arXiv:2604.04921](https://arxiv.org/abs/2604.04921)). Drops low-salience cells once the cache passes a budget. [Design doc](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/triattention-v3.md).
 
 #### When to enable what
 
-| Workload | Use this | Don't use |
-|---|---|---|
-| Coding assistant on a local repo (file-path-aware queries) | **longctx alone** | V3 alone |
-| Long single-shot prompt that already fits in the model's context | **TurboQuant+ KV codec** (`turbo4v2`) | V3 |
-| Long multi-turn chat that grows past GPU memory | **V3 + longctx together** | V3 alone |
-| Strict NIAH / retrieval workloads at 32K+ | **V3 + longctx together** | V3 alone (recall fails) |
+| Workload | Use this |
+|---|---|
+| Coding assistant on a local repo | longctx alone |
+| Long single-shot prompt that fits the model's context window | TurboQuant+ KV codec (`turbo4v2`) |
+| Long multi-turn chat that would otherwise outgrow GPU memory | V3 + longctx |
+| Retrieval-heavy workloads (NIAH-style) at 32K+ | V3 + longctx |
 
-> **Critical:** Don't enable V3 without longctx. V3 evicts cells from the KV cache to stay under budget; without a recovery layer, evicted facts are gone. On Qwen3.5-2B-4bit at 32K → 256K, V3-only ✗misses recall at every rung; V3+longctx ✓HITs every rung.
+V3 alone is not recommended. Eviction is one-way; without a recovery layer, evicted facts are gone. On Qwen3.5-2B-4bit at 32K → 256K, V3-only misses recall at every rung; V3+longctx passes at every rung (table at the bottom of this section).
 
-#### longctx alone (code-aware RAG)
+#### Installing longctx-svc
+
+`--enable-longctx` and the V3 rescue path both need the `longctx-svc` Python service. Install once into the bundled vllm-swift venv:
 
 ```bash
-# One-time setup of the Python sidecar
-vllm-swift longctx-install
+~/.vllm-swift/venv/bin/pip install longctx-svc
+```
 
-# Serve with longctx — sidecar boots automatically
+Or install globally if you'd rather:
+
+```bash
+pip install longctx-svc
+```
+
+#### longctx alone (code-aware retrieval)
+
+```bash
 vllm-swift serve ~/models/Qwen3-4B-4bit \
   --served-model-name qwen3-4b \
   --enable-longctx
 ```
 
-Every chat completion's prompt is parsed for absolute file paths. The first path's project root is detected (`.git`, `package.json`, etc.), the repo is indexed, and top-K relevant chunks are spliced in as a system message. Tool-call-aware — works alongside `--enable-auto-tool-choice`. See [longctx](https://github.com/TheTom/longctx) for scope-tuning, watch-mode, and tester recommendations.
+The sidecar boots automatically when `--enable-longctx` is set. Each chat completion's prompt is scanned for absolute file paths; the first path's project root is detected (`.git`, `package.json`, etc.), the repo is indexed, and top-K relevant chunks are spliced in as a system message. Works alongside `--enable-auto-tool-choice`. See [longctx](https://github.com/TheTom/longctx) for scope tuning, watch-mode, and tester notes.
 
-#### V3 + longctx (long multi-turn / unbounded context)
+#### V3 + longctx (long multi-turn chat)
 
 ```bash
-# 1. Install + start longctx-svc (one time, picks port 5054 by default)
-vllm-swift longctx-install
+# Start longctx-svc separately (the auto-spawn from --enable-longctx
+# is enough for the code-aware path; the V3 rescue path benefits
+# from a long-running shared instance)
+~/.vllm-swift/venv/bin/longctx-svc serve --host 127.0.0.1 --port 5054 &
 
-# 2. Serve with V3 + longctx wired together
+# Serve with V3 + longctx wired together
 VLLM_TRIATT_ENABLED=1 \
-VLLM_TRIATT_BUDGET=$((CTX_TARGET * 9 / 10)) \
+VLLM_TRIATT_BUDGET=230400 \
 VLLM_TRIATT_WINDOW=128 \
 VLLM_TRIATT_PREFIX=32 \
 VLLM_TRIATT_WARMUP=256 \
@@ -239,7 +251,7 @@ vllm-swift serve ~/models/Qwen3.5-2B-4bit \
   --max-model-len 262144
 ```
 
-The auto Tier-3 rehydrate hook fires before each turn's prefill, queries longctx with the user's question, and prepends recovered chunks as a system message. End-to-end the model sees a normal multi-turn chat with bonus retrieved-context.
+Set `VLLM_TRIATT_BUDGET` to ~90% of `--max-model-len` for a 10% eviction headroom. The auto Tier-3 rehydrate hook fires before each turn's prefill, queries longctx with the user's question, and prepends recovered chunks as a system message. The model sees a normal multi-turn chat with the recovered context up top.
 
 #### V3 environment variables
 
