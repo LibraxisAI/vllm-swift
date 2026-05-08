@@ -106,6 +106,8 @@ Metal GPU
 - Per-request temperature sampling in batched path
 - Auto model download from HuggingFace Hub
 - [TurboQuant+](https://github.com/TheTom/turboquant_plus) KV cache compression (`turbo3`, `turbo4v2`) via mlx-swift-lm
+- [longctx](https://github.com/TheTom/longctx) code-aware retrieval companion (`--enable-longctx`, experimental)
+- TriAttention V3 query-aware KV-cache eviction (env-gated, experimental — pair with longctx, see [Effectively-unbounded context](#effectively-unbounded-context--triattention-v3--longctx-experimental))
 - Decode and prompt logprobs
 - Greedy and temperature sampling
 - EOS / stop token detection (vLLM scheduler)
@@ -182,6 +184,94 @@ vllm-swift serve ~/models/Qwen3-4B-4bit \
 |--------|:-----------:|----------|
 | `turbo4v2` | ~3× | Recommended — best quality/compression balance |
 | `turbo3` | ~4.6× | Maximum compression, higher PPL trade-off |
+
+### Effectively-unbounded context — TriAttention V3 + longctx (experimental)
+
+> **Status: experimental.** Both pieces are off by default. Wiring is validated end-to-end on Qwen3.5-2B-4bit (M5 Max + M2 Mac mini) at 32K → 256K planted-fact NIAH. Other model families work but are less exhaustively tested. APIs and defaults may change.
+
+Two independent features that compose into one:
+
+- **longctx** — code-aware retrieval companion that wraps any chat completion with a `## Retrieved code context` block of the most relevant chunks from the user's repo. RAG, but transparent to the model. [See longctx](https://github.com/TheTom/longctx).
+- **TriAttention V3** — query-aware KV-cache eviction policy. Independent Swift port + hybrid extension of Mao et al., *"TriAttention: Efficient Long Reasoning with Trigonometric KV Compression"* ([arXiv:2604.04921](https://arxiv.org/abs/2604.04921)). Throws away the lowest-salience cells once the cache passes a budget. [Design doc](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/triattention-v3.md).
+
+#### When to enable what
+
+| Workload | Use this | Don't use |
+|---|---|---|
+| Coding assistant on a local repo (file-path-aware queries) | **longctx alone** | V3 alone |
+| Long single-shot prompt that already fits in the model's context | **TurboQuant+ KV codec** (`turbo4v2`) | V3 |
+| Long multi-turn chat that grows past GPU memory | **V3 + longctx together** | V3 alone |
+| Strict NIAH / retrieval workloads at 32K+ | **V3 + longctx together** | V3 alone (recall fails) |
+
+> **Critical:** Don't enable V3 without longctx. V3 evicts cells from the KV cache to stay under budget; without a recovery layer, evicted facts are gone. On Qwen3.5-2B-4bit at 32K → 256K, V3-only ✗misses recall at every rung; V3+longctx ✓HITs every rung.
+
+#### longctx alone (code-aware RAG)
+
+```bash
+# One-time setup of the Python sidecar
+vllm-swift longctx-install
+
+# Serve with longctx — sidecar boots automatically
+vllm-swift serve ~/models/Qwen3-4B-4bit \
+  --served-model-name qwen3-4b \
+  --enable-longctx
+```
+
+Every chat completion's prompt is parsed for absolute file paths. The first path's project root is detected (`.git`, `package.json`, etc.), the repo is indexed, and top-K relevant chunks are spliced in as a system message. Tool-call-aware — works alongside `--enable-auto-tool-choice`. See [longctx](https://github.com/TheTom/longctx) for scope-tuning, watch-mode, and tester recommendations.
+
+#### V3 + longctx (long multi-turn / unbounded context)
+
+```bash
+# 1. Install + start longctx-svc (one time, picks port 5054 by default)
+vllm-swift longctx-install
+
+# 2. Serve with V3 + longctx wired together
+VLLM_TRIATT_ENABLED=1 \
+VLLM_TRIATT_BUDGET=$((CTX_TARGET * 9 / 10)) \
+VLLM_TRIATT_WINDOW=128 \
+VLLM_TRIATT_PREFIX=32 \
+VLLM_TRIATT_WARMUP=256 \
+VLLM_TRIATT_HYBRID=2 \
+LONGCTX_ENDPOINT=http://127.0.0.1:5054 \
+vllm-swift serve ~/models/Qwen3.5-2B-4bit \
+  --served-model-name qwen35-2b \
+  --enable-longctx \
+  --max-model-len 262144
+```
+
+The auto Tier-3 rehydrate hook fires before each turn's prefill, queries longctx with the user's question, and prepends recovered chunks as a system message. End-to-end the model sees a normal multi-turn chat with bonus retrieved-context.
+
+#### V3 environment variables
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `VLLM_TRIATT_ENABLED` | unset (off) | master switch |
+| `VLLM_TRIATT_BUDGET` | required | KV cells to keep (set to ~90% of `--max-model-len` for 10% eviction headroom) |
+| `VLLM_TRIATT_WINDOW` | 128 | always-keep recent window |
+| `VLLM_TRIATT_PREFIX` | 32 | always-keep prompt prefix |
+| `VLLM_TRIATT_WARMUP` | 256 | tokens before first eviction round |
+| `VLLM_TRIATT_HYBRID` | 2 | eviction policy mode |
+| `LONGCTX_ENDPOINT` | unset | URL of longctx-svc — **required** for the rescue path |
+
+#### Limitations / current state
+
+- V3 cache (`TriAttentionKVCache`) is FP16 only. **Stacking V3 with TurboQuant codecs (turbo4v2, turbo8v4) is not yet supported.** Track progress at mlx-swift-lm task #187.
+- V3 hooks are wired on Qwen3 / Qwen3.5 / Qwen3-MoE / Llama / Mistral3 / Phi / Phi3 / Gemma3 / GLM4. Other model families fall back to non-V3 caches.
+- Tier-3 rehydrate auto-fires only through the chat-completions multi-turn path (`ChatSession` in mlx-swift-lm). Single-shot completions skip it; document or NIAH-style workloads need to structure as a 2+ turn chat.
+- longctx-svc is an alpha companion service with its own caveats; see its README.
+
+#### Receipts
+
+12-cell ramp on Qwen3.5-2B-4bit (M5 Max), 32K → 256K planted-fact NIAH:
+
+| ctx | baseline turbo8v4 | V3 only | V3 + longctx |
+|-----|:---:|:---:|:---:|
+| 32K  | ✓HIT | ✗miss | **✓HIT** |
+| 64K  | ✓HIT | ✗miss | **✓HIT** |
+| 128K | ✓HIT | ✗miss | **✓HIT** |
+| 256K | ✓HIT | ✗miss | **✓HIT** |
+
+Source paper: [longctx and TriAttention](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/longctx-1m-and-triattention.md).
 
 ### Full setup (agent + reasoning + TurboQuant+)
 
