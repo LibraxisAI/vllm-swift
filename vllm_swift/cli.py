@@ -550,11 +550,47 @@ def _serve_with_rewriter(  # pragma: no cover
         "  rewriter rule: recover structured tool_calls from plaintext-JSON "
         "leaks in `content` (hermes / qwen3_coder / phi4-pipe / mistral shapes)"
     )
-    proc = subprocess.Popen(cmd, env=env)
+    # start_new_session=True puts vllm api_server AND its EngineCore
+    # subprocess into a fresh process group, so killpg() can reap both.
+    # Without this, SIGTERM on the parent leaves EngineCore orphaned —
+    # the child holds ~all KV cache memory and keeps the GPU busy.
+    proc = subprocess.Popen(cmd, env=env, start_new_session=True)
+
+    def _kill_orphan_engine_cores() -> None:
+        """Belt-and-suspenders: nuke any leftover VLLM::EngineCore.
+
+        If the api_server died without taking EngineCore with it (rare but
+        observed under hard crashes), this sweeps the leftovers. Only kills
+        EngineCores whose parent is dead or is our own pgid.
+        """
+        try:
+            out = subprocess.check_output(
+                ["pgrep", "-f", "VLLM::EngineCore"], text=True, timeout=2
+            )
+        except Exception:  # noqa: BLE001
+            return
+        own_pgid = os.getpgid(proc.pid) if proc.pid else -1
+        for line in out.splitlines():
+            pid_str = line.strip()
+            if not pid_str.isdigit():
+                continue
+            pid = int(pid_str)
+            try:
+                ppgid = os.getpgid(pid)
+            except (ProcessLookupError, PermissionError):
+                continue
+            if ppgid == own_pgid:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
     def _shutdown(*_: object) -> None:
         if proc.poll() is None:
-            proc.terminate()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                proc.terminate()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -587,8 +623,12 @@ def _serve_with_rewriter(  # pragma: no cover
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
             proc.wait()
+        _kill_orphan_engine_cores()
 
 
 def _download(args: list[str]) -> int:
