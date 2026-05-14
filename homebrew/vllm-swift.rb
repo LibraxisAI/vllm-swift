@@ -40,12 +40,31 @@ class VllmSwift < Formula
 
     build_dir = "swift/.build/arm64-apple-macosx/release"
 
+    # SPM doesn't compile .metal files; mlx-swift-lm ships
+    # `scripts/build-metallib.sh` that compiles + archives them into
+    # `mlx.metallib`. Run it for the release build so the metallib
+    # lands next to the dylib. Without this, the dylib loads but
+    # every kernel dispatch fails at runtime ("kernel not found in
+    # default Metal library"). This is the build-from-source gap that
+    # bit on v0.6.3 — the bottle path runs the script via
+    # scripts/build_bottle.sh, but `brew install --build-from-source`
+    # never did until now.
+    metallib_script = "swift/.build/checkouts/mlx-swift-lm/scripts/build-metallib.sh"
+    if File.exist?(metallib_script)
+      cd "swift" do
+        system "bash", ".build/checkouts/mlx-swift-lm/scripts/build-metallib.sh", "release"
+      end
+    end
+
     # Install the dylib
     lib.install "#{build_dir}/libVLLMBridge.dylib"
 
-    # Copy metallib if it exists
+    # Metallib is required for any Metal kernel dispatch. Fail loud if
+    # the build script didn't produce one — silent install of a broken
+    # binary is what we're trying to prevent.
     metallib = "#{build_dir}/mlx.metallib"
-    lib.install metallib if File.exist?(metallib)
+    odie "mlx.metallib not built — check build-metallib.sh output" unless File.exist?(metallib)
+    lib.install metallib
 
     # Install the Python plugin source + pyproject.toml
     libexec.install "pyproject.toml"
