@@ -70,9 +70,7 @@ def _wait_for_health(port: int, timeout: float = 90.0) -> None:
 def _count_engine_cores() -> int:
     """Count live `VLLM::EngineCore` processes anywhere on the box."""
     try:
-        out = subprocess.check_output(
-            ["pgrep", "-f", "VLLM::EngineCore"], text=True, timeout=2
-        )
+        out = subprocess.check_output(["pgrep", "-f", "VLLM::EngineCore"], text=True, timeout=2)
     except subprocess.CalledProcessError:
         return 0  # pgrep returns 1 when no matches
     except Exception:  # noqa: BLE001

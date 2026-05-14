@@ -70,9 +70,7 @@ def _kill_orphan_engine_cores(parent_pid: int | None) -> int:
     except (ProcessLookupError, PermissionError):
         return 0
     try:
-        out = subprocess.check_output(
-            ["pgrep", "-f", "VLLM::EngineCore"], text=True, timeout=2
-        )
+        out = subprocess.check_output(["pgrep", "-f", "VLLM::EngineCore"], text=True, timeout=2)
     except Exception:  # noqa: BLE001
         return 0
     killed = 0

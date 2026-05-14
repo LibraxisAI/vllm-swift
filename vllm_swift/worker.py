@@ -303,17 +303,22 @@ class SwiftMetalWorker:
                     # Batched path failed — fall back to per-request for this group.
                     logger.warning(
                         "prefill_batched_uniform rc=%d (B=%d, T=%d); falling back",
-                        rc, len(reqs), plen,
+                        rc,
+                        len(reqs),
+                        plen,
                     )
                     for r in reqs:
                         first_token = self.engine.prefill_req(
-                            r.req_id, list(r.prompt_token_ids),
-                            temperature=temp, top_p=top_p,
+                            r.req_id,
+                            list(r.prompt_token_ids),
+                            temperature=temp,
+                            top_p=top_p,
                         )
                         sp_r = r.sampling_params
                         self._active_requests[r.req_id] = [first_token]
                         self._request_params[r.req_id] = {
-                            "temperature": temp, "top_p": top_p,
+                            "temperature": temp,
+                            "top_p": top_p,
                             "logprobs": getattr(sp_r, "logprobs", None) is not None,
                         }
                         req_ids.append(r.req_id)
@@ -325,7 +330,8 @@ class SwiftMetalWorker:
                     sp_r = r.sampling_params
                     self._active_requests[r.req_id] = [first_token]
                     self._request_params[r.req_id] = {
-                        "temperature": temp, "top_p": top_p,
+                        "temperature": temp,
+                        "top_p": top_p,
                         "logprobs": getattr(sp_r, "logprobs", None) is not None,
                     }
                     req_ids.append(r.req_id)
@@ -334,13 +340,16 @@ class SwiftMetalWorker:
                 # Singleton — per-request fallback.
                 r = reqs[0]
                 first_token = self.engine.prefill_req(
-                    r.req_id, list(r.prompt_token_ids),
-                    temperature=temp, top_p=top_p,
+                    r.req_id,
+                    list(r.prompt_token_ids),
+                    temperature=temp,
+                    top_p=top_p,
                 )
                 sp_r = r.sampling_params
                 self._active_requests[r.req_id] = [first_token]
                 self._request_params[r.req_id] = {
-                    "temperature": temp, "top_p": top_p,
+                    "temperature": temp,
+                    "top_p": top_p,
                     "logprobs": getattr(sp_r, "logprobs", None) is not None,
                 }
                 req_ids.append(r.req_id)

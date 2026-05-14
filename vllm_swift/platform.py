@@ -45,11 +45,17 @@ logger = logging.getLogger(__name__)
 _ARCHS_WE_RUN_VIA_MLX_SWIFT_LM = (
     # New families that may not be in user's pinned transformers yet:
     "deepseek_v4",
-    "gemma4", "gemma4_text", "gemma4_vision", "gemma4_audio",
+    "gemma4",
+    "gemma4_text",
+    "gemma4_vision",
+    "gemma4_audio",
     "gpt_oss",
-    "qwen3_5", "qwen3_5_text",
-    "qwen3_5_moe", "qwen3_5_moe_text",
-    "qwen3_next", "qwen3_next_text",
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "qwen3_next",
+    "qwen3_next_text",
     "qwen3_moe",
     "minimax_m2",
     "nemotron_h",
@@ -63,7 +69,8 @@ _ARCHS_WE_RUN_VIA_MLX_SWIFT_LM = (
     "qwen2",
     "qwen3",
     "gemma2",
-    "gemma3", "gemma3_text",
+    "gemma3",
+    "gemma3_text",
     # SigLIP vision tower used by Gemma3-VLM checkpoints
     "siglip_vision_model",
 )
@@ -107,8 +114,12 @@ def _register_passthrough_configs() -> None:
     # carries a `model_type` is upgraded to a PretrainedConfig instance via
     # AutoConfig (which falls back to our other stubs for unknown model_types).
     _SUB_CONFIG_KEYS = (
-        "text_config", "vision_config", "audio_config",
-        "speech_config", "decoder_config", "encoder_config",
+        "text_config",
+        "vision_config",
+        "audio_config",
+        "speech_config",
+        "decoder_config",
+        "encoder_config",
     )
 
     def _make_stub_init():
@@ -122,6 +133,7 @@ def _register_passthrough_configs() -> None:
                     except Exception:
                         pass  # leave as dict; downstream may not need it
             PretrainedConfig.__init__(self, **kwargs)
+
         return __init__
 
     # Only register stubs for model_types transformers doesn't already know
@@ -129,6 +141,7 @@ def _register_passthrough_configs() -> None:
     # isinstance checks in vLLM (it expects the canonical transformers class).
     try:
         from transformers import CONFIG_MAPPING
+
         known = set(CONFIG_MAPPING.keys())
     except Exception:
         known = set()
@@ -354,8 +367,6 @@ def _register_passthrough_archs() -> None:
         len(registered),
     )
     _archs_registered = True
-
-
 
 
 class SwiftMetalPlatform(Platform):

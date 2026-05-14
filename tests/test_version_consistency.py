@@ -8,6 +8,7 @@ others. Hit on 2026-05-13 when bumping 0.6.0 → 0.6.3 missed a
 hardcoded "0.6.0" inside the wrapper template, shipping a bottle
 whose `vllm-swift version` reported the wrong number.
 """
+
 from __future__ import annotations
 
 import re
@@ -76,7 +77,7 @@ def test_homebrew_formula_version_subcommand_matches(canonical_version):
     must match pyproject.toml. (Brew formula has its own inline wrapper.)"""
     text = _read("homebrew/vllm-swift.rb")
     m = re.search(r'echo\s+"vllm-swift\s+([^"]+)"', text)
-    assert m, "homebrew/vllm-swift.rb has no `echo \"vllm-swift X\"` line"
+    assert m, 'homebrew/vllm-swift.rb has no `echo "vllm-swift X"` line'
     assert m.group(1) == canonical_version, (
         f"homebrew/vllm-swift.rb wrapper 'vllm-swift {m.group(1)}' "
         f"!= pyproject.toml version {canonical_version!r}"
@@ -170,7 +171,7 @@ def test_bottle_wrapper_template_uses_substitution_placeholder():
         r'version\)\s*\n\s*echo\s+"vllm-swift\s+(\S+)"',
         text,
     )
-    assert m, "build_bottle.sh wrapper has no `echo \"vllm-swift X\"` line"
+    assert m, 'build_bottle.sh wrapper has no `echo "vllm-swift X"` line'
     placeholder = m.group(1)
     assert placeholder == "__VERSION__", (
         f"Bottle wrapper bakes hardcoded version {placeholder!r}. "
