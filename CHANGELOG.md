@@ -1,5 +1,99 @@
 # Release History
 
+## v0.6.3 — 2026-05-13
+
+**Reliability + integration cycle.** Three classes of fix that
+together unblock long-running agentic workloads and bring the
+toolchain to the latest alpha-integration tip.
+
+### What's new
+
+- **EngineCore process-group kill.** vLLM V1 spawns
+  `VLLM::EngineCore` as a grandchild of `vllm-swift`. The previous
+  `_shutdown` only called `proc.terminate()` on the direct child
+  (api_server), leaving EngineCore orphaned and holding ~all KV
+  cache memory until manually killed (presented as a "memory
+  leak"). Three-layer fix in `vllm_swift/cli.py`:
+  1. `start_new_session=True` on `Popen` puts api_server +
+     EngineCore in a fresh process group.
+  2. `_shutdown` uses `os.killpg(pgid, SIGTERM)` to reap the whole
+     group in one shot.
+  3. Belt-and-suspenders `_kill_orphan_engine_cores()` sweep after
+     `proc.wait()` SIGKILLs any leftover EngineCore that shares
+     our pgid (covers hard-crash scenarios where the api_server
+     died first).
+
+- **Cross-request slot lifecycle (worker.py).** Fixes the B≥8
+  crash where `prefill_batched_uniform` rebuilt `engine.batchedCaches`
+  and cleared `engine.batchSlots`, destroying in-flight sessions
+  from prior scheduler steps. Worker now detects active sessions
+  via `scheduled_cached_reqs.req_ids` and falls back to per-request
+  `prefill_req` for new prefills when any are alive — preserves
+  existing batchSlots. Batched path only used for greenfield prefills.
+
+- **ModelRegistry race fix (platform.py).** Some multimodal model
+  dirs (e.g. Gemma 4 e2b text+audio) register architectures lazily
+  through plugins. Without explicit pre-registration, the first
+  request races `vllm.config` init and resolves to the wrong arch
+  class. Fix: post-init hook walks known multimodal archs and calls
+  `ModelRegistry.register_model` after `vllm.config` finishes
+  initializing. Safe-no-op for archs already registered.
+
+- **Bridge.swift KVCache rename port.** Rebases `swift/Sources/VLLMBridge/Bridge.swift`
+  to the post-spec-006 `mlx-swift-lm` API:
+  - `KVCacheSimple` → `StandardKVCache`
+  - `MambaCache` → `SSMStateCache`
+  - `params.kvScheme` / `kvBits` → `params.compressionAlgorithm`
+    (typed enum `.none` / `.turbo(keyBits:, valueBits:)` / `.affine(bits:, groupSize:)`).
+  `BatchedMambaCache` unchanged.
+
+- **BF16 RMSNorm fp32-stream upcast + NAX runtime opt-out** (in
+  bundled `mlx`/`mlx-swift`). Qwen3.5/3.6 hybrid stability on M5
+  Max; the NAX disable is gated by `MLX_METAL_NO_NAX=1` env var.
+
+- **Big-MoE load-time hardening** (in bundled `mlx-swift-lm`):
+  per-layer quantize split + asyncEval to dodge the Metal command-
+  buffer watchdog on Qwen3.6-A3B-ConfigI cold starts.
+
+- **`longctx-svc` floor bumped 0.3.0a3 → 0.3.2** for the
+  retrieval-companion optional extra. Picks up the 12M coarse
+  filter, auto-policy router, symbol-aware retrieval augment, and
+  test-coverage gates landed today on TheTom/longctx main.
+
+### New tests
+
+- **`tests/test_cli.py`** — 10 unit tests for the new EngineCore
+  pgroup-kill helpers (`_shutdown_pgroup`, `_kill_orphan_engine_cores`):
+  killpg-targets-whole-group, fallback to `proc.terminate()` on
+  pgid lookup failure, no-op when process already dead, never
+  touches another vllm-swift instance's EngineCore, swallows
+  pgrep races + FileNotFoundError, source-level assert that
+  `start_new_session=True` is wired in `_serve_with_rewriter`.
+
+- **`tests/integration/test_real_server_e2e.py`** — basic Hermes
+  tool-calling test (Qwen3-0.6B + `tool_choice=auto`) plus a
+  fixture-level orphan guard: post-teardown `pgrep` count must not
+  exceed pre-launch snapshot — `conftest.py` now uses the same
+  pgroup-kill pattern as the CLI for consistency.
+
+### Bumped
+
+- `vllm_swift/__init__.py` `__version__` 0.5.4 → 0.6.3 (was out of
+  sync with `pyproject.toml`'s 0.6.0).
+- `scripts/build_bottle.sh` VERSION 0.6.0 → 0.6.3.
+- `homebrew/vllm-swift.rb` version + caveat strings 0.6.0 → 0.6.3;
+  bottle `arm64_tahoe` sha256 stamped to `f1bc67e2079517489c79227111
+  74471b96096ea523b0afcd6568aca52640fbe2` (8.1MB bottle).
+
+### Verified
+
+- Local unit suite: 514 tests pass (vllm-swift), 1177 + 291 pass
+  (longctx + longctx-svc).
+- M2 mini (macOS 26.1, arm64_tahoe): all 3 wheels install cleanly
+  into the managed venv, dylib SHA matches local build, Qwen3.5-2B-4bit
+  smoke test returned "Paris" in 0.5s, SIGTERM teardown left zero
+  orphan `VLLM::EngineCore` processes.
+
 ## v0.6.0
 
 **TriAttention V3 + longctx ChatSession integration; Gemma 4 MTP drafter.**
