@@ -39,6 +39,62 @@ def _lib_dir() -> Path:
     return Path(__file__).resolve().parent / "_lib"
 
 
+def _shutdown_pgroup(proc: subprocess.Popen) -> None:
+    """SIGTERM the whole process group of `proc`.
+
+    vLLM V1 spawns `VLLM::EngineCore` as a child of the api_server. Both
+    inherit the api_server's pgid (set via `start_new_session=True`).
+    `killpg(pgid, SIGTERM)` reaps the api_server AND EngineCore in one
+    shot. Falls back to plain `proc.terminate()` if the process is
+    already gone or the pgid lookup fails.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        proc.terminate()
+
+
+def _kill_orphan_engine_cores(parent_pid: int | None) -> int:
+    """Belt-and-suspenders: SIGKILL leftover `VLLM::EngineCore` processes
+    whose pgid matches `parent_pid`'s pgid.
+
+    Covers hard-crash scenarios where the api_server died without taking
+    EngineCore with it. Returns the number of processes killed.
+    """
+    if not parent_pid:
+        return 0
+    try:
+        own_pgid = os.getpgid(parent_pid)
+    except (ProcessLookupError, PermissionError):
+        return 0
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "VLLM::EngineCore"], text=True, timeout=2
+        )
+    except Exception:  # noqa: BLE001
+        return 0
+    killed = 0
+    for line in out.splitlines():
+        pid_str = line.strip()
+        if not pid_str.isdigit():
+            continue
+        pid = int(pid_str)
+        try:
+            ppgid = os.getpgid(pid)
+        except (ProcessLookupError, PermissionError):
+            continue
+        if ppgid != own_pgid:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+    return killed
+
+
 def _prepare_dyld_env() -> dict[str, str]:
     env = os.environ.copy()
     lib = str(_lib_dir())
@@ -556,41 +612,8 @@ def _serve_with_rewriter(  # pragma: no cover
     # the child holds ~all KV cache memory and keeps the GPU busy.
     proc = subprocess.Popen(cmd, env=env, start_new_session=True)
 
-    def _kill_orphan_engine_cores() -> None:
-        """Belt-and-suspenders: nuke any leftover VLLM::EngineCore.
-
-        If the api_server died without taking EngineCore with it (rare but
-        observed under hard crashes), this sweeps the leftovers. Only kills
-        EngineCores whose parent is dead or is our own pgid.
-        """
-        try:
-            out = subprocess.check_output(
-                ["pgrep", "-f", "VLLM::EngineCore"], text=True, timeout=2
-            )
-        except Exception:  # noqa: BLE001
-            return
-        own_pgid = os.getpgid(proc.pid) if proc.pid else -1
-        for line in out.splitlines():
-            pid_str = line.strip()
-            if not pid_str.isdigit():
-                continue
-            pid = int(pid_str)
-            try:
-                ppgid = os.getpgid(pid)
-            except (ProcessLookupError, PermissionError):
-                continue
-            if ppgid == own_pgid:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-
     def _shutdown(*_: object) -> None:
-        if proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                proc.terminate()
+        _shutdown_pgroup(proc)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -628,7 +651,7 @@ def _serve_with_rewriter(  # pragma: no cover
             except (ProcessLookupError, PermissionError):
                 proc.kill()
             proc.wait()
-        _kill_orphan_engine_cores()
+        _kill_orphan_engine_cores(proc.pid)
 
 
 def _download(args: list[str]) -> int:

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the pip-installed `vllm-swift` CLI entry point."""
 
+import signal
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -344,3 +345,187 @@ def test_serve_skips_injection_for_unregistered_parser(tmp_path):
     cmd = mock_call.call_args[0][0]
     assert "future_parser_dne" not in cmd
     assert "--tool-call-parser" not in cmd
+
+
+# --- EngineCore process-group lifecycle ---------------------------------
+#
+# Regression coverage for the "leak" where SIGTERM-ing vllm-swift left a
+# `VLLM::EngineCore` grandchild alive, pinning ~all KV cache memory until
+# manually killed. See `cli._shutdown_pgroup` and
+# `cli._kill_orphan_engine_cores`.
+
+
+def _proc_stub(pid: int = 99999, poll_return=None) -> MagicMock:
+    """Minimal `subprocess.Popen` stand-in for the shutdown helpers."""
+    p = MagicMock()
+    p.pid = pid
+    p.poll.return_value = poll_return
+    return p
+
+
+def test_shutdown_pgroup_sigterms_whole_group():
+    proc = _proc_stub(pid=12345)
+    with (
+        patch("vllm_swift.cli.os.getpgid", return_value=12345) as mock_getpgid,
+        patch("vllm_swift.cli.os.killpg") as mock_killpg,
+    ):
+        cli._shutdown_pgroup(proc)
+    mock_getpgid.assert_called_once_with(12345)
+    mock_killpg.assert_called_once_with(12345, signal.SIGTERM)
+    proc.terminate.assert_not_called()
+
+
+def test_shutdown_pgroup_falls_back_to_terminate_when_pgid_lookup_fails():
+    proc = _proc_stub(pid=12345)
+    with (
+        patch("vllm_swift.cli.os.getpgid", side_effect=ProcessLookupError),
+        patch("vllm_swift.cli.os.killpg") as mock_killpg,
+    ):
+        cli._shutdown_pgroup(proc)
+    mock_killpg.assert_not_called()
+    proc.terminate.assert_called_once()
+
+
+def test_shutdown_pgroup_noops_when_process_already_dead():
+    proc = _proc_stub(pid=12345, poll_return=0)  # already exited
+    with (
+        patch("vllm_swift.cli.os.getpgid") as mock_getpgid,
+        patch("vllm_swift.cli.os.killpg") as mock_killpg,
+    ):
+        cli._shutdown_pgroup(proc)
+    mock_getpgid.assert_not_called()
+    mock_killpg.assert_not_called()
+    proc.terminate.assert_not_called()
+
+
+def test_kill_orphan_engine_cores_returns_zero_when_no_parent_pid():
+    assert cli._kill_orphan_engine_cores(None) == 0
+    assert cli._kill_orphan_engine_cores(0) == 0
+
+
+def test_kill_orphan_engine_cores_returns_zero_when_pgrep_empty():
+    """No leftover EngineCores → 0 kills, never call os.kill."""
+    with (
+        patch("vllm_swift.cli.os.getpgid", return_value=12345),
+        patch("vllm_swift.cli.subprocess.check_output", return_value=""),
+        patch("vllm_swift.cli.os.kill") as mock_kill,
+    ):
+        n = cli._kill_orphan_engine_cores(12345)
+    assert n == 0
+    mock_kill.assert_not_called()
+
+
+def test_kill_orphan_engine_cores_kills_matching_pgid_only():
+    """SIGKILL only EngineCores whose pgid matches our parent's pgid.
+
+    Critical safety property: never kill someone else's EngineCore from
+    a different vllm-swift instance.
+    """
+    parent_pid = 100
+    parent_pgid = 200
+
+    # Two EngineCores in pgrep output: one matches our pgid, one belongs
+    # to a different vllm-swift instance.
+    pgrep_output = "300\n400\n"
+
+    def fake_getpgid(pid: int) -> int:
+        return {
+            parent_pid: parent_pgid,
+            300: parent_pgid,  # ours — should be killed
+            400: 999,  # someone else's — must be spared
+        }[pid]
+
+    with (
+        patch("vllm_swift.cli.os.getpgid", side_effect=fake_getpgid),
+        patch("vllm_swift.cli.subprocess.check_output", return_value=pgrep_output),
+        patch("vllm_swift.cli.os.kill") as mock_kill,
+    ):
+        n = cli._kill_orphan_engine_cores(parent_pid)
+
+    assert n == 1
+    mock_kill.assert_called_once_with(300, signal.SIGKILL)
+
+
+def test_kill_orphan_engine_cores_skips_dead_pids():
+    """pgrep race: pid disappears between pgrep and getpgid → skip cleanly."""
+    parent_pid = 100
+    parent_pgid = 200
+
+    def fake_getpgid(pid: int) -> int:
+        if pid == parent_pid:
+            return parent_pgid
+        raise ProcessLookupError
+
+    with (
+        patch("vllm_swift.cli.os.getpgid", side_effect=fake_getpgid),
+        patch("vllm_swift.cli.subprocess.check_output", return_value="300\n"),
+        patch("vllm_swift.cli.os.kill") as mock_kill,
+    ):
+        n = cli._kill_orphan_engine_cores(parent_pid)
+
+    assert n == 0
+    mock_kill.assert_not_called()
+
+
+def test_kill_orphan_engine_cores_swallows_pgrep_failure():
+    """pgrep not installed / timed out → silent no-op, never raises."""
+    with (
+        patch("vllm_swift.cli.os.getpgid", return_value=200),
+        patch(
+            "vllm_swift.cli.subprocess.check_output",
+            side_effect=FileNotFoundError("pgrep"),
+        ),
+        patch("vllm_swift.cli.os.kill") as mock_kill,
+    ):
+        n = cli._kill_orphan_engine_cores(100)
+    assert n == 0
+    mock_kill.assert_not_called()
+
+
+def test_kill_orphan_engine_cores_handles_kill_race():
+    """If SIGKILL races with natural exit, count stays accurate."""
+    parent_pid = 100
+    parent_pgid = 200
+
+    def fake_getpgid(pid: int) -> int:
+        return {parent_pid: parent_pgid, 300: parent_pgid, 301: parent_pgid}[pid]
+
+    def fake_kill(pid: int, sig: int) -> None:
+        if pid == 301:
+            raise ProcessLookupError  # exited before our SIGKILL landed
+
+    with (
+        patch("vllm_swift.cli.os.getpgid", side_effect=fake_getpgid),
+        patch("vllm_swift.cli.subprocess.check_output", return_value="300\n301\n"),
+        patch("vllm_swift.cli.os.kill", side_effect=fake_kill),
+    ):
+        n = cli._kill_orphan_engine_cores(parent_pid)
+
+    # Only 300 was actually killed; 301 was already gone.
+    assert n == 1
+
+
+def test_serve_with_rewriter_uses_start_new_session_for_pgroup_kill():
+    """Regression (source-level): the Popen call in `_serve_with_rewriter`
+    MUST pass `start_new_session=True`, otherwise the api_server +
+    EngineCore land in our pgid and SIGTERM-ing our process group nukes
+    vllm-swift itself. With start_new_session=True they get a fresh
+    pgid that we can later target with killpg().
+
+    The body of `_serve_with_rewriter` is `# pragma: no cover` because
+    it spawns real subprocesses and runs the rewriter event loop —
+    asserting at the source level is the practical seam.
+    """
+    import inspect
+
+    src = inspect.getsource(cli._serve_with_rewriter)
+    # Be flexible about formatting (keyword positioning, line wraps).
+    assert "start_new_session=True" in src, (
+        "subprocess.Popen in _serve_with_rewriter must pass "
+        "start_new_session=True — without it SIGTERM leaves "
+        "VLLM::EngineCore orphaned holding all KV cache memory."
+    )
+    # And the shutdown path must go through _shutdown_pgroup.
+    assert "_shutdown_pgroup" in src
+    # And the orphan-sweeper must fire on exit.
+    assert "_kill_orphan_engine_cores" in src
