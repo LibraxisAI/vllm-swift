@@ -95,6 +95,66 @@ def test_homebrew_formula_test_assertion_matches(canonical_version):
     )
 
 
+def test_published_tap_formula_matches_repo_formula(canonical_version):
+    """Network-gated regression: the formula in `TheTom/homebrew-tap`
+    MUST match the one in this repo's `homebrew/vllm-swift.rb`.
+
+    The 0.6.2 → 0.6.3 release shipped with `homebrew/vllm-swift.rb`
+    correctly bumped here but the tap formula at TheTom/homebrew-tap
+    was left at 0.6.2 — `brew install TheTom/tap/vllm-swift` would
+    have silently installed the old version. This test catches that
+    class of split-brain drift.
+
+    Opt out with `VLLM_SWIFT_SKIP_TAP_CHECK=1` (CI on no-network).
+    """
+    import os
+    import urllib.error
+    import urllib.request
+
+    if os.environ.get("VLLM_SWIFT_SKIP_TAP_CHECK"):
+        pytest.skip("VLLM_SWIFT_SKIP_TAP_CHECK set")
+
+    import base64
+    import json as _json
+
+    # Use the GitHub Contents API (uncached) instead of
+    # raw.githubusercontent (5-min CDN cache that false-positives this
+    # test for ~5 min after every tap push).
+    try:
+        with urllib.request.urlopen(
+            "https://api.github.com/repos/TheTom/homebrew-tap/contents/Formula/vllm-swift.rb",
+            timeout=10,
+        ) as r:
+            payload = _json.loads(r.read())
+            tap_text = base64.b64decode(payload["content"]).decode("utf-8")
+    except (urllib.error.URLError, ConnectionError, OSError, KeyError, ValueError) as e:
+        pytest.skip(f"network/api unavailable: {e}")
+
+    m = re.search(r'^\s*version\s+"([^"]+)"', tap_text, re.MULTILINE)
+    if m is None:
+        pytest.skip("tap formula missing version line (api glitch?)")
+    tap_version = m.group(1)
+
+    assert tap_version == canonical_version, (
+        f"Published tap formula version = {tap_version!r}, "
+        f"repo formula version = {canonical_version!r}. "
+        f"Push the updated formula to TheTom/homebrew-tap "
+        f"before announcing the release."
+    )
+
+    # Also verify the bottle SHA stamp matches the repo's. Mismatch =
+    # the tap is pointing at a different binary than our formula.
+    repo_text = _read("homebrew/vllm-swift.rb")
+    repo_sha = re.search(r'arm64_tahoe:\s*"([0-9a-f]{64})"', repo_text)
+    tap_sha = re.search(r'arm64_tahoe:\s*"([0-9a-f]{64})"', tap_text)
+    if repo_sha and tap_sha:
+        assert repo_sha.group(1) == tap_sha.group(1), (
+            f"Tap arm64_tahoe bottle SHA = {tap_sha.group(1)} "
+            f"does not match repo formula SHA = {repo_sha.group(1)}. "
+            f"Push the updated formula to TheTom/homebrew-tap."
+        )
+
+
 def test_bottle_wrapper_template_uses_substitution_placeholder():
     """The bottle wrapper template inside build_bottle.sh MUST use
     `__VERSION__` (substituted by `sed` at build time) for its
