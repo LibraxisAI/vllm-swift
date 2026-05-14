@@ -125,16 +125,13 @@ private let engineQueue = DispatchQueue(label: "vsm.engine.queue")
 private func batchedTurboBits(
     from params: GenerateParameters
 ) -> (Int?, Int?) {
-    guard let scheme = params.kvScheme,
-          scheme.hasPrefix("turbo")
-    else { return (nil, nil) }
-    let parsed = parseTurboScheme(scheme)
-    // Symmetric form ("turbo4") returns keyBits == nil → fall back to the
-    // top-level bits value for both K and V. parseTurboScheme uses
-    // `params.kvBits` semantics indirectly via the top-level bits field.
-    let kb = parsed.keyBits ?? parsed.bits
-    let vb = parsed.valueBits ?? parsed.bits
-    return (kb, vb)
+    // Eric's spec-006 cleanup: kvScheme/kvBits replaced by the typed
+    // `CompressionAlgorithm` enum on GenerateParameters. Pattern-match
+    // the .turbo case to extract per-K/per-V bit counts.
+    if case let .turbo(keyBits, valueBits, _, _) = params.compressionAlgorithm {
+        return (keyBits, valueBits)
+    }
+    return (nil, nil)
 }
 
 // MARK: - C API implementations
@@ -157,11 +154,22 @@ public func vsm_engine_create(
     if maxKVSize > 0 {
         params.maxKVSize = Int(maxKVSize)
     }
+    // 2026-05-12 alpha integration: Eric's spec-006 cleanup replaced the
+    // `kvScheme` (String) + `kvBits` (Int) fields with a typed
+    // `CompressionAlgorithm` enum. Translate the C-side string into the
+    // enum. The `kvBits` int is now embedded in the enum case
+    // (.turbo(keyBits:, valueBits:) / .affine(bits:, groupSize:)), so the
+    // separate `kvBits` parameter is informational only — if the scheme
+    // string didn't carry bit counts (e.g. plain "turbo"), the enum init
+    // defaults to symmetric. We still respect a non-zero kvBits as a
+    // fallback by composing "turbo<N>" when no scheme is given.
     if let kvScheme {
-        params.kvScheme = String(cString: kvScheme)
-    }
-    if kvBits > 0 {
-        params.kvBits = Int(kvBits)
+        let schemeStr = String(cString: kvScheme)
+        params.compressionAlgorithm = KVCacheCompressionAlgorithm(schemeStr) ?? .none
+    } else if kvBits > 0 {
+        // No scheme but bits provided — default to symmetric turbo.
+        params.compressionAlgorithm =
+            KVCacheCompressionAlgorithm.turbo(keyBits: Int(kvBits), valueBits: Int(kvBits))
     }
     params.temperature = 0  // default greedy, overridden per-call
 
@@ -403,7 +411,7 @@ public func vsm_engine_prompt_logprobs(
         let tokens = (0..<n).map { Int(promptTokens[$0]) }
         let tokenArray = MLXArray(tokens)
 
-        // Run model forward on full prompt with proper caches for hybrid models (GDN needs MambaCache)
+        // Run model forward on full prompt with proper caches for hybrid models (GDN needs SSMStateCache)
         let input = LMInput(text: .init(tokens: tokenArray))
         let cache: [KVCache]? = (engine.model as? LLMModel)?.newCache(parameters: nil) ?? nil
         let result = engine.model(input.text.tokens.reshaped(1, n), cache: cache)
@@ -486,7 +494,7 @@ public func vsm_engine_decode_all(
         // (prefill_batched_uniform / hybrid init_batched), but the dense
         // Qwen3 serve path is prefill_req → init_batched → decode_all, and
         // both stages drop the scheme:
-        //   - init_batched fails its `as? KVCacheSimple` cast (per-request
+        //   - init_batched fails its `as? StandardKVCache` cast (per-request
         //     caches are RotatingKVCache when kvScheme is set), returns 0
         //     silently → batchedCaches stays nil.
         //   - The Qwen3 semi-batched fallback below calls
@@ -505,8 +513,14 @@ public func vsm_engine_decode_all(
         // mlx-swift-lm converts it to TurboQuantKVCache lazily inside
         // step() via maybeQuantizeKVCache, so an early type-cast misses
         // turbo'd sessions. kvScheme on generateParams is the durable signal.
-        let hasTurboCache: Bool =
-            engine.generateParams.kvScheme?.hasPrefix("turbo") ?? false
+        // Eric's spec-006 cleanup: typed CompressionAlgorithm enum
+        // replaces the kvScheme string. Pattern-match the .turbo case.
+        let hasTurboCache: Bool = {
+            if case .turbo = engine.generateParams.compressionAlgorithm {
+                return true
+            }
+            return false
+        }()
 
         // Cast ordering: Qwen3 fast path FIRST so the verified hot path
         // stays bit-identical (no extra protocol cast in the inner loop).
@@ -825,7 +839,7 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
         guard numLayers > 0 else { return Int32(0) }
 
         // Determine KV heads and head dim from first cache
-        guard let firstCache = firstSession.iterator.cache[0] as? KVCacheSimple,
+        guard let firstCache = firstSession.iterator.cache[0] as? StandardKVCache,
               let firstKeys = firstCache.peek()?.0 else { return Int32(0) }
         let kvHeads = firstKeys.dim(1)
         let headDim = firstKeys.dim(3)
@@ -854,7 +868,7 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
         }
 
         // Copy per-request cache into batched cache, then free the session.
-        // Per-request KVCacheSimples hold full prompt-length K/V (~1 GB/req at
+        // Per-request StandardKVCaches hold full prompt-length K/V (~1 GB/req at
         // 4B/8K). Holding them across the copy doubles KV memory and OOMs at
         // long-ctx high-B cells.
         engine.batchSlots.removeAll()
@@ -919,7 +933,7 @@ public func vsm_engine_add_batch_slot(
         guard let engine = engines[handle],
               let session = engine.sessions[rid] else { return Int32(-1) }
 
-        // Hybrid path: copy per-layer cache (KVCacheSimple OR MambaCache) into
+        // Hybrid path: copy per-layer cache (StandardKVCache OR SSMStateCache) into
         // the matching BatchedHybridCache layer, then addSlot() to advance
         // active counts in lockstep across all layers.
         if let hCaches = engine.batchedHybridCaches {
@@ -1417,7 +1431,7 @@ private func prefillBatchedUniformQwen3(
     B: Int,
     T: Int
 ) -> Int32 {
-    // Fresh per-layer caches. KVCacheSimple holds [B, kvHeads, T, headDim]
+    // Fresh per-layer caches. StandardKVCache holds [B, kvHeads, T, headDim]
     // after a single batched forward — same shape as the existing
     // BatchedKVCache layout, so the copy step below is a slice assign.
     guard let caches = model.newCache(parameters: nil) as [KVCache]? else { return -4 }
@@ -1449,7 +1463,7 @@ private func prefillBatchedUniformQwen3(
     // Read K/V from prefilled caches and pull dimensions for BatchedKVCache.
     // After prepare + step + iterator.next() equivalent, the cache holds
     // T+1 tokens (prompt + first sampled token).
-    guard let firstSimple = caches[0] as? KVCacheSimple,
+    guard let firstSimple = caches[0] as? StandardKVCache,
           let firstPeek = firstSimple.peek() else { return -5 }
     let kvHeads = firstPeek.0.dim(1)
     let headDim = firstPeek.0.dim(3)
@@ -1471,7 +1485,7 @@ private func prefillBatchedUniformQwen3(
     // Wiring turbo here means bulk-encoding the prefilled K/V (one fusedEncode
     // dispatch over [B*H*cacheLen, headDim]) into a turbo BatchedKVCache.
     // Use a wrapped caches array we can nil out per-layer — drops the
-    // [B, kvHeads, cacheLen, headDim] KVCacheSimple as soon as its layer
+    // [B, kvHeads, cacheLen, headDim] StandardKVCache as soon as its layer
     // is copied into the BatchedKVCache slot. Without this, both caches
     // are alive across all 36 layers (≈ 144 GB at 4B/p8K/B=64) and OOM.
     var transientCaches: [KVCache?] = caches.map { $0 }
@@ -1480,7 +1494,7 @@ private func prefillBatchedUniformQwen3(
             maxBatch: maxBatch, kvHeads: kvHeads, headDim: headDim,
             maxSeq: maxSeq, dtype: firstPeek.0.dtype
         )
-        guard let simple = transientCaches[layer] as? KVCacheSimple,
+        guard let simple = transientCaches[layer] as? StandardKVCache,
               let (k, v) = simple.peek() else { return -6 }
         bc.keys[..<B, 0..., ..<cacheLen, 0...] = k
         bc.values[..<B, 0..., ..<cacheLen, 0...] = v
@@ -1524,7 +1538,7 @@ private func prefillBatchedUniformQwen3(
 
 /// Hybrid (attention + GDN) batched prefill. Same chunked `[B, T-1]` + `[B, 1]`
 /// + `[B, 1]` pattern as the Qwen3 path — works because the hybrid model's
-/// standard `callAsFunction` accepts mixed `[KVCacheSimple, MambaCache, …]`
+/// standard `callAsFunction` accepts mixed `[StandardKVCache, SSMStateCache, …]`
 /// caches and propagates the leading-B dimension through both attention and
 /// GDN layers. After the chunks land, copy each layer's cache into the right
 /// `BatchedHybridCache` slot range (attention → BatchedKVCache, GDN →
@@ -1542,7 +1556,7 @@ private func prefillBatchedUniformHybrid(
     // protocol surface for the chunked forward calls.
     guard let lmModel = model as? any LanguageModel else { return -7 }
 
-    // Fresh per-layer caches: mixed [KVCacheSimple, MambaCache, …]. The
+    // Fresh per-layer caches: mixed [StandardKVCache, SSMStateCache, …]. The
     // standard hybrid forward writes [B, ...] state into both kinds.
     let caches = lmModel.newCache(parameters: nil)
     let numLayers = caches.count
@@ -1593,18 +1607,18 @@ private func prefillBatchedUniformHybrid(
         let dstLayer = hCaches.layers[layerIdx]
         switch dstLayer {
         case .attention(let bkv):
-            guard let simple = transientCaches[layerIdx] as? KVCacheSimple,
+            guard let simple = transientCaches[layerIdx] as? StandardKVCache,
                   copyBatchedAttentionLayer(src: simple, dst: bkv, B: B)
             else {
-                print("[vsm] prefill_batched_uniform hybrid: layer \(layerIdx) expected KVCacheSimple")
+                print("[vsm] prefill_batched_uniform hybrid: layer \(layerIdx) expected StandardKVCache")
                 return -9
             }
             eval(bkv.keys, bkv.values)
         case .gdn(let bma):
-            guard let mamba = transientCaches[layerIdx] as? MambaCache,
+            guard let mamba = transientCaches[layerIdx] as? SSMStateCache,
                   copyBatchedMambaLayer(src: mamba, dst: bma, B: B)
             else {
-                print("[vsm] prefill_batched_uniform hybrid: layer \(layerIdx) expected MambaCache")
+                print("[vsm] prefill_batched_uniform hybrid: layer \(layerIdx) expected SSMStateCache")
                 return -10
             }
             eval(bma.convState, bma.recState)
@@ -1642,10 +1656,10 @@ private func prefillBatchedUniformHybrid(
 
 // MARK: - Hybrid (Qwen3Next-class) batched cache helpers
 
-/// Copy a single per-request `KVCacheSimple` layer into the matching
+/// Copy a single per-request `StandardKVCache` layer into the matching
 /// `BatchedKVCache` slot. Mirrors the Qwen3 init path's per-layer copy.
 private func copyAttentionLayerIntoSlot(
-    src: KVCacheSimple, dst: BatchedKVCache, slot: Int
+    src: StandardKVCache, dst: BatchedKVCache, slot: Int
 ) -> Bool {
     let offset = src.offset
     guard let (k, v) = src.peek() else { return false }
@@ -1656,13 +1670,13 @@ private func copyAttentionLayerIntoSlot(
     return true
 }
 
-/// Copy a single per-request `MambaCache` layer (conv + recurrent state)
-/// into the matching `BatchedMambaCache` slot. Per-request MambaCache holds
+/// Copy a single per-request `SSMStateCache` layer (conv + recurrent state)
+/// into the matching `BatchedMambaCache` slot. Per-request SSMStateCache holds
 /// `state[0]` as `[1, kernel-1, convDim]` conv state and `state[1]` as
 /// `[1, Hv, Dv, Dk]` fp32 recurrent state — slice off the leading 1-dim
 /// before writing into the batched [maxBatch, ...] tensors.
 private func copyMambaLayerIntoSlot(
-    src: MambaCache, dst: BatchedMambaCache, slot: Int
+    src: SSMStateCache, dst: BatchedMambaCache, slot: Int
 ) -> Bool {
     let s = src.state
     // src may be empty (zero-length prompt) — leave the destination zeroed.
@@ -1680,13 +1694,13 @@ private func copyMambaLayerIntoSlot(
     return true
 }
 
-/// Copy a batched `KVCacheSimple` layer (already shaped `[B, kvHeads, T, headDim]`
+/// Copy a batched `StandardKVCache` layer (already shaped `[B, kvHeads, T, headDim]`
 /// after a single batched forward) into `[..<B]` slots of a `BatchedKVCache`.
 /// Used by `vsm_engine_prefill_batched_uniform` hybrid path — the input is
 /// already batched, so we slice-assign the whole `[..<B]` range in one op
 /// instead of looping per-slot.
 private func copyBatchedAttentionLayer(
-    src: KVCacheSimple, dst: BatchedKVCache, B: Int
+    src: StandardKVCache, dst: BatchedKVCache, B: Int
 ) -> Bool {
     let offset = src.offset
     guard let (k, v) = src.peek() else { return false }
@@ -1698,13 +1712,13 @@ private func copyBatchedAttentionLayer(
     return true
 }
 
-/// Copy a batched `MambaCache` layer into `[..<B]` slots of a
+/// Copy a batched `SSMStateCache` layer into `[..<B]` slots of a
 /// `BatchedMambaCache`. After a batched forward, the per-request
-/// `MambaCache.state` holds `state[0]: [B, kernel-1, convDim]` and
+/// `SSMStateCache.state` holds `state[0]: [B, kernel-1, convDim]` and
 /// `state[1]: [B, Hv, Dv, Dk]` (fp32) — same leading-B layout as the
 /// destination, so this is a single slice-assign per state tensor.
 private func copyBatchedMambaLayer(
-    src: MambaCache, dst: BatchedMambaCache, B: Int
+    src: SSMStateCache, dst: BatchedMambaCache, B: Int
 ) -> Bool {
     let s = src.state
     if s.isEmpty {
@@ -1768,17 +1782,17 @@ private func initBatchedHybrid(
             let dstLayer = hCaches.layers[layerIdx]
             switch dstLayer {
             case .attention(let bkv):
-                guard let simple = srcCache as? KVCacheSimple,
+                guard let simple = srcCache as? StandardKVCache,
                       copyAttentionLayerIntoSlot(src: simple, dst: bkv, slot: slotIdx)
                 else {
-                    print("[vsm] init_batched_hybrid: layer \(layerIdx) expected KVCacheSimple")
+                    print("[vsm] init_batched_hybrid: layer \(layerIdx) expected StandardKVCache")
                     return Int32(-1)
                 }
             case .gdn(let bma):
-                guard let mamba = srcCache as? MambaCache,
+                guard let mamba = srcCache as? SSMStateCache,
                       copyMambaLayerIntoSlot(src: mamba, dst: bma, slot: slotIdx)
                 else {
-                    print("[vsm] init_batched_hybrid: layer \(layerIdx) expected MambaCache")
+                    print("[vsm] init_batched_hybrid: layer \(layerIdx) expected SSMStateCache")
                     return Int32(-1)
                 }
             }
@@ -1838,11 +1852,11 @@ private func addBatchSlotHybrid(
         let dstLayer = hCaches.layers[layerIdx]
         switch dstLayer {
         case .attention(let bkv):
-            guard let simple = srcCache as? KVCacheSimple,
+            guard let simple = srcCache as? StandardKVCache,
                   copyAttentionLayerIntoSlot(src: simple, dst: bkv, slot: slotIdx)
             else { return Int32(-1) }
         case .gdn(let bma):
-            guard let mamba = srcCache as? MambaCache,
+            guard let mamba = srcCache as? SSMStateCache,
                   copyMambaLayerIntoSlot(src: mamba, dst: bma, slot: slotIdx)
             else { return Int32(-1) }
         }
