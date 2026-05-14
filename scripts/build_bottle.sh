@@ -150,7 +150,7 @@ print(f'Downloaded to {p}')
     echo "Update complete."
     ;;
   version)
-    echo "vllm-swift 0.6.0"
+    echo "vllm-swift __VERSION__"
     echo "dylib: $PREFIX/lib/libVLLMBridge.dylib"
     [ -d "$VENV_DIR" ] && "$VENV_DIR/bin/python3" -c "import vllm; print(f'vLLM: {vllm.__version__}')" 2>/dev/null
     ;;
@@ -170,6 +170,13 @@ print(f'Downloaded to {p}')
     ;;
 esac
 WRAPPER
+
+# Substitute the version placeholder so the wrapper's `version` cmd
+# always reflects the bottle's actual VERSION (no more drift between
+# scripts/build_bottle.sh:VERSION and the wrapper's hardcoded string).
+sed -i.bak "s/__VERSION__/$VERSION/g" "$BOTTLE_DIR/bin/vllm-swift" && \
+  rm -f "$BOTTLE_DIR/bin/vllm-swift.bak"
+
 chmod +x "$BOTTLE_DIR/bin/vllm-swift"
 
 # Create tarball
