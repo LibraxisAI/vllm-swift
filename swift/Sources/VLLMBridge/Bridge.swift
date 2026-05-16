@@ -954,14 +954,20 @@ public func vsm_engine_decode_all(
             return count
         }
 
-        // Fallback: sequential stepAsync/readToken for non-Qwen3 models
+        // Fallback: sequential stepAsync/readToken for non-Qwen3 models.
+        // Wrap in the engine's persistent decode stream — matches Python
+        // mlx-lm's `with mx.stream(generation_stream):` (generate.py:401)
+        // and prevents the per-op @TaskLocal default-stream lookup that
+        // mlx-swift Stream.swift documents at ~15ms/forward overhead.
         var stepped: [String] = []
-        for rid in rids {
-            guard var session = engine.sessions[rid] else { continue }
-            if session.iterator.stepAsync() {
-                stepped.append(rid)
+        MLX.Stream.withStream(engine.decodeStream) {
+            for rid in rids {
+                guard var session = engine.sessions[rid] else { continue }
+                if session.iterator.stepAsync() {
+                    stepped.append(rid)
+                }
+                engine.sessions[rid] = session
             }
-            engine.sessions[rid] = session
         }
 
         var count: Int32 = 0
