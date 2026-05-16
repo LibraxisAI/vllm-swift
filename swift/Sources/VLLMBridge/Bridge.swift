@@ -89,6 +89,15 @@ final class InferenceEngine {
     var batchSlots: [String: Int] = [:]
     /// Last token per batch slot for batched decode.
     var batchTokens: [Int] = []
+    /// Lazy [B] Int32 tensor of the previous step's sampled tokens. When
+    /// non-nil and `pendingB == batchSlots.count`, the fully-batched decode
+    /// path uses it directly as input (skipping host-side rebuild) and
+    /// runs the new step's forward via `asyncEval` while the PRIOR step's
+    /// pending tokens block-and-pull. Pipelines GPU compute of step N+1
+    /// with the host pull of step N's tokens — mirrors Python mlx_lm
+    /// generate.py's `mx.async_eval(y); yield y_prev.item()` pattern.
+    var pendingSampledTokens: MLXArray?
+    var pendingSampledB: Int = 0
 
     // Perf tracking
     var prefillTokensPerSec: Double = 0
@@ -533,6 +542,44 @@ public func vsm_engine_decode_all(
            !engine.batchSlots.isEmpty
         {
             let B = engine.batchSlots.count
+            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
+            let allGreedy = sortedSlots.allSatisfy { (rid, _) in
+                (engine.sessions[rid]?.temperature ?? 0) == 0
+            }
+
+            // ASYNC-PIPELINED PATH — mirrors Python mlx_lm generate.py
+            // `mx.async_eval(y); yield prev.item()`. See Qwen2 path below
+            // for full notes. Critical for small-model wins (0.6B/4B).
+            if allGreedy,
+               let pending = engine.pendingSampledTokens,
+               engine.pendingSampledB == B
+            {
+                let inputBatch = pending.reshaped(B, 1)
+                let logitsBatch = qwenModel.fullyBatchedDecode(inputBatch, caches: bCaches)
+                let lastLogits = logitsBatch.reshaped(B, -1)
+                let newSampled = argMax(lastLogits, axis: -1).asType(.int32)
+                asyncEval(newSampled)
+                let prevArr = pending.asArray(Int32.self)
+
+                var count: Int32 = 0
+                for (rid, slotIdx) in sortedSlots {
+                    let returnToken = Int(prevArr[slotIdx])
+                    engine.batchTokens[slotIdx] = returnToken
+                    reqIds[Int(count)] = strdup(rid)
+                    outTokens[Int(count)] = Int32(returnToken)
+                    count += 1
+                }
+
+                engine.pendingSampledTokens = newSampled
+                engine.pendingSampledB = B
+
+                let elapsed = CFAbsoluteTimeGetCurrent() - start
+                engine.totalDecodeTokens += count
+                engine.totalDecodeTime += elapsed
+                return count
+            }
+
+            // SYNC PATH — first call, B changed, or non-greedy.
             let tokens = engine.batchTokens
 
             // Single batched forward: [B, 1] → [B, 1, vocab]
@@ -541,49 +588,49 @@ public func vsm_engine_decode_all(
 
             let lastLogits = logitsBatch[0..., -1, 0...]  // [B, vocab]
 
-            // Check if all requests use greedy sampling. Missing session is
-            // treated as greedy (default) — happens when init_batched freed
-            // the per-request session after copying its KV into batchedCaches,
-            // or when prefill_batched_uniform skipped session creation.
-            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
-            let allGreedy = sortedSlots.allSatisfy { (rid, _) in
-                (engine.sessions[rid]?.temperature ?? 0) == 0
-            }
-
             // Match TokenIterator.next() pattern: return previousY, advance to next
             // TODO: temperature sampling when !allGreedy (gap #7)
             let sampledTokens: MLXArray
             if allGreedy {
-                sampledTokens = argMax(lastLogits, axis: -1)
+                sampledTokens = argMax(lastLogits, axis: -1).asType(.int32)
             } else {
                 // Per-request temperature sampling
-                var tokenList = [Int]()
+                var tokenList = [Int32]()
                 for (rid, slotIdx) in sortedSlots {
                     let temp = engine.sessions[rid]?.temperature ?? 0
                     let logits = lastLogits[slotIdx]
                     if temp > 0 {
                         let scaled = logits / temp
                         let sampled = MLXRandom.categorical(scaled)
-                        tokenList.append(sampled.item(Int.self))
+                        tokenList.append(Int32(sampled.item(Int.self)))
                     } else {
-                        tokenList.append(argMax(logits, axis: -1).item(Int.self))
+                        tokenList.append(Int32(argMax(logits, axis: -1).item(Int.self)))
                     }
                 }
                 sampledTokens = MLXArray(tokenList)
             }
             eval(sampledTokens)
+            let sampledArr = sampledTokens.asArray(Int32.self)
 
             var count: Int32 = 0
             for (rid, slotIdx) in sortedSlots {
                 // Return the INPUT token (previousY pattern)
                 let returnToken = engine.batchTokens[slotIdx]
                 // Advance to the model's output for next step
-                let nextToken = sampledTokens[slotIdx].item(Int.self)
+                let nextToken = Int(sampledArr[slotIdx])
                 engine.batchTokens[slotIdx] = nextToken
 
                 reqIds[Int(count)] = strdup(rid)
                 outTokens[Int(count)] = Int32(returnToken)
                 count += 1
+            }
+
+            // Seed pending for next call's pipelined fast path.
+            if allGreedy {
+                engine.pendingSampledTokens = sampledTokens
+                engine.pendingSampledB = B
+            } else {
+                engine.pendingSampledTokens = nil
             }
 
             let elapsed = CFAbsoluteTimeGetCurrent() - start
@@ -653,6 +700,114 @@ public func vsm_engine_decode_all(
             return count
         }
 
+        // Fully batched path for Qwen2 (Qwen2.5-* dense) with BatchedKVCache.
+        // Closes the bulk of the remaining gap to Python parallel-subprocess
+        // throughput at 14B B=64 — single batched cache update + single
+        // batched SDPA per layer instead of B per-request loops.
+        if !hasTurboCache,
+           let qwen2Model = engine.model as? Qwen2Model,
+           let bCaches = engine.batchedCaches,
+           !engine.batchSlots.isEmpty
+        {
+            let B = engine.batchSlots.count
+            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
+            let allGreedy = sortedSlots.allSatisfy { (rid, _) in
+                (engine.sessions[rid]?.temperature ?? 0) == 0
+            }
+
+            // ASYNC-PIPELINED PATH (greedy + stable B + pending from prior step).
+            // Mirrors Python mlx_lm generate.py's `mx.async_eval(y); yield prev.item()`:
+            // step N's GPU compute runs concurrently with step N+1's CPU encode and
+            // the host pull of step N-1's tokens. Closes the small-model gap where
+            // GPU work is tiny and serialized eval+pull dominates.
+            if allGreedy,
+               let pending = engine.pendingSampledTokens,
+               engine.pendingSampledB == B
+            {
+                let inputBatch = pending.reshaped(B, 1)
+                let logitsBatch = qwen2Model.fullyBatchedDecode(inputBatch, caches: bCaches)
+                let lastLogits = logitsBatch.reshaped(B, -1)
+                let newSampled = argMax(lastLogits, axis: -1).asType(.int32)
+
+                // Kick GPU on step N+1 (and the pending step N tokens) — non-blocking.
+                asyncEval(newSampled)
+
+                // Pull the PRIOR step's tokens — these are the "returnToken" /
+                // previousY this call's contract returns. Block here while GPU
+                // is busy on step N+1 = free pipelining.
+                let prevArr = pending.asArray(Int32.self)
+
+                var count: Int32 = 0
+                for (rid, slotIdx) in sortedSlots {
+                    let returnToken = Int(prevArr[slotIdx])
+                    engine.batchTokens[slotIdx] = returnToken
+                    reqIds[Int(count)] = strdup(rid)
+                    outTokens[Int(count)] = Int32(returnToken)
+                    count += 1
+                }
+
+                engine.pendingSampledTokens = newSampled
+                engine.pendingSampledB = B
+
+                let elapsed = CFAbsoluteTimeGetCurrent() - start
+                engine.totalDecodeTokens += count
+                engine.totalDecodeTime += elapsed
+                return count
+            }
+
+            // SYNCHRONOUS PATH — first call (no pending) or B changed or
+            // non-greedy (temperature sampling needs Int values per slot).
+            let tokenInts32 = engine.batchTokens[0..<B].map { Int32($0) }
+            let inputBatch = MLXArray(tokenInts32).reshaped(B, 1)
+            let logitsBatch = qwen2Model.fullyBatchedDecode(inputBatch, caches: bCaches)
+            let lastLogits = logitsBatch.reshaped(B, -1)
+
+            let sampledTokens: MLXArray
+            if allGreedy {
+                sampledTokens = argMax(lastLogits, axis: -1).asType(.int32)
+            } else {
+                var tokenList = [Int32]()
+                for (rid, slotIdx) in sortedSlots {
+                    let temp = engine.sessions[rid]?.temperature ?? 0
+                    let logits = lastLogits[slotIdx]
+                    if temp > 0 {
+                        let scaled = logits / temp
+                        let sampled = MLXRandom.categorical(scaled)
+                        tokenList.append(Int32(sampled.item(Int.self)))
+                    } else {
+                        tokenList.append(Int32(argMax(logits, axis: -1).item(Int.self)))
+                    }
+                }
+                sampledTokens = MLXArray(tokenList)
+            }
+            eval(sampledTokens)
+            let sampledArr = sampledTokens.asArray(Int32.self)
+
+            var count: Int32 = 0
+            for (rid, slotIdx) in sortedSlots {
+                let returnToken = engine.batchTokens[slotIdx]
+                let nextToken = Int(sampledArr[slotIdx])
+                engine.batchTokens[slotIdx] = nextToken
+
+                reqIds[Int(count)] = strdup(rid)
+                outTokens[Int(count)] = Int32(returnToken)
+                count += 1
+            }
+
+            // Seed pending for next call's pipelined fast path. Greedy only.
+            if allGreedy {
+                engine.pendingSampledTokens = sampledTokens
+                engine.pendingSampledB = B
+            } else {
+                engine.pendingSampledTokens = nil
+            }
+
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            engine.totalDecodeTokens += count
+            engine.totalDecodeTime += elapsed
+            return count
+        }
+
         // Semi-batched path for Qwen3 with per-request caches.
         // Skipped when any per-request cache is TurboQuantKVCache — see the
         // top-of-function `hasTurboCache` comment. Falls through to the
@@ -674,6 +829,51 @@ public func vsm_engine_decode_all(
 
             let inputBatch = MLXArray(tokens).reshaped(tokens.count, 1)
             let logitsBatch = qwenModel.batchedDecode(inputBatch, caches: allCaches)
+
+            var count: Int32 = 0
+            for (idx, rid) in activeRids.enumerated() {
+                guard var session = engine.sessions[rid] else { continue }
+                let logits = logitsBatch[idx, -1, 0...]
+                let newToken = session.iterator.sampler.sample(logits: logits)
+                eval(newToken)
+                let tokenId = newToken.item(Int.self)
+                session.iterator.y = .init(tokens: newToken)
+                session.iterator.tokenCount += 1
+                engine.sessions[rid] = session
+                reqIds[Int(count)] = strdup(rid)
+                outTokens[Int(count)] = Int32(tokenId)
+                count += 1
+            }
+
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            engine.totalDecodeTokens += count
+            engine.totalDecodeTime += elapsed
+            return count
+        }
+
+        // Semi-batched path for Qwen2 family (Qwen2.5-* dense) with per-request
+        // caches. Mirrors the Qwen3 semi-batched path above — single batched
+        // model forward (projections + MLP shared across B), per-request RoPE
+        // + cache update + SDPA. Closes the 15× concurrent-decode gap at 14B
+        // where the sequential fallback below was looping per-stream and
+        // re-reading 7 GB of weights per request.
+        if !hasTurboCache, let qwen2Model = engine.model as? Qwen2Model {
+            var tokens: [Int] = []
+            var allCaches: [[KVCache]] = []
+            var activeRids: [String] = []
+
+            for rid in rids {
+                guard let session = engine.sessions[rid] else { continue }
+                let tokenId = session.iterator.y.tokens.item(Int.self)
+                tokens.append(tokenId)
+                allCaches.append(session.iterator.cache)
+                activeRids.append(rid)
+            }
+
+            guard !tokens.isEmpty else { return Int32(0) }
+
+            let inputBatch = MLXArray(tokens).reshaped(tokens.count, 1)
+            let logitsBatch = qwen2Model.batchedDecode(inputBatch, caches: allCaches)
 
             var count: Int32 = 0
             for (idx, rid) in activeRids.enumerated() {
@@ -827,6 +1027,10 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
         // so order is correctness-neutral. Models that match neither return -1.
         if engine.model is Qwen3Model {
             // Fall through to the existing Qwen3 init path below.
+        } else if engine.model is Qwen2Model {
+            // Same generic StandardKVCache-shaped init path works for Qwen2.
+            // Required so the Qwen2 fullyBatchedDecode fast path in
+            // vsm_engine_decode_all has populated `engine.batchedCaches`.
         } else if let hybridModel = engine.model as? any BatchedHybridLLM {
             return initBatchedHybrid(engine: engine, model: hybridModel, rids: rids)
         } else {
@@ -913,6 +1117,9 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
         eval(toEval)
 
         engine.batchedCaches = bCaches
+        // Pipelined fast path needs to be re-seeded after batch reinit.
+        engine.pendingSampledTokens = nil
+        engine.pendingSampledB = 0
         print("[vsm] Batched KV cache initialized: B=\(B), layers=\(numLayers), kvHeads=\(kvHeads), headDim=\(headDim)")
         return Int32(B)
     }
