@@ -17,7 +17,8 @@ let package = Package(
         // exact alpha tip (plus any local cherry-picks) we tested. Alpha keeps
         // moving; vllm-swift-stable does not until the next release.
         // For local dev: .package(path: "/Users/tom/dev/mlx-swift-lm")
-        .package(url: "https://github.com/TheTom/mlx-swift-lm.git", branch: "vllm-swift-stable"),
+        // .package(url: "https://github.com/TheTom/mlx-swift-lm.git", branch: "vllm-swift-stable"),
+        .package(path: "/Users/tom/dev/mlx-swift-lm"),
     ],
     targets: [
         .target(

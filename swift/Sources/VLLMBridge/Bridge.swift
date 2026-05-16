@@ -86,9 +86,26 @@ final class InferenceEngine {
     /// Mutually exclusive with `batchedCaches` for a given engine instance.
     var batchedHybridCaches: BatchedHybridCache?
     /// Maps request ID → batch slot index in batchedCaches / batchedHybridCaches.
-    var batchSlots: [String: Int] = [:]
+    var batchSlots: [String: Int] = [:] {
+        didSet { _sortedSlotsCache = nil }
+    }
+    /// Cached `batchSlots.sorted { $0.value < $1.value }` result. The fully-
+    /// batched decode hot path needs this every step to walk slots in
+    /// deterministic order; rebuilding it ~78 times/sec (Qwen3-0.6B B=64)
+    /// shows up in CPU profile because of the dictionary iter + sort
+    /// allocation. Invalidated automatically via `didSet` on `batchSlots`.
+    private var _sortedSlotsCache: [(String, Int)]?
     /// Last token per batch slot for batched decode.
     var batchTokens: [Int] = []
+
+    /// Slot-ordered `(reqId, slotIdx)` view of `batchSlots`. Cached across
+    /// decode steps and invalidated when `batchSlots` mutates.
+    func sortedSlots() -> [(String, Int)] {
+        if let cached = _sortedSlotsCache { return cached }
+        let sorted = batchSlots.sorted { $0.value < $1.value }
+        _sortedSlotsCache = sorted
+        return sorted
+    }
     /// Lazy [B] Int32 tensor of the previous step's sampled tokens. When
     /// non-nil and `pendingB == batchSlots.count`, the fully-batched decode
     /// path uses it directly as input (skipping host-side rebuild) and
@@ -711,7 +728,10 @@ public func vsm_engine_decode_all(
            !engine.batchSlots.isEmpty
         {
             let B = engine.batchSlots.count
-            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
+            // `sortedSlots` is cached on the engine and invalidated only when
+            // batchSlots mutates (add/remove req). Avoids rebuilding a
+            // [(String, Int)] array every decode step.
+            let sortedSlots = engine.sortedSlots()
             let allGreedy = sortedSlots.allSatisfy { (rid, _) in
                 (engine.sessions[rid]?.temperature ?? 0) == 0
             }
@@ -2326,8 +2346,12 @@ private func copyAttentionLayerIntoSlot(
 /// Copy a single per-request `SSMStateCache` layer (conv + recurrent state)
 /// into the matching `BatchedMambaCache` slot. Per-request SSMStateCache holds
 /// `state[0]` as `[1, kernel-1, convDim]` conv state and `state[1]` as
-/// `[1, Hv, Dv, Dk]` fp32 recurrent state — slice off the leading 1-dim
-/// before writing into the batched [maxBatch, ...] tensors.
+/// `[1, Hv, Dv, Dk]` recurrent state — slice off the leading 1-dim before
+/// writing into the batched [maxBatch, ...] tensors. The rec dtype must
+/// match `dst.recDtype` (asType-cast on mismatch); both GDN and Mamba2 keep
+/// state in fp32 (the GDN kernel writes fp32 via a separate `StT` template;
+/// the Mamba2 kernel — after the 2026-05-16 fix — writes via a parallel
+/// `U` template so fp32 state survives the recurrence).
 private func copyMambaLayerIntoSlot(
     src: SSMStateCache, dst: BatchedMambaCache, slot: Int
 ) -> Bool {
@@ -2339,9 +2363,9 @@ private func copyMambaLayerIntoSlot(
     }
     guard s.count >= 2 else { return false }
     let conv = s[0]   // [1, kernel-1, convDim]
-    let rec = s[1]    // [1, Hv, Dv, Dk] fp32
+    let rec = s[1]    // [1, Hv, Dv, Dk]
     dst.convState[slot, 0..., 0...] = conv[0]
-    let recCast = (rec.dtype == .float32) ? rec[0] : rec[0].asType(.float32)
+    let recCast = (rec.dtype == dst.recDtype) ? rec[0] : rec[0].asType(dst.recDtype)
     dst.recState[slot, 0..., 0..., 0...] = recCast
     dst.active = max(dst.active, slot + 1)
     return true
@@ -2382,9 +2406,9 @@ private func copyBatchedMambaLayer(
     }
     guard s.count >= 2 else { return false }
     let conv = s[0]    // [B, kernel-1, convDim]
-    let rec = s[1]     // [B, Hv, Dv, Dk] (fp32 after gatedDeltaUpdate)
+    let rec = s[1]     // [B, Hv, Dv, Dk] — caller dtype (fp32 GDN, bf16 Mamba2)
     dst.convState[..<B, 0..., 0...] = conv
-    let recCast = (rec.dtype == .float32) ? rec : rec.asType(.float32)
+    let recCast = (rec.dtype == dst.recDtype) ? rec : rec.asType(dst.recDtype)
     dst.recState[..<B, 0..., 0..., 0...] = recCast
     dst.active = max(dst.active, B)
     return true
@@ -2479,6 +2503,16 @@ private func initBatchedHybrid(
     eval(toEval)
 
     engine.batchedHybridCaches = hCaches
+    // Pipelined fast path needs to be re-seeded after batch reinit. Without
+    // clearing these, the async path in vsm_engine_decode_all's hybrid branch
+    // will fire on the FIRST decode call after init using stale pending
+    // tokens from a prior batch (the dense Qwen3 init path clears these at
+    // line 1584-1585; hybrid path was missing the same reset). This was the
+    // root cause of the B>1 cross-slot divergence bug at Qwen3.6-35B-A3B /
+    // Nemotron Cascade — and it also fires at B=1 when a prior batch left
+    // pendingSampledB==1 behind.
+    engine.pendingSampledTokens = nil
+    engine.pendingSampledB = 0
     print("[vsm] Batched hybrid cache initialized: B=\(B), layers=\(numLayers), maxBatch=\(maxBatch)")
     return Int32(B)
 }

@@ -1,24 +1,6 @@
 {
-  "originHash" : "fcb581df505a94ca4216ef2a9356f6bf764d45c48e3c53d1b94cb276f462b779",
+  "originHash" : "e3976cacf738c4747c90dc708bf4fc8a73ee2ea0712af485d133c4683fed50d7",
   "pins" : [
-    {
-      "identity" : "mlx-swift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/TheTom/mlx-swift.git",
-      "state" : {
-        "branch" : "vllm-swift-stable",
-        "revision" : "6859396e3c2b8b4e578e88b45c813c8d54e6d5e0"
-      }
-    },
-    {
-      "identity" : "mlx-swift-lm",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/TheTom/mlx-swift-lm.git",
-      "state" : {
-        "branch" : "vllm-swift-stable",
-        "revision" : "fd16163ab58304195a2ed1bd602e2f57e6b55f2f"
-      }
-    },
     {
       "identity" : "swift-numerics",
       "kind" : "remoteSourceControl",
