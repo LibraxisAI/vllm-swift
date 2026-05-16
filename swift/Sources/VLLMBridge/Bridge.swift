@@ -653,59 +653,99 @@ public func vsm_engine_decode_all(
             return count
         }
 
-        // Fully batched path for hybrid models (Qwen3Next, etc.) with
-        // BatchedHybridCache. Mirrors the Qwen3 path — same sampling /
-        // temperature plumbing, just dispatches through the protocol.
+        // Fully batched path for hybrid models (Qwen3.5/3.6 GDN, Qwen3Next,
+        // etc.) with BatchedHybridCache. Mirrors the Qwen3 / Qwen2 fully-
+        // batched paths above — async pipelining via pendingSampledTokens
+        // overlaps the host pull of step N with GPU compute of step N+1,
+        // and the batched argMax + asArray pull replaces per-slot
+        // .item(Int.self) sync barriers.
         if let hybridModel = engine.model as? any BatchedHybridLLM,
            let hCaches = engine.batchedHybridCaches,
            !engine.batchSlots.isEmpty
         {
             let B = engine.batchSlots.count
-            let tokens = engine.batchTokens
-
-            // Single batched forward: [B, 1] → [B, 1, vocab]
-            let inputBatch = MLXArray(tokens[0..<B]).reshaped(B, 1)
-            let logitsBatch = hybridModel.fullyBatchedDecode(inputBatch, caches: hCaches)
-
-            let lastLogits = logitsBatch[0..., -1, 0...]  // [B, vocab]
-
-            // Same greedy / per-request temperature split as the Qwen3 path.
             let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
             let allGreedy = sortedSlots.allSatisfy { (rid, _) in
                 (engine.sessions[rid]?.temperature ?? 0) == 0
             }
 
-            // TODO: per-request temperature sampling could share a helper
-            // with the Qwen3 path once we add it (gap #7).
+            // ASYNC-PIPELINED FAST PATH (greedy + stable B + pending from
+            // prior step). Same pattern as the Qwen2/Qwen3 paths above.
+            if allGreedy,
+               let pending = engine.pendingSampledTokens,
+               engine.pendingSampledB == B
+            {
+                let newSampled: MLXArray = MLX.Stream.withStream(engine.decodeStream) {
+                    let inputBatch = pending.reshaped(B, 1)
+                    let logitsBatch = hybridModel.fullyBatchedDecode(inputBatch, caches: hCaches)
+                    let lastLogits = logitsBatch.reshaped(B, -1)
+                    let s = argMax(lastLogits, axis: -1).asType(.int32)
+                    asyncEval(s)
+                    return s
+                }
+                let prevArr = pending.asArray(Int32.self)
+
+                var count: Int32 = 0
+                for (rid, slotIdx) in sortedSlots {
+                    let returnToken = Int(prevArr[slotIdx])
+                    engine.batchTokens[slotIdx] = returnToken
+                    reqIds[Int(count)] = strdup(rid)
+                    outTokens[Int(count)] = Int32(returnToken)
+                    count += 1
+                }
+
+                engine.pendingSampledTokens = newSampled
+                engine.pendingSampledB = B
+
+                let elapsed = CFAbsoluteTimeGetCurrent() - start
+                engine.totalDecodeTokens += count
+                engine.totalDecodeTime += elapsed
+                return count
+            }
+
+            // SYNC PATH — first call, B changed, or non-greedy.
+            let tokens = engine.batchTokens
+            let inputBatch = MLXArray(tokens[0..<B]).reshaped(B, 1)
+            let logitsBatch = hybridModel.fullyBatchedDecode(inputBatch, caches: hCaches)
+            let lastLogits = logitsBatch.reshaped(B, -1)
+
             let sampledTokens: MLXArray
             if allGreedy {
-                sampledTokens = argMax(lastLogits, axis: -1)
+                sampledTokens = argMax(lastLogits, axis: -1).asType(.int32)
             } else {
-                var tokenList = [Int]()
+                var tokenList = [Int32]()
                 for (rid, slotIdx) in sortedSlots {
                     let temp = engine.sessions[rid]?.temperature ?? 0
                     let logits = lastLogits[slotIdx]
                     if temp > 0 {
                         let scaled = logits / temp
                         let sampled = MLXRandom.categorical(scaled)
-                        tokenList.append(sampled.item(Int.self))
+                        tokenList.append(Int32(sampled.item(Int.self)))
                     } else {
-                        tokenList.append(argMax(logits, axis: -1).item(Int.self))
+                        tokenList.append(Int32(argMax(logits, axis: -1).item(Int.self)))
                     }
                 }
                 sampledTokens = MLXArray(tokenList)
             }
             eval(sampledTokens)
+            let sampledArr = sampledTokens.asArray(Int32.self)
 
             var count: Int32 = 0
             for (rid, slotIdx) in sortedSlots {
                 let returnToken = engine.batchTokens[slotIdx]
-                let nextToken = sampledTokens[slotIdx].item(Int.self)
+                let nextToken = Int(sampledArr[slotIdx])
                 engine.batchTokens[slotIdx] = nextToken
 
                 reqIds[Int(count)] = strdup(rid)
                 outTokens[Int(count)] = Int32(returnToken)
                 count += 1
+            }
+
+            if allGreedy {
+                engine.pendingSampledTokens = sampledTokens
+                engine.pendingSampledB = B
+            } else {
+                engine.pendingSampledTokens = nil
             }
 
             let elapsed = CFAbsoluteTimeGetCurrent() - start
