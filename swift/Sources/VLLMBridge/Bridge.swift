@@ -541,11 +541,16 @@ public func vsm_engine_decode_all(
         // stays bit-identical (no extra protocol cast in the inner loop).
         // Qwen3Model and BatchedHybridLLM are disjoint conformances —
         // ordering is correctness-neutral, only perf-motivated.
-        // Fully batched path for Qwen3 with BatchedKVCache
+        // Fully batched path for Qwen3 with BatchedKVCache.
+        // Gated on B > 1: at B=1 the BatchedKVCache pre-allocation
+        // ([maxBatch, kv_heads, max_seq, dim] per layer) is wasteful
+        // — single-request decode is faster through the per-request
+        // TokenIterator fallback at the bottom (same path Python
+        // mlx-lm uses for single-stream generate).
         if !hasTurboCache,
            let qwenModel = engine.model as? Qwen3Model,
            let bCaches = engine.batchedCaches,
-           !engine.batchSlots.isEmpty
+           engine.batchSlots.count > 1
         {
             let B = engine.batchSlots.count
             let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
@@ -716,7 +721,7 @@ public func vsm_engine_decode_all(
         if !hasTurboCache,
            let qwen2Model = engine.model as? Qwen2Model,
            let bCaches = engine.batchedCaches,
-           !engine.batchSlots.isEmpty
+           engine.batchSlots.count > 1
         {
             let B = engine.batchSlots.count
             let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
