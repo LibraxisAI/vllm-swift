@@ -1243,6 +1243,34 @@ public func vsm_engine_decode_all(
             )
         }
 
+        // Gemma4 (dense E2B/E4B/31B + MoE 26B-A4B)
+        // bCaches may alias donor caches for KV-shared layers — the model's
+        // fullyBatchedForward handles the donor routing internally based on
+        // its `previousKVs` map.
+        if !hasTurboCache,
+           let gemma4Model = engine.model as? Gemma4TextModel,
+           let bCaches = engine.batchedCaches,
+           !engine.batchSlots.isEmpty
+        {
+            let B = engine.batchSlots.count
+            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
+            let allGreedy = sortedSlots.allSatisfy { (rid, _) in
+                (engine.sessions[rid]?.temperature ?? 0) == 0
+            }
+            return runFullyBatchedDecode(
+                engine: engine, sortedSlots: sortedSlots, allGreedy: allGreedy, B: B,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input in gemma4Model.fullyBatchedDecode(input, caches: bCaches) }
+            )
+        }
+        if !hasTurboCache, let gemma4Model = engine.model as? Gemma4TextModel {
+            return runSemiBatchedDecode(
+                engine: engine, rids: rids,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input, caches in gemma4Model.batchedDecode(input, caches: caches) }
+            )
+        }
+
         // Fallback: sequential stepAsync/readToken for non-Qwen3 models.
         // Wrap in the engine's persistent decode stream — matches Python
         // mlx-lm's `with mx.stream(generation_stream):` (generate.py:401)
@@ -1389,9 +1417,12 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
             || engine.model is Phi3Model
             || engine.model is Mistral3TextModel
             || engine.model is Qwen3MoEModel
+            || engine.model is Gemma4TextModel
         {
             // Same generic StandardKVCache-shaped init path works for all of
             // these dense LLM families now that they expose fullyBatchedDecode.
+            // Gemma4 needs per-layer dims (sliding vs global differ); handled
+            // below via per-layer peek of cache shape.
             // Required so vsm_engine_decode_all's per-model fast paths get a
             // populated `engine.batchedCaches`.
         } else if let hybridModel = engine.model as? any BatchedHybridLLM {
@@ -1405,15 +1436,17 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
         let numLayers = firstSession.iterator.cache.count
         guard numLayers > 0 else { return Int32(0) }
 
-        // Determine KV heads and head dim from first cache
-        guard let firstCache = firstSession.iterator.cache[0] as? StandardKVCache,
-              let firstKeys = firstCache.peek()?.0 else { return Int32(0) }
-        let kvHeads = firstKeys.dim(1)
-        let headDim = firstKeys.dim(3)
-        // Size cache from longest actual prefill + decode margin. Pin to
-        // engine.maxKVSize when known so subsequent prefills can't force
-        // a re-grow (which on Metal stacks the old backing in the heap
-        // and shows up as a GB/turn unified-mem leak).
+        // Determine per-layer KV heads and head dim from each layer's cache.
+        // Most models have uniform dims across layers, but Gemma4 has
+        // sliding (head_dim=256) vs global (head_dim=512) and may have
+        // KV-shared layers whose cache was never populated (peek() returns nil).
+        // For those, we'll point at the donor's cache instead of allocating.
+        // KV sharing donor map: previousKVs[i]==i → own cache; ≠i → donor index.
+        let gemma4Model = engine.model as? Gemma4TextModel
+        let previousKVs: [Int] = gemma4Model?.previousKVs ?? Array(0..<numLayers)
+        let modelKVDims: [(kvHeads: Int, headDim: Int)]? = gemma4Model?.batchedKVDims()
+
+        // Determine maxSeq + maxBatch (shared across layers).
         let maxPrefillOffset = rids.compactMap {
             engine.sessions[$0]?.iterator.cache.first?.offset
         }.max() ?? 0
@@ -1421,17 +1454,47 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
         let maxSeq = engine.maxKVSize > 0
             ? engine.maxKVSize
             : max(2048, maxPrefillOffset + decodeMargin)
-        // Respect scheduler max_num_seqs instead of forcing 64 slots.
-        // 64-slot pre-alloc on max_num_seqs=1 wastes (64-1)× per-layer
-        // KV bytes — at maxSeq=64K that's ~60 GB unused-but-allocated.
         let maxBatch = max(B, engine.maxConcurrentRequests)
 
-        var bCaches = [BatchedKVCache]()
-        for _ in 0..<numLayers {
-            bCaches.append(BatchedKVCache(
+        // Resolve a sample peek for dtype (try any layer that has populated K/V).
+        var sampleDtype: DType = .bfloat16
+        for layerIdx in 0..<numLayers {
+            if let c = firstSession.iterator.cache[layerIdx] as? StandardKVCache,
+               let (k, _) = c.peek()
+            {
+                sampleDtype = k.dtype
+                break
+            }
+        }
+
+        // Per-layer dims: prefer model-provided dims (Gemma4); else read from
+        // layer 0's cache and use that uniformly (legacy behavior).
+        let perLayerDims: [(kvHeads: Int, headDim: Int)]
+        if let modelKVDims, modelKVDims.count == numLayers {
+            perLayerDims = modelKVDims
+        } else {
+            guard let firstCache = firstSession.iterator.cache[0] as? StandardKVCache,
+                  let firstKeys = firstCache.peek()?.0 else { return Int32(0) }
+            let kvHeads = firstKeys.dim(1)
+            let headDim = firstKeys.dim(3)
+            perLayerDims = Array(repeating: (kvHeads, headDim), count: numLayers)
+        }
+
+        // Allocate batched caches. For KV-shared layers (previousKVs[i]!=i),
+        // alias the donor's BatchedKVCache rather than allocating a separate
+        // one — shared layers read K/V from the donor's cache at decode time.
+        var bCaches = [BatchedKVCache?](repeating: nil, count: numLayers)
+        for layerIdx in 0..<numLayers {
+            let donor = previousKVs[layerIdx]
+            if donor != layerIdx, let donorCache = bCaches[donor] {
+                bCaches[layerIdx] = donorCache
+                continue
+            }
+            let (kvHeads, headDim) = perLayerDims[layerIdx]
+            bCaches[layerIdx] = BatchedKVCache(
                 maxBatch: maxBatch, kvHeads: kvHeads, headDim: headDim,
-                maxSeq: maxSeq, dtype: firstKeys.dtype
-            ))
+                maxSeq: maxSeq, dtype: sampleDtype
+            )
         }
 
         // Copy per-request cache into batched cache, then free the session.
@@ -1441,6 +1504,18 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
         engine.batchSlots.removeAll()
         engine.batchTokens = Array(repeating: 0, count: maxBatch)
 
+        // Track unique caches (de-duped via object identity) for eval batches.
+        // KV-shared layers alias the donor cache; we mustn't double-eval.
+        var uniqueCaches: [BatchedKVCache] = []
+        var seenCacheIds = Set<ObjectIdentifier>()
+        for c in bCaches.compactMap({ $0 }) {
+            let id = ObjectIdentifier(c)
+            if !seenCacheIds.contains(id) {
+                seenCacheIds.insert(id)
+                uniqueCaches.append(c)
+            }
+        }
+
         for (slotIdx, rid) in rids.enumerated() {
             guard let session = engine.sessions[rid] else { continue }
             engine.batchSlots[rid] = slotIdx
@@ -1449,21 +1524,23 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
             engine.batchTokens[slotIdx] = tokenId
 
             for layerIdx in 0..<numLayers {
+                // Skip KV-shared layers — their per-req cache is empty;
+                // the donor copy below populates the shared batched cache.
+                if previousKVs[layerIdx] != layerIdx { continue }
                 let cache = session.iterator.cache[layerIdx]
+                guard let bCache = bCaches[layerIdx] else { continue }
                 let offset = cache.offset
                 if let (k, v) = cache.peek() {
-                    bCaches[layerIdx].keys[slotIdx, 0..., ..<offset, 0...] = k[0]
-                    bCaches[layerIdx].values[slotIdx, 0..., ..<offset, 0...] = v[0]
+                    bCache.keys[slotIdx, 0..., ..<offset, 0...] = k[0]
+                    bCache.values[slotIdx, 0..., ..<offset, 0...] = v[0]
                 }
-                bCaches[layerIdx].offsets[slotIdx] = offset
-                bCaches[layerIdx].active = max(bCaches[layerIdx].active, slotIdx + 1)
+                bCache.offsets[slotIdx] = offset
+                bCache.active = max(bCache.active, slotIdx + 1)
             }
 
             // Materialize this slot's writes, then drop the per-req cache.
-            // Otherwise per-req K/V accumulate alongside the growing batched
-            // cache, peaking at 2× total KV memory.
             var slotEval = [MLXArray]()
-            for c in bCaches {
+            for c in uniqueCaches {
                 slotEval.append(c.keys)
                 slotEval.append(c.values)
             }
@@ -1473,17 +1550,23 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
 
         // Materialize the final cache state.
         var toEval = [MLXArray]()
-        for c in bCaches {
+        for c in uniqueCaches {
             toEval.append(c.keys)
             toEval.append(c.values)
         }
         eval(toEval)
 
-        engine.batchedCaches = bCaches
+        // Sync `active` across aliased shared layers (donor's bumps must
+        // propagate to the shared slot's reference — but since they alias the
+        // same object, this is automatic).
+        let finalCaches: [BatchedKVCache] = bCaches.compactMap { $0 }
+        engine.batchedCaches = finalCaches
         // Pipelined fast path needs to be re-seeded after batch reinit.
         engine.pendingSampledTokens = nil
         engine.pendingSampledB = 0
-        print("[vsm] Batched KV cache initialized: B=\(B), layers=\(numLayers), kvHeads=\(kvHeads), headDim=\(headDim)")
+        let dimsDesc = Set(perLayerDims.map { "\($0.kvHeads)x\($0.headDim)" })
+            .sorted().joined(separator: ",")
+        print("[vsm] Batched KV cache initialized: B=\(B), layers=\(numLayers), dims=\(dimsDesc), uniqueCaches=\(uniqueCaches.count)")
         return Int32(B)
     }
 }
