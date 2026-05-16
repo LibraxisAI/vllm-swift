@@ -98,6 +98,12 @@ final class InferenceEngine {
     /// generate.py's `mx.async_eval(y); yield y_prev.item()` pattern.
     var pendingSampledTokens: MLXArray?
     var pendingSampledB: Int = 0
+    /// Persistent GPU stream for decode, mirrors Python mlx-lm's
+    /// `generation_stream = mx.ThreadLocalStream(mx.default_device())`.
+    /// Wrap the model forward in `Stream.withStream(decodeStream)` to
+    /// keep all decode dispatches on the same queue + skip the @TaskLocal
+    /// default-stream lookup that's documented at 15ms/forward overhead.
+    lazy var decodeStream: MLX.Stream = MLX.Stream(Device.defaultDevice())
 
     // Perf tracking
     var prefillTokensPerSec: Double = 0
@@ -554,11 +560,14 @@ public func vsm_engine_decode_all(
                let pending = engine.pendingSampledTokens,
                engine.pendingSampledB == B
             {
-                let inputBatch = pending.reshaped(B, 1)
-                let logitsBatch = qwenModel.fullyBatchedDecode(inputBatch, caches: bCaches)
-                let lastLogits = logitsBatch.reshaped(B, -1)
-                let newSampled = argMax(lastLogits, axis: -1).asType(.int32)
-                asyncEval(newSampled)
+                let newSampled: MLXArray = MLX.Stream.withStream(engine.decodeStream) {
+                    let inputBatch = pending.reshaped(B, 1)
+                    let logitsBatch = qwenModel.fullyBatchedDecode(inputBatch, caches: bCaches)
+                    let lastLogits = logitsBatch.reshaped(B, -1)
+                    let s = argMax(lastLogits, axis: -1).asType(.int32)
+                    asyncEval(s)
+                    return s
+                }
                 let prevArr = pending.asArray(Int32.self)
 
                 var count: Int32 = 0
@@ -724,17 +733,19 @@ public func vsm_engine_decode_all(
                let pending = engine.pendingSampledTokens,
                engine.pendingSampledB == B
             {
-                let inputBatch = pending.reshaped(B, 1)
-                let logitsBatch = qwen2Model.fullyBatchedDecode(inputBatch, caches: bCaches)
-                let lastLogits = logitsBatch.reshaped(B, -1)
-                let newSampled = argMax(lastLogits, axis: -1).asType(.int32)
+                let newSampled: MLXArray = MLX.Stream.withStream(engine.decodeStream) {
+                    let inputBatch = pending.reshaped(B, 1)
+                    let logitsBatch = qwen2Model.fullyBatchedDecode(inputBatch, caches: bCaches)
+                    let lastLogits = logitsBatch.reshaped(B, -1)
+                    let s = argMax(lastLogits, axis: -1).asType(.int32)
+                    asyncEval(s)
+                    return s
+                }
 
-                // Kick GPU on step N+1 (and the pending step N tokens) — non-blocking.
-                asyncEval(newSampled)
-
-                // Pull the PRIOR step's tokens — these are the "returnToken" /
-                // previousY this call's contract returns. Block here while GPU
-                // is busy on step N+1 = free pipelining.
+                // Pull the PRIOR step's tokens while GPU is busy on the new
+                // step we just kicked. The pending tensor was created in a
+                // prior call (also on decodeStream) and finalized by this
+                // call's asyncEval kick — block-pull overlaps with that work.
                 let prevArr = pending.asArray(Int32.self)
 
                 var count: Int32 = 0
