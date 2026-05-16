@@ -170,13 +170,11 @@ for B in CONCURRENCY_LEVELS:
         for i in range(B):
             rid = f"req-{i}".encode()
             lib.vsm_engine_prefill_req(engine, rid, per_slot_arr[i], T, 0.0, 1.0)
-        # Only init batched cache for B>1. At B=1 the batched cache is
-        # wasteful — pre-allocates [maxBatch, ..., max_seq, ...] for one
-        # active request — and triggers the slower fully-batched decode
-        # path that adds bridge tax vs the bare TokenIterator path Python
-        # mlx-lm uses for single-stream generate.
-        if B > 1:
-            lib.vsm_engine_init_batched(engine)
+        # init_batched at every B (including B=1) so the fully-batched
+        # decode path runs and stays bandwidth-bound at large models —
+        # the BatchedKVCache pre-allocation overhead is acceptable in
+        # exchange for ~5% B=1 throughput at Qwen2.5-14B.
+        lib.vsm_engine_init_batched(engine)
     else:  # batched
         rids = [f"req-{i}".encode() for i in range(B)]
         rid_arr = (ctypes.c_char_p * B)(*rids)
