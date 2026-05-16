@@ -478,6 +478,162 @@ public func vsm_engine_decode_step_req(
     }
 }
 
+/// Generic fully-batched decode runner shared across the Qwen2/Llama/Gemma3/
+/// Phi3/Mistral3/Qwen3MoE fast paths. Each per-model block above the legacy
+/// sequential fallback in `vsm_engine_decode_all` casts the model to its
+/// concrete type, then delegates here passing a `decodeFn` closure that
+/// invokes the typed `fullyBatchedDecode(_:caches:)` method.
+///
+/// Returns the number of tokens emitted (matching the count pattern of the
+/// per-model blocks). All state mutation on `engine` mirrors the Qwen2
+/// fully-batched path exactly, including pendingSampledTokens seeding.
+private func runFullyBatchedDecode(
+    engine: InferenceEngine,
+    sortedSlots: [(key: String, value: Int)],
+    allGreedy: Bool,
+    B: Int,
+    reqIds: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>,
+    outTokens: UnsafeMutablePointer<Int32>,
+    decodeFn: (MLXArray) -> MLXArray
+) -> Int32 {
+    let start = CFAbsoluteTimeGetCurrent()
+
+    // ASYNC-PIPELINED PATH (greedy + stable B + pending from prior step).
+    // Mirrors Python mlx_lm generate.py's `mx.async_eval(y); yield prev.item()`.
+    if allGreedy,
+       let pending = engine.pendingSampledTokens,
+       engine.pendingSampledB == B
+    {
+        let newSampled: MLXArray = MLX.Stream.withStream(engine.decodeStream) {
+            let inputBatch = pending.reshaped(B, 1)
+            let logitsBatch = decodeFn(inputBatch)
+            let lastLogits = logitsBatch.reshaped(B, -1)
+            let s = argMax(lastLogits, axis: -1).asType(.int32)
+            asyncEval(s)
+            return s
+        }
+        let prevArr = pending.asArray(Int32.self)
+
+        var count: Int32 = 0
+        for (rid, slotIdx) in sortedSlots {
+            let returnToken = Int(prevArr[slotIdx])
+            engine.batchTokens[slotIdx] = returnToken
+            reqIds[Int(count)] = strdup(rid)
+            outTokens[Int(count)] = Int32(returnToken)
+            count += 1
+        }
+
+        engine.pendingSampledTokens = newSampled
+        engine.pendingSampledB = B
+
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        engine.totalDecodeTokens += count
+        engine.totalDecodeTime += elapsed
+        return count
+    }
+
+    // SYNCHRONOUS PATH — first call (no pending) or B changed or non-greedy.
+    let tokenInts32 = engine.batchTokens[0..<B].map { Int32($0) }
+    let inputBatch = MLXArray(tokenInts32).reshaped(B, 1)
+    let logitsBatch = decodeFn(inputBatch)
+    let lastLogits = logitsBatch.reshaped(B, -1)
+
+    let sampledTokens: MLXArray
+    if allGreedy {
+        sampledTokens = argMax(lastLogits, axis: -1).asType(.int32)
+    } else {
+        var tokenList = [Int32]()
+        for (rid, slotIdx) in sortedSlots {
+            let temp = engine.sessions[rid]?.temperature ?? 0
+            let logits = lastLogits[slotIdx]
+            if temp > 0 {
+                let scaled = logits / temp
+                let sampled = MLXRandom.categorical(scaled)
+                tokenList.append(Int32(sampled.item(Int.self)))
+            } else {
+                tokenList.append(Int32(argMax(logits, axis: -1).item(Int.self)))
+            }
+        }
+        sampledTokens = MLXArray(tokenList)
+    }
+    eval(sampledTokens)
+    let sampledArr = sampledTokens.asArray(Int32.self)
+
+    var count: Int32 = 0
+    for (rid, slotIdx) in sortedSlots {
+        let returnToken = engine.batchTokens[slotIdx]
+        let nextToken = Int(sampledArr[slotIdx])
+        engine.batchTokens[slotIdx] = nextToken
+
+        reqIds[Int(count)] = strdup(rid)
+        outTokens[Int(count)] = Int32(returnToken)
+        count += 1
+    }
+
+    if allGreedy {
+        engine.pendingSampledTokens = sampledTokens
+        engine.pendingSampledB = B
+    } else {
+        engine.pendingSampledTokens = nil
+    }
+
+    let elapsed = CFAbsoluteTimeGetCurrent() - start
+    engine.totalDecodeTokens += count
+    engine.totalDecodeTime += elapsed
+    return count
+}
+
+/// Semi-batched decode runner (per-request caches, no BatchedKVCache).
+/// Mirrors the Qwen3/Qwen2 semi-batched blocks at the bottom of
+/// `vsm_engine_decode_all`. Used as the fallback when init_batched wasn't
+/// called for the new model families.
+private func runSemiBatchedDecode(
+    engine: InferenceEngine,
+    rids: [String],
+    reqIds: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>,
+    outTokens: UnsafeMutablePointer<Int32>,
+    decodeFn: (MLXArray, [[KVCache]]) -> MLXArray
+) -> Int32 {
+    let start = CFAbsoluteTimeGetCurrent()
+
+    var tokens: [Int] = []
+    var allCaches: [[KVCache]] = []
+    var activeRids: [String] = []
+
+    for rid in rids {
+        guard let session = engine.sessions[rid] else { continue }
+        let tokenId = session.iterator.y.tokens.item(Int.self)
+        tokens.append(tokenId)
+        allCaches.append(session.iterator.cache)
+        activeRids.append(rid)
+    }
+
+    guard !tokens.isEmpty else { return Int32(0) }
+
+    let inputBatch = MLXArray(tokens).reshaped(tokens.count, 1)
+    let logitsBatch = decodeFn(inputBatch, allCaches)
+
+    var count: Int32 = 0
+    for (idx, rid) in activeRids.enumerated() {
+        guard var session = engine.sessions[rid] else { continue }
+        let logits = logitsBatch[idx, -1, 0...]
+        let newToken = session.iterator.sampler.sample(logits: logits)
+        eval(newToken)
+        let tokenId = newToken.item(Int.self)
+        session.iterator.y = .init(tokens: newToken)
+        session.iterator.tokenCount += 1
+        engine.sessions[rid] = session
+        reqIds[Int(count)] = strdup(rid)
+        outTokens[Int(count)] = Int32(tokenId)
+        count += 1
+    }
+
+    let elapsed = CFAbsoluteTimeGetCurrent() - start
+    engine.totalDecodeTokens += count
+    engine.totalDecodeTime += elapsed
+    return count
+}
+
 /// Batch decode: all active sessions in one batched forward pass.
 /// Projections + MLP batched across B requests, attention per-request.
 @_cdecl("vsm_engine_decode_all")
@@ -954,6 +1110,139 @@ public func vsm_engine_decode_all(
             return count
         }
 
+        // F-83 batched-decode expansion: per-model fully-batched and
+        // semi-batched fast paths for Llama, Gemma3, Phi3, Mistral3, and
+        // Qwen3MoE. Each mirrors the Qwen2 block above exactly via the
+        // shared helpers `runFullyBatchedDecode` / `runSemiBatchedDecode`.
+        // Without these, B>1 decode for these families falls through to the
+        // sequential stepAsync TokenIterator path at the bottom (10-12×
+        // slower than Python mlx_lm at B=64 because weights re-load per req).
+
+        // Llama (Llama-3.x dense)
+        if !hasTurboCache,
+           let llamaModel = engine.model as? LlamaModel,
+           let bCaches = engine.batchedCaches,
+           !engine.batchSlots.isEmpty
+        {
+            let B = engine.batchSlots.count
+            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
+            let allGreedy = sortedSlots.allSatisfy { (rid, _) in
+                (engine.sessions[rid]?.temperature ?? 0) == 0
+            }
+            return runFullyBatchedDecode(
+                engine: engine, sortedSlots: sortedSlots, allGreedy: allGreedy, B: B,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input in llamaModel.fullyBatchedDecode(input, caches: bCaches) }
+            )
+        }
+        if !hasTurboCache, let llamaModel = engine.model as? LlamaModel {
+            return runSemiBatchedDecode(
+                engine: engine, rids: rids,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input, caches in llamaModel.batchedDecode(input, caches: caches) }
+            )
+        }
+
+        // Gemma3 (text)
+        if !hasTurboCache,
+           let gemmaModel = engine.model as? Gemma3TextModel,
+           let bCaches = engine.batchedCaches,
+           !engine.batchSlots.isEmpty
+        {
+            let B = engine.batchSlots.count
+            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
+            let allGreedy = sortedSlots.allSatisfy { (rid, _) in
+                (engine.sessions[rid]?.temperature ?? 0) == 0
+            }
+            return runFullyBatchedDecode(
+                engine: engine, sortedSlots: sortedSlots, allGreedy: allGreedy, B: B,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input in gemmaModel.fullyBatchedDecode(input, caches: bCaches) }
+            )
+        }
+        if !hasTurboCache, let gemmaModel = engine.model as? Gemma3TextModel {
+            return runSemiBatchedDecode(
+                engine: engine, rids: rids,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input, caches in gemmaModel.batchedDecode(input, caches: caches) }
+            )
+        }
+
+        // Phi3
+        if !hasTurboCache,
+           let phi3Model = engine.model as? Phi3Model,
+           let bCaches = engine.batchedCaches,
+           !engine.batchSlots.isEmpty
+        {
+            let B = engine.batchSlots.count
+            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
+            let allGreedy = sortedSlots.allSatisfy { (rid, _) in
+                (engine.sessions[rid]?.temperature ?? 0) == 0
+            }
+            return runFullyBatchedDecode(
+                engine: engine, sortedSlots: sortedSlots, allGreedy: allGreedy, B: B,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input in phi3Model.fullyBatchedDecode(input, caches: bCaches) }
+            )
+        }
+        if !hasTurboCache, let phi3Model = engine.model as? Phi3Model {
+            return runSemiBatchedDecode(
+                engine: engine, rids: rids,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input, caches in phi3Model.batchedDecode(input, caches: caches) }
+            )
+        }
+
+        // Mistral3 / Ministral3
+        if !hasTurboCache,
+           let mistralModel = engine.model as? Mistral3TextModel,
+           let bCaches = engine.batchedCaches,
+           !engine.batchSlots.isEmpty
+        {
+            let B = engine.batchSlots.count
+            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
+            let allGreedy = sortedSlots.allSatisfy { (rid, _) in
+                (engine.sessions[rid]?.temperature ?? 0) == 0
+            }
+            return runFullyBatchedDecode(
+                engine: engine, sortedSlots: sortedSlots, allGreedy: allGreedy, B: B,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input in mistralModel.fullyBatchedDecode(input, caches: bCaches) }
+            )
+        }
+        if !hasTurboCache, let mistralModel = engine.model as? Mistral3TextModel {
+            return runSemiBatchedDecode(
+                engine: engine, rids: rids,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input, caches in mistralModel.batchedDecode(input, caches: caches) }
+            )
+        }
+
+        // Qwen3MoE (Qwen3-Coder-30B-A3B etc)
+        if !hasTurboCache,
+           let qwen3MoEModel = engine.model as? Qwen3MoEModel,
+           let bCaches = engine.batchedCaches,
+           !engine.batchSlots.isEmpty
+        {
+            let B = engine.batchSlots.count
+            let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
+            let allGreedy = sortedSlots.allSatisfy { (rid, _) in
+                (engine.sessions[rid]?.temperature ?? 0) == 0
+            }
+            return runFullyBatchedDecode(
+                engine: engine, sortedSlots: sortedSlots, allGreedy: allGreedy, B: B,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input in qwen3MoEModel.fullyBatchedDecode(input, caches: bCaches) }
+            )
+        }
+        if !hasTurboCache, let qwen3MoEModel = engine.model as? Qwen3MoEModel {
+            return runSemiBatchedDecode(
+                engine: engine, rids: rids,
+                reqIds: reqIds, outTokens: outTokens,
+                decodeFn: { input, caches in qwen3MoEModel.batchedDecode(input, caches: caches) }
+            )
+        }
+
         // Fallback: sequential stepAsync/readToken for non-Qwen3 models.
         // Wrap in the engine's persistent decode stream — matches Python
         // mlx-lm's `with mx.stream(generation_stream):` (generate.py:401)
@@ -1095,6 +1384,16 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
             // Same generic StandardKVCache-shaped init path works for Qwen2.
             // Required so the Qwen2 fullyBatchedDecode fast path in
             // vsm_engine_decode_all has populated `engine.batchedCaches`.
+        } else if engine.model is LlamaModel
+            || engine.model is Gemma3TextModel
+            || engine.model is Phi3Model
+            || engine.model is Mistral3TextModel
+            || engine.model is Qwen3MoEModel
+        {
+            // Same generic StandardKVCache-shaped init path works for all of
+            // these dense LLM families now that they expose fullyBatchedDecode.
+            // Required so vsm_engine_decode_all's per-model fast paths get a
+            // populated `engine.batchedCaches`.
         } else if let hybridModel = engine.model as? any BatchedHybridLLM {
             return initBatchedHybrid(engine: engine, model: hybridModel, rids: rids)
         } else {
