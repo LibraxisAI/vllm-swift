@@ -58,6 +58,83 @@ struct RequestSession {
     var topP: Float
 }
 
+// MARK: - Sparse-capable model protocol
+
+/// Locally-scoped protocol abstracting the F-83 sparse decode + F-85
+/// batched sparse decode entry points. Conformed to by Qwen2Model,
+/// Qwen3Model, Qwen3MoEModel, LlamaModel, Gemma4TextModel,
+/// Mistral3TextModel, and Phi3Model so the sparse paths below don't have
+/// to special-case each concrete class. Lives in Bridge.swift only — not
+/// exported through MLXLMCommon because each model's `raContexts:`
+/// overload is already public; the protocol just lets us call them
+/// generically.
+///
+/// Caveman: one interface — many concrete models. Bridge speak to interface,
+/// don't care which family.
+protocol BatchedSparseLLM: AnyObject {
+    /// Sidecar retrieval-attention forward. `raContexts` parallels `cache`;
+    /// nil-entries are dense-band layers.
+    func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?,
+        raContexts: [RetrievalAttentionContext?]?
+    ) -> MLXArray
+
+    /// F-85 batched sparse decode. Inputs `[B, 1]`; logits `[B, 1, vocab]`.
+    func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+    ) -> MLXArray
+
+    /// Number of layers — same value `kvHeads.count` returns on the
+    /// concrete models (one entry per layer).
+    var kvHeads: [Int] { get }
+
+    /// Prefill chunk size — `LanguageModel.defaultPrefillStepSize`.
+    var defaultPrefillStepSize: Int { get }
+}
+
+extension Qwen2Model: BatchedSparseLLM {}
+extension Qwen3Model: BatchedSparseLLM {}
+extension Qwen3MoEModel: BatchedSparseLLM {}
+extension LlamaModel: BatchedSparseLLM {}
+extension Gemma3TextModel: BatchedSparseLLM {}
+extension Gemma4TextModel: BatchedSparseLLM {}
+extension Mistral3TextModel: BatchedSparseLLM {}
+extension Phi3Model: BatchedSparseLLM {}
+
+// F-85 hybrid sparse — Qwen35 (dense + Qwen3.6 MoE share Qwen35TextModel)
+// and NemotronH conform to BatchedHybridSparseLLM in mlx-swift-lm.
+// Bridge dispatches via `engine.model as? any BatchedHybridSparseLLM`.
+
+/// Per-request session for the F-83 sparse decode (RetrievalAttention)
+/// path. Lives alongside `RequestSession` (regular dense path) — they
+/// are mutually exclusive per request. The sparse path bypasses
+/// `TokenIterator` because TokenIterator's `model(...)` invocation goes
+/// through the dense-only `callAsFunction(_:cache:)` overload, with no
+/// way to thread the `raContexts:` side-channel through it.
+///
+/// Activation: `VSM_SPARSE=1` env var at `vsm_engine_create` time. Only
+/// engages for `Qwen2Model` (the F-83 north-star validated model). All
+/// other models fall through to the dense path even when the env var is
+/// set.
+///
+/// Memory: same as dense — per-layer `StandardKVCache` storing the full
+/// post-RoPE K/V. The sparse win is in the per-step SDPA shape (gathers
+/// ~2k positions of the cache instead of the full T at 128K), not in
+/// cache storage.
+struct SparseSession {
+    /// Per-layer KV cache; identical to what TokenIterator would build
+    /// in the dense default path. Sparse decode gathers from this.
+    var cache: [KVCache]
+    /// Per-layer `RetrievalAttentionContext?`. nil entries mark
+    /// dense-band layers (first-N + last-N). `prefillUpdate` is invoked
+    /// automatically by `retrievalAttentionStep` on prefill chunks.
+    var raContexts: [RetrievalAttentionContext?]
+    /// Last sampled token to feed into the next decode step.
+    var nextToken: Int32
+    var temperature: Float
+    var topP: Float
+}
+
 /// Holds model + all active request sessions.
 final class InferenceEngine {
     let model: any LanguageModel
@@ -67,6 +144,20 @@ final class InferenceEngine {
 
     /// Active sessions keyed by request ID (supports concurrent requests)
     var sessions: [String: RequestSession] = [:]
+    /// F-83 RetrievalAttention sparse-decode sessions. Mutually exclusive
+    /// per request with `sessions` — when `sparseEnabled` is on and the
+    /// model is Qwen2, prefill+decode go here instead.
+    var sparseSessions: [String: SparseSession] = [:]
+    /// When true, `vsm_engine_prefill_req` builds a `SparseSession` and
+    /// drives prefill+decode through the F-83 sparse path. Set from
+    /// `VSM_SPARSE=1` at engine create. Only honored for Qwen2Model.
+    var sparseEnabled: Bool = false
+    /// RoPE base parsed from the model's config.json at engine-create
+    /// time. Used to construct each request's `RetrievalAttentionContext`
+    /// so the selector index's trig features stay aligned with the
+    /// model's positional encoding. Defaults to 10_000 if unparseable;
+    /// Qwen2.5-14B-Instruct-1M reports 10_000_000.
+    var ropeBase: Float = 10_000
     var generateParams: GenerateParameters
 
     /// Cap on concurrent batched-decode slots. Drives BatchedKVCache
@@ -115,6 +206,18 @@ final class InferenceEngine {
     /// generate.py's `mx.async_eval(y); yield y_prev.item()` pattern.
     var pendingSampledTokens: MLXArray?
     var pendingSampledB: Int = 0
+
+    /// F-85 — shared per-layer batched-sparse caches. Populated on the
+    /// first vsm_engine_decode_all call when VSM_SPARSE_BATCHED=1 and
+    /// at least 2 sparse sessions exist. Subsequent decode steps reuse
+    /// these for one batched forward per token.
+    var batchedSparseCaches: [BatchedRetrievalAttentionKVCache]?
+    /// Ordered list of (reqId, slotIdx) for the batched-sparse path,
+    /// matching the slot layout in batchedSparseCaches[*].inner.
+    var batchedSparseSlots: [(String, Int)] = []
+    /// Per-slot last sampled token for the batched-sparse path.
+    var batchedSparseTokens: [Int32] = []
+
     /// Persistent GPU stream for decode, mirrors Python mlx-lm's
     /// `generation_stream = mx.ThreadLocalStream(mx.default_device())`.
     /// Wrap the model forward in `Stream.withStream(decodeStream)` to
@@ -180,6 +283,16 @@ public func vsm_engine_create(
 ) -> UnsafeMutableRawPointer? {
     guard let modelPath else { return nil }
     let modelId = String(cString: modelPath)
+
+    // F-85 v3.2 — set MLX_SDPA_BLOCKS=128 at engine-create time before
+    // MLX kernels start compiling PSOs. awni's PR #3023 picks blocks=256
+    // at our N range on M5 Max devc='s', tuned for _nomask. Our F-73
+    // sparse mask=.array path uses _floatmask kernel which cliffs at 256.
+    // 128 wins both paths. Must be multiple of 32 (MLX pass-2 modulo bug).
+    // Honor user override.
+    if ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"] == nil {
+        setenv("MLX_SDPA_BLOCKS", "128", 1)
+    }
 
     // Build generation parameters
     var params = GenerateParameters()
@@ -269,6 +382,45 @@ public func vsm_engine_create(
     engine.maxKVSize = (maxKVSize > 0) ? Int(maxKVSize) : 0
     print("[vsm] Engine create: maxNumSeqs=\(engine.maxConcurrentRequests) "
           + "maxKVSize=\(engine.maxKVSize)")
+
+    // F-83 sparse decode activation. Two equivalent triggers:
+    //   1. `VSM_SPARSE=1` env var (simplest for spike + harness).
+    //   2. `kvScheme="sparse"` (so callers that already thread kvScheme
+    //      through can opt in without touching env).
+    // Either one flips `engine.sparseEnabled`. The actual sparse routing
+    // happens in `vsm_engine_prefill_req` / `vsm_engine_decode_*` and is
+    // gated additionally on `model is Qwen2Model` — the only family with
+    // the `raContexts:` overload landed today.
+    let envSparse = ProcessInfo.processInfo.environment["VSM_SPARSE"] == "1"
+    let schemeSparse = (kvScheme.map { String(cString: $0) } ?? "") == "sparse"
+    engine.sparseEnabled = envSparse || schemeSparse
+    if engine.sparseEnabled {
+        // Parse rope_theta from the model's config.json so the selector
+        // index's trig features track the model's positional encoding.
+        // Qwen2.5-14B-Instruct-1M uses 10_000_000, not the default 10_000.
+        let configURL = modelURL.appendingPathComponent("config.json")
+        if let data = try? Data(contentsOf: configURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let v = json["rope_theta"] as? Double {
+                engine.ropeBase = Float(v)
+            } else if let v = json["rope_theta"] as? Int {
+                engine.ropeBase = Float(v)
+            }
+        }
+        let sparseCompatible = engine.model is BatchedSparseLLM
+        print("[vsm] F-83 sparse decode ENABLED (VSM_SPARSE=\(envSparse) "
+              + "kvScheme=\(schemeSparse ? "sparse" : "other") "
+              + "model=\(type(of: engine.model)) sparseCompatible=\(sparseCompatible) "
+              + "ropeBase=\(engine.ropeBase))")
+        if !sparseCompatible {
+            print("[vsm] WARNING: sparse decode requested but model is not "
+                  + "a BatchedSparseLLM (Qwen2/Qwen3/Qwen3MoE/Llama/Gemma3/Gemma4/Mistral3/Phi3) — "
+                  + "will fall through to dense path. F-83 raContexts overload "
+                  + "is wired on Qwen2 + Qwen3 + Qwen3MoE + Llama + Gemma4 + Mistral3 + "
+                  + "Phi3 today (Gemma3 falls through to dense for F-83; F-85 "
+                  + "batched sparse decode IS wired).")
+        }
+    }
 
     // Create stable pointer as opaque handle
     let ptr = Unmanaged.passRetained(engine).toOpaque()
@@ -393,6 +545,20 @@ public func vsm_engine_prefill_req(
         guard let engine = engines[handle] else { return Int32(-1) }
 
         let tokens = (0..<Int(numTokens)).map { Int(promptTokens[$0]) }
+
+        // F-83 sparse prefill+first-token path. Engages when sparse is
+        // requested AND the model conforms to `BatchedSparseLLM`
+        // (Qwen2Model, Qwen3Model, or LlamaModel). All other configs
+        // fall through to the legacy dense TokenIterator path. The
+        // sparse session is stored in `sparseSessions[rid]`; subsequent
+        // decode steps for this rid go through `sparseDecodeStep(...)`.
+        if engine.sparseEnabled, let sparseModel = engine.model as? BatchedSparseLLM {
+            return sparsePrefillFirstToken(
+                engine: engine, sparseModel: sparseModel, rid: rid,
+                tokens: tokens, temperature: temperature, topP: topP
+            )
+        }
+
         let tokenArray = MLXArray(tokens)
 
         var params = engine.generateParams
@@ -422,6 +588,283 @@ public func vsm_engine_prefill_req(
             return Int32(-1)
         }
     }
+}
+
+/// F-83 sparse-prefill helper. Drives prefill chunk-by-chunk through
+/// `Qwen2Model.callAsFunction(_:cache:raContexts:)`, populating the
+/// per-layer `RetrievalAttentionContext.batchedIndex` selector via the
+/// dispatcher's `prefillUpdate` side-channel (see `retrievalAttentionStep`).
+/// Returns the first sampled token (greedy argmax for the spike — matches
+/// `params.temperature == 0` default).
+///
+/// On error the function logs + returns -1 and no `SparseSession` is
+/// inserted; subsequent decode_step calls will return -1 cleanly.
+private func sparsePrefillFirstToken(
+    engine: InferenceEngine,
+    sparseModel: BatchedSparseLLM,
+    rid: String,
+    tokens: [Int],
+    temperature: Float,
+    topP: Float
+) -> Int32 {
+    let nLayers = sparseModel.kvHeads.count
+    // Per-layer dense KV caches; same storage shape as the dense default.
+    // `StandardKVCache()` is unbounded — fine for the bench harness which
+    // sets `maxKVSize=0` (= unbounded). For windowed caches the F-83
+    // selector is undefined; reject early to keep semantics clear.
+    if engine.maxKVSize > 0 {
+        print("[vsm] sparse prefill: refusing maxKVSize>0 (windowed) — "
+              + "sparse path requires unbounded StandardKVCache")
+        return -1
+    }
+    // F-83 task #126 — size the inner cache to `prefill + decode budget`
+    // in one allocation so neither prefill chunks nor decode steps trip
+    // the per-write reallocation path in `StandardKVCache.updateUnbounded`
+    // (each realloc is a full-cache concat that surges memory and shows
+    // up on the lazy graph). Matches the F-83 256K bench's
+    // `stepDefault = prefillLen + nDecode + 1024` recipe.
+    let envEarly = ProcessInfo.processInfo.environment
+    let decodeBudget = envEarly["VSM_SPARSE_DECODE_BUDGET"]
+        .flatMap(Int.init) ?? 256
+    let cacheStep = tokens.count + max(decodeBudget, 256)
+    let cache: [KVCache] = (0..<nLayers).map { _ in
+        StandardKVCache(eviction: .unbounded, step: cacheStep) as KVCache
+    }
+    // F-83 task #126 — env-controllable RA config so we can A/B the
+    // F-73 fused-mask (current default, ~89 ms/step at 128K sidecar) vs
+    // F-70 per-KV-head gather + amortization (~161 ms at default knobs,
+    // potentially better with tighter fineBlockSize / no-adaptive).
+    //
+    //   VSM_SPARSE_PER_HEAD_GATHER=1  → use F-70 path instead of F-73 mask
+    //   VSM_SPARSE_FINE_BS=N          → override fineBlockSize (default 64)
+    //   VSM_SPARSE_FINE_TOPK=N        → override fineTopK (default 32)
+    //   VSM_SPARSE_NO_ADAPTIVE=1      → disable adaptive top-K (caps K_padded)
+    //   VSM_SPARSE_COARSE_TOPK=N      → override coarseTopK (default 2)
+    //   VSM_SPARSE_AMORT=N            → override selectorAmortization (default 16)
+    //
+    // Defaults preserve the prior shipped behavior; without any env vars
+    // set this matches the pre-#126 path exactly.
+    var raCfg = RetrievalAttentionConfig()
+    let env = envEarly
+    if env["VSM_SPARSE_PER_HEAD_GATHER"] == "1" {
+        raCfg.usePerKVHeadGather = true
+        raCfg.useFusedMaskBuild = false
+    }
+    // F-84 — `VSM_SPARSE_BLOCK_GATHER=1` enables the cross-KV-head
+    // UNION + 1D `take(axis: 2)` gather path. Targets long-ctx
+    // bandwidth ceiling: dense 128 K B=1 reads 25 GB K/V per step
+    // (saturated at 67 ms / 400 GB/s); blockGather reads ~1.2 GB
+    // → potential 5-8× decode speedup. Recommended pairing for
+    // 128 K: `VSM_SPARSE_NO_ADAPTIVE=1 VSM_SPARSE_FINE_BS=64
+    // VSM_SPARSE_FINE_TOPK=32` to cap k_padded. Default off until
+    // benches validate the win.
+    if env["VSM_SPARSE_BLOCK_GATHER"] == "1" {
+        raCfg.useBlockGather = true
+        raCfg.useFusedMaskBuild = false
+    }
+    // F-84 — `VSM_SPARSE_BLOCK_GATHER_MASK=1` opts INTO the dup mask
+    // (default is `mask: .none` which hits MLXFast SDPA's fast tile
+    // path; the dup mask path is ~9× slower but correct under
+    // cross-head collisions). Only set this for configs with overlap.
+    if env["VSM_SPARSE_BLOCK_GATHER_MASK"] == "1" {
+        raCfg.blockGatherNoMask = false
+    }
+    // F-84 — `VSM_SPARSE_BLOCK_GATHER_KPAD_FRAC=0.10` overrides the
+    // hard guard fraction. Default 0.05 caps k_padded at 5% of T.
+    // Raise for configs with large fine + coarse + sliding (e.g. 0.30).
+    if let v = env["VSM_SPARSE_BLOCK_GATHER_KPAD_FRAC"].flatMap(Float.init) {
+        raCfg.blockGatherKPaddedMaxFraction = v
+    }
+    // F-84 — `VSM_SPARSE_BLOCK_GATHER_AMORT_LAYERS=1` sets selector
+    // amortization to numLayers so the top-K pass runs once per
+    // decode step (shared across all 48 layers) instead of every
+    // layer. Combined with the cross-layer selector reuse this
+    // amortizes ~6-8 ms of selector latency into 0.1-0.2 ms.
+    // (TODO: amortization is currently per-layer; true cross-layer
+    // reuse requires hoisting the selector call into the dispatcher
+    // top-level — separate change.)
+    if let v = env["VSM_SPARSE_FINE_BS"].flatMap(Int.init) {
+        raCfg.fineBlockSize = v
+    }
+    if let v = env["VSM_SPARSE_FINE_TOPK"].flatMap(Int.init) {
+        raCfg.fineTopK = v
+    }
+    if env["VSM_SPARSE_NO_ADAPTIVE"] == "1" {
+        raCfg.adaptiveTopK = false
+    }
+    if let v = env["VSM_SPARSE_COARSE_TOPK"].flatMap(Int.init) {
+        raCfg.coarseTopK = v
+    }
+    if let v = env["VSM_SPARSE_AMORT"].flatMap(Int.init) {
+        raCfg.selectorAmortization = v
+    }
+    // F-83 task #126 — `VSM_SPARSE_IMPLICIT=1` flips the wrapper-cache
+    // mode into the F-76 implicit-positions sparse SDPA kernel (the
+    // F-83 north-star path that produced 33.7 ms/step at 128K in the
+    // microbench). Only meaningful when `VSM_SPARSE_WRAPPER=1` since
+    // the sidecar engine has no implicitSparseSDPA implementation.
+    if env["VSM_SPARSE_IMPLICIT"] == "1" {
+        raCfg.useImplicitSparseSDPA = true
+    }
+    // F-83 task #127 — `VSM_SPARSE_PREFILL=1` flips the wrapper-cache
+    // into sparse-prefill mode (chunked attention with prior-chunks
+    // gather + within-chunk dense). F83_PERF_256K_RESULTS measured
+    // 2.43x prefill speedup at 128K via direct test; this exposes it
+    // through the Bridge. Only meaningful when `VSM_SPARSE_WRAPPER=1`
+    // since the sidecar path doesn't wire the prefill-sparse branch.
+    //
+    // Optional sub-knobs:
+    //   VSM_SPARSE_PREFILL_FINE_TOPK=N      (default 16 from RA config)
+    //   VSM_SPARSE_PREFILL_COARSE_TOPK=N    (default 2)
+    //   VSM_SPARSE_PREFILL_MIN_CTX=N        (default 16384 — below this prefill goes dense)
+    //   VSM_SPARSE_PREFILL_GROUP_SIZE=N     (default 4 — IndexCache reuse across layers)
+    if env["VSM_SPARSE_PREFILL"] == "1" {
+        raCfg.sparsePrefillEnabled = true
+    }
+    if let v = env["VSM_SPARSE_PREFILL_FINE_TOPK"].flatMap(Int.init) {
+        raCfg.sparsePrefillFineTopK = v
+    }
+    if let v = env["VSM_SPARSE_PREFILL_COARSE_TOPK"].flatMap(Int.init) {
+        raCfg.sparsePrefillCoarseTopK = v
+    }
+    if let v = env["VSM_SPARSE_PREFILL_MIN_CTX"].flatMap(Int.init) {
+        raCfg.sparsePrefillMinContext = v
+    }
+    if let v = env["VSM_SPARSE_PREFILL_GROUP_SIZE"].flatMap(Int.init) {
+        raCfg.sparsePrefillSelectorGroupSize = v
+    }
+    // F-83 task #126 — `VSM_SPARSE_WRAPPER=1` swaps the sidecar
+    // path (`StandardKVCache` + `RetrievalAttentionContext`) for the
+    // wrapper path (`RetrievalAttentionKVCache`). The wrapper path goes
+    // through `AttentionUtils.attentionWithCacheUpdate` which has the
+    // full set of sparse decode paths wired (F-69/F-70/F-73/F-74/F-75/
+    // F-76/F-77) — the sidecar engine only has F-73 mask + F-70 gather.
+    // This is the only way to engage `useImplicitSparseSDPA` from the
+    // Bridge today.
+    let useWrapperCache = env["VSM_SPARSE_WRAPPER"] == "1"
+    print("[vsm] sparse cfg: fineBS=\(raCfg.fineBlockSize) "
+          + "fineTopK=\(raCfg.fineTopK) adaptive=\(raCfg.adaptiveTopK) "
+          + "coarseTopK=\(raCfg.coarseTopK) "
+          + "amort=\(raCfg.selectorAmortization) "
+          + "perKVHead=\(raCfg.usePerKVHeadGather) "
+          + "blockGather=\(raCfg.useBlockGather) "
+          + "blockGatherNoMask=\(raCfg.blockGatherNoMask) "
+          + "blockGatherKPadFrac=\(raCfg.blockGatherKPaddedMaxFraction) "
+          + "fusedMask=\(raCfg.useFusedMaskBuild) "
+          + "implicit=\(raCfg.useImplicitSparseSDPA) "
+          + "wrapper=\(useWrapperCache) "
+          + "prefillSparse=\(raCfg.sparsePrefillEnabled) "
+          + "prefillFineTopK=\(raCfg.sparsePrefillFineTopK) "
+          + "prefillMinCtx=\(raCfg.sparsePrefillMinContext) "
+          + "prefillGroupSize=\(raCfg.sparsePrefillSelectorGroupSize) "
+          + "cacheStep=\(cacheStep)")
+    // Sidecar-path contexts (used when `useWrapperCache=false`). When
+    // `useWrapperCache=true` the raContexts list is nil — the wrapper
+    // cache carries its own selector index.
+    let raContexts: [RetrievalAttentionContext?]? = useWrapperCache ? nil : (0..<nLayers).map { i in
+        RetrievalAttentionContext(
+            layerIdx: i, totalLayers: nLayers,
+            raConfig: raCfg, ropeBase: engine.ropeBase
+        )
+    }
+    // Replace the bare-StandardKVCache list with wrapper caches when
+    // `useWrapperCache=true`. The wrapper init sizes its inner cache via
+    // `step` — pass the same `cacheStep` we computed above so the inner
+    // StandardKVCache doesn't trip the per-decode realloc path either.
+    //
+    // F-83 task #127 — TurboQuant+RA composition. When the engine was
+    // created with kvScheme="turbo<N>" (compressionAlgorithm.turbo), use
+    // the wrapper's `valueBits:` init so V is compressed to N bits while
+    // K stays raw FP16 (required by RA's JL selector). Memory savings:
+    // V drops 4× at 4-bit, total KV drops ~2× per slot. Opens B>1 budget
+    // headroom at long context. K must stay raw — rawKeyMode is forced.
+    let tqValueBits: Int = {
+        if case let .turbo(_, vBits, _, _) = engine.generateParams.compressionAlgorithm {
+            return vBits
+        }
+        return 0
+    }()
+    let cacheFinal: [KVCache] = useWrapperCache
+        ? (0..<nLayers).map { i in
+            (tqValueBits > 0
+                ? RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: nLayers,
+                    raConfig: raCfg, ropeBase: engine.ropeBase,
+                    valueBits: tqValueBits, tqStep: cacheStep)
+                : RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: nLayers,
+                    raConfig: raCfg, ropeBase: engine.ropeBase,
+                    step: cacheStep)
+            ) as KVCache
+        }
+        : cache
+    if useWrapperCache && tqValueBits > 0 {
+        print("[vsm] sparse+turbo composed: valueBits=\(tqValueBits) (K=fp16 raw)")
+    }
+
+    // Chunked prefill. Use the model's `defaultPrefillStepSize` (1024 for
+    // Qwen2 by default — see LanguageModel extension). Each chunk goes
+    // through the model's `raContexts:` overload so the dispatcher
+    // populates the selector index (`prefillUpdate`) for the sparse-band
+    // layers. The final chunk's last-token logits feed the first sampled
+    // token (greedy/argmax for the bench harness).
+    let chunkSize = sparseModel.defaultPrefillStepSize
+    let n = tokens.count
+    var lastLogits: MLXArray? = nil
+
+    for chunkStart in stride(from: 0, to: n, by: chunkSize) {
+        let chunkEnd = min(chunkStart + chunkSize, n)
+        let chunkTokens = Array(tokens[chunkStart..<chunkEnd])
+        let chunkArray = MLXArray(chunkTokens).reshaped(1, chunkTokens.count)
+        let isLast = chunkEnd == n
+
+        let out = sparseModel.callAsFunction(
+            chunkArray, cache: cacheFinal, raContexts: raContexts
+        )
+        if isLast {
+            eval(out)
+            lastLogits = out[0, -1, 0...]
+        } else {
+            // Materialise the cache writes for this chunk before queuing
+            // the next forward. Matches the F-83 256K bench's default
+            // recipe (`F83_SYNC` unset → asyncEval) — lets the host
+            // queue the next chunk's forward graph while the GPU is
+            // still draining this chunk's writes. The sync-eval version
+            // (set `VSM_SPARSE_SYNC_PREFILL=1`) is the diagnostic fallback.
+            var arrays: [MLXArray] = []
+            for c in cacheFinal { arrays.append(contentsOf: c.innerState()) }
+            if env["VSM_SPARSE_SYNC_PREFILL"] == "1" {
+                eval(arrays)
+            } else {
+                asyncEval(arrays)
+            }
+        }
+    }
+
+    guard let logits = lastLogits else {
+        print("[vsm] sparse prefill produced no logits for \(rid)")
+        return -1
+    }
+
+    // Greedy sample for the bench harness (params.temperature=0 by
+    // default). Temperature sampling can be added later — out of scope
+    // for the F-83 perf-validation spike.
+    let token: Int32 = {
+        if temperature > 0 {
+            let scaled = logits / temperature
+            let sampled = MLXRandom.categorical(scaled)
+            return Int32(sampled.item(Int.self))
+        } else {
+            return argMax(logits, axis: -1).asType(.int32).item(Int32.self)
+        }
+    }()
+
+    engine.sparseSessions[rid] = SparseSession(
+        cache: cacheFinal,
+        raContexts: raContexts ?? [],
+        nextToken: token, temperature: temperature, topP: topP
+    )
+    return token
 }
 
 /// Compute prompt logprobs: for each position i, the log-probability of token[i+1]
@@ -474,8 +917,29 @@ public func vsm_engine_decode_step_req(
     let rid = String(cString: reqId)
 
     return engineQueue.sync { () -> Int32 in
-        guard let engine = engines[handle],
-              var session = engine.sessions[rid] else { return Int32(-1) }
+        guard let engine = engines[handle] else { return Int32(-1) }
+
+        // F-83 sparse decode path. When a `SparseSession` exists for
+        // `rid`, route through the RetrievalAttention dispatcher
+        // (gathers ~2k positions of K/V at 128K instead of T). The
+        // dense path stays the default for non-sparse rids.
+        if var sparse = engine.sparseSessions[rid],
+           let sparseModel = engine.model as? BatchedSparseLLM {
+            let start = CFAbsoluteTimeGetCurrent()
+            let token = sparseDecodeStep(
+                sparseModel: sparseModel, session: &sparse,
+                stream: engine.decodeStream
+            )
+            engine.sparseSessions[rid] = sparse
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            engine.totalDecodeTokens += 1
+            engine.totalDecodeTime += elapsed
+            engine.peakMemoryBytes = max(
+                engine.peakMemoryBytes, Int64(Memory.peakMemory))
+            return token
+        }
+
+        guard var session = engine.sessions[rid] else { return Int32(-1) }
 
         let start = CFAbsoluteTimeGetCurrent()
         guard let token = session.iterator.next() else {
@@ -493,6 +957,308 @@ public func vsm_engine_decode_step_req(
 
         return Int32(token)
     }
+}
+
+/// F-83 sparse decode step. Mirrors the F-83 256K bench's `runDecode`
+/// inner loop: feed `nextToken` as `[1, 1]`, run model forward through
+/// the sparse dispatcher, argmax the last logit, return the previously-
+/// sampled token (previousY pattern, matching `TokenIterator.next()`).
+///
+/// Per-step cost at 128K on Qwen2.5-14B-1M-4bit:
+///   - Dense: ~67ms (Python mlx_lm reference) / ~78ms (Swift bare).
+///   - Sparse (F-83 north-star): ~34ms.
+/// Below the `sparseMinContext` threshold (16K by default) the
+/// dispatcher transparently falls through to plain dense SDPA per layer,
+/// so this path is parity with the dense path at short context.
+private func sparseDecodeStep(
+    sparseModel: BatchedSparseLLM,
+    session: inout SparseSession,
+    stream: MLX.Stream
+) -> Int32 {
+    let prev = session.nextToken
+    let input = MLXArray([prev]).reshaped(1, 1)
+    let traceStep = ProcessInfo.processInfo.environment["VSM_SPARSE_TRACE"] == "1"
+    let stepStart = traceStep ? CFAbsoluteTimeGetCurrent() : 0
+    // Wrapper-cache mode stores `raContexts = []` — pass nil to the
+    // model so dispatch goes through `attentionWithCacheUpdate`'s
+    // `.retrievalSparse` arm (which has the F-76 implicit-sparse path
+    // wired). Sidecar mode passes the per-layer context list.
+    let raCtx: [RetrievalAttentionContext?]? =
+        session.raContexts.isEmpty ? nil : session.raContexts
+    let token: Int32 = MLX.Stream.withStream(stream) {
+        let out = sparseModel.callAsFunction(
+            input, cache: session.cache, raContexts: raCtx
+        )
+        let lastLogits = out[0, -1, 0...]
+        let t: MLXArray
+        if session.temperature > 0 {
+            let scaled = lastLogits / session.temperature
+            t = MLXRandom.categorical(scaled).asType(.int32)
+        } else {
+            t = argMax(lastLogits, axis: -1).asType(.int32)
+        }
+        eval(t)
+        return t.item(Int32.self)
+    }
+    if traceStep {
+        let ms = (CFAbsoluteTimeGetCurrent() - stepStart) * 1000
+        print(String(format: "[vsm] sparse step ms=%.1f", ms))
+    }
+    session.nextToken = token
+    return prev
+}
+
+/// F-85 batched-sparse decode driver. ONE batched forward per token
+/// through `Qwen2Model.fullyBatchedSparseDecode`. On the first call,
+/// migrates the per-session StandardKVCache + RetrievalAttentionContext
+/// data into a shared `BatchedRetrievalAttentionKVCache` per layer.
+/// Subsequent calls reuse the shared caches.
+///
+/// Caveman: first call build big shared cache from B small ones. then
+/// every call run one fwd pass on B inputs. F-71b kernel eat the gather.
+///
+/// Returns count of tokens emitted (1 per active sparse slot).
+private func batchedSparseDecodeAll(
+    engine: InferenceEngine,
+    sparseModel: BatchedSparseLLM,
+    reqIds: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>,
+    outTokens: UnsafeMutablePointer<Int32>,
+    maxReqs: Int
+) -> Int32 {
+    // Stable ordering — sort by rid so per-call slot index doesn't drift.
+    let sortedRids = engine.sparseSessions.keys.sorted()
+        .prefix(maxReqs)
+    let B = sortedRids.count
+    guard B > 0 else { return 0 }
+
+    // Lazy init: build shared batched-sparse caches on first call.
+    if engine.batchedSparseCaches == nil {
+        guard buildBatchedSparseCaches(
+            engine: engine, sparseModel: sparseModel,
+            sortedRids: Array(sortedRids))
+        else {
+            // Build failed — fall back to nothing (caller fell through here
+            // because the env flag was set; we report 0 so the harness can
+            // bail rather than silently regress to serial).
+            print("[vsm] f85 batched-sparse cache build failed — bailing")
+            return 0
+        }
+    }
+
+    guard let raCaches = engine.batchedSparseCaches else { return 0 }
+
+    // Build the input token batch from per-slot last-tokens.
+    let tokens = engine.batchedSparseTokens
+    precondition(tokens.count >= B, "batchedSparseTokens too short")
+    let inputArr = MLXArray(tokens[0 ..< B]).reshaped(B, 1)
+
+    // Run ONE batched forward through the model + F-73/F-71b kernel path.
+    let logits = MLX.Stream.withStream(engine.decodeStream) {
+        sparseModel.fullyBatchedSparseDecode(inputArr, raCaches: raCaches)
+    }
+    // logits: [B, 1, vocab] — take per-slot argmax over the last position.
+    let lastLogits = logits.reshaped(B, -1)
+    let sampled = argMax(lastLogits, axis: -1).asType(.int32)
+    eval(sampled)
+    let sampledArr = sampled.asArray(Int32.self)
+
+    // Write previousY-style outputs: return PRIOR step's token, then stash
+    // the freshly-sampled token for the next call.
+    var count: Int32 = 0
+    for (slotIdx, rid) in sortedRids.enumerated() {
+        reqIds[Int(count)] = strdup(rid)
+        outTokens[Int(count)] = engine.batchedSparseTokens[slotIdx]
+        engine.batchedSparseTokens[slotIdx] = sampledArr[slotIdx]
+        count += 1
+    }
+    let logBatched = ProcessInfo.processInfo.environment["VSM_SPARSE_TRACE"] == "1"
+    if logBatched {
+        print("[vsm] f85 batched=true B=\(B) tokens emitted=\(count)")
+    }
+    return count
+}
+
+/// Build shared per-layer `BatchedRetrievalAttentionKVCache`s by
+/// migrating each sparse session's `StandardKVCache` into a single
+/// `BatchedKVCache` slot. Assumes all sparse sessions share the same
+/// prefilled context length (rectangular T — bench harness always does
+/// this). Returns false on any mismatch.
+private func buildBatchedSparseCaches(
+    engine: InferenceEngine,
+    sparseModel: BatchedSparseLLM,
+    sortedRids: [String]
+) -> Bool {
+    let B = sortedRids.count
+    let nLayers = sparseModel.kvHeads.count
+    // Validate: every session has a cache of the right shape, all T match.
+    // Per-layer K shape is captured because heterogeneous models (e.g.
+    // Gemma 4 with interleaved sliding `[8, 256]` and global `[2, 512]`
+    // layers) have DIFFERENT `[nKVH, D]` per layer. Layer 0's shape was
+    // previously used for every layer's BatchedKVCache; that silently
+    // misshaped global-layer migrations on Gemma 4. Now each layer's
+    // BatchedKVCache is sized from that layer's own K, and we only assert
+    // shape uniformity ACROSS SESSIONS (slots) for the SAME layer.
+    var commonT: Int = -1
+    var dtype: DType = .float16
+    var perLayerKVH = [Int](repeating: -1, count: nLayers)
+    var perLayerD = [Int](repeating: -1, count: nLayers)
+    for rid in sortedRids {
+        guard let session = engine.sparseSessions[rid] else { return false }
+        guard session.cache.count == nLayers else {
+            print("[vsm] f85 build: session \(rid) layer count \(session.cache.count) != \(nLayers)")
+            return false
+        }
+        for layerIdx in 0..<nLayers {
+            guard let (k, _) = session.cache[layerIdx].peek() else {
+                if layerIdx == 0 {
+                    print("[vsm] f85 build: session \(rid) layer 0 has no K — prefill not run?")
+                    return false
+                }
+                // Some layers can be unpopulated (e.g. KV-shared donor
+                // layers on Gemma 4 where the layer reads from another's
+                // cache). Skip these — they get zero-filled placeholder
+                // BatchedKVCaches below using the per-layer kvHeads
+                // count from `sparseModel.kvHeads` as a fallback.
+                continue
+            }
+            let T = k.dim(2)
+            let h = k.dim(1)
+            let d = k.dim(3)
+            if commonT < 0 {
+                commonT = T; dtype = k.dtype
+            } else if T != commonT || k.dtype != dtype {
+                print("[vsm] f85 build: session \(rid) layer \(layerIdx) "
+                    + "shape mismatch T=\(T) vs \(commonT), "
+                    + "dtype=\(k.dtype) vs \(dtype)")
+                return false
+            }
+            if perLayerKVH[layerIdx] < 0 {
+                perLayerKVH[layerIdx] = h
+                perLayerD[layerIdx] = d
+            } else if perLayerKVH[layerIdx] != h || perLayerD[layerIdx] != d {
+                // Different slots disagree on layer-i shape — would only
+                // happen if two sessions had different models, which the
+                // engine never permits. Bail loudly.
+                print("[vsm] f85 build: session \(rid) layer \(layerIdx) "
+                    + "kv shape mismatch [\(h),\(d)] vs "
+                    + "[\(perLayerKVH[layerIdx]),\(perLayerD[layerIdx])]")
+                return false
+            }
+        }
+    }
+    guard commonT > 0 else { return false }
+    // Layer-0 dims used only for the build log below; per-layer dims drive
+    // the actual allocations.
+    let nKVH = perLayerKVH[0]
+    let dHead = perLayerD[0]
+
+    // F-85 v3.2 — MLX_SDPA_BLOCKS=128 set at vsm_engine_create (above).
+    // This runs before model load + first SDPA dispatch, so PSO compiles
+    // for blocks=128 not 256.
+    let envCheck = ProcessInfo.processInfo.environment
+
+    // F-85 v3.1 — B*T ship gate. With MLX_SDPA_BLOCKS=128 the cliff is
+    // substantially mitigated but not eliminated at extreme cells
+    // (B=2 ctx=128K still ~0.54× dense vs 0.09× pre-fix). Keep gate
+    // conservative at 224K. After more bench data may raise this.
+    let force = envCheck["VSM_SPARSE_BATCHED_FORCE"] == "1"
+    let btThreshold = Int(envCheck["VSM_SPARSE_BT_THRESHOLD"] ?? "") ?? 224_000
+    let btProduct = B * commonT
+    if !force && btProduct > btThreshold {
+        print("[vsm] f85 batched-sparse SKIPPED: B*T=\(btProduct) > "
+            + "threshold \(btThreshold). F-73 batched cliffs above this. "
+            + "Falling back to serial per-request sparse. "
+            + "(VSM_SPARSE_BATCHED_FORCE=1 to override)")
+        return false
+    }
+
+    // Build the F-85 cache list. Use a generous maxSeq buffer = commonT + 1024
+    // so the first decode tokens don't immediately trip a re-alloc.
+    let env = envCheck
+    let decodeBudget = env["VSM_SPARSE_DECODE_BUDGET"].flatMap(Int.init) ?? 256
+    let maxSeq = commonT + max(decodeBudget, 256)
+    var raCfg = RetrievalAttentionConfig()
+    // Carry over the same env knobs the per-session prefill path honours
+    // so a batched bench can still tweak them.
+    if let v = env["VSM_SPARSE_FINE_BS"].flatMap(Int.init) { raCfg.fineBlockSize = v }
+    if let v = env["VSM_SPARSE_FINE_TOPK"].flatMap(Int.init) { raCfg.fineTopK = v }
+    if env["VSM_SPARSE_NO_ADAPTIVE"] == "1" { raCfg.adaptiveTopK = false }
+    if let v = env["VSM_SPARSE_COARSE_TOPK"].flatMap(Int.init) { raCfg.coarseTopK = v }
+    if let v = env["VSM_SPARSE_AMORT"].flatMap(Int.init) { raCfg.selectorAmortization = v }
+
+    var raCaches: [BatchedRetrievalAttentionKVCache] = []
+    raCaches.reserveCapacity(nLayers)
+    for layerIdx in 0..<nLayers {
+        // Per-layer dims — Gemma 4 sliding vs global differ. For layers
+        // with no observed K (KV-shared placeholders), fall back to the
+        // model-supplied kvHeads + layer-0 headDim so the BatchedKVCache
+        // can still be constructed without crashing. Such layers will
+        // never be sparse-eligible.
+        let layerKVH = perLayerKVH[layerIdx] > 0 ? perLayerKVH[layerIdx] : sparseModel.kvHeads[layerIdx]
+        let layerD = perLayerD[layerIdx] > 0 ? perLayerD[layerIdx] : dHead
+        let batched = BatchedKVCache(
+            maxBatch: B, kvHeads: layerKVH, headDim: layerD,
+            maxSeq: maxSeq, dtype: dtype)
+        // Reserve B slots so addRequest semantics are satisfied later.
+        for _ in 0..<B { _ = batched.addRequest() }
+        // Migrate K/V from each session's StandardKVCache into the slot.
+        for (slotIdx, rid) in sortedRids.enumerated() {
+            guard let session = engine.sparseSessions[rid] else { continue }
+            guard let (k, v) = session.cache[layerIdx].peek() else { continue }
+            // k shape: [1, nKVH, T, D]. Write into batched slot.
+            batched.keys[slotIdx, 0..., ..<commonT, 0...] = k[0, 0..., 0..., 0...]
+            batched.values[slotIdx, 0..., ..<commonT, 0...] = v[0, 0..., 0..., 0...]
+            batched.offsets[slotIdx] = commonT
+        }
+        let raCache = BatchedRetrievalAttentionKVCache(
+            inner: batched, B: B, nKVHeads: layerKVH, dHead: layerD,
+            layerIdx: layerIdx, totalLayers: nLayers,
+            raConfig: raCfg, ropeBase: engine.ropeBase)
+        // F-85 v2 M3 — populate the selector index from the migrated K so
+        // decode-time top-K picks real best-matching blocks instead of
+        // blocks 0..k-1 by index order. Skip for non-sparse-eligible layers
+        // (the index.update path is a no-op via raCache.updateIndex, but
+        // we call index.update directly with a multi-token L so the prefill
+        // path runs — updateIndex would otherwise treat L=commonT correctly,
+        // so this also works through the wrapper. Direct call avoids any
+        // ambiguity).
+        if raCache.isSparseEligible && commonT > 0 {
+            // [B, nKVH, T, D] view of the just-migrated K for this layer.
+            let migratedK = batched.keys[..<B, 0..., ..<commonT, 0...]
+            raCache.index.update(newKeys: migratedK.asType(.float32))
+        }
+        raCaches.append(raCache)
+        // F-85 v3.1 — force per-layer eval. Without this MLX lazy graph
+        // accumulates all 48 layers' K/V copies + fp32 casts + index updates
+        // before any eval, peaking RSS at ~10× actual state (~300GB at B=8
+        // T=128K). Caused the 2026-05-17 system crash mid-bench. Eval here
+        // bounds peak memory to single-layer working set.
+        eval(batched.keys, batched.values)
+    }
+
+    // Stash on engine + seed batchedSparseTokens with each session's
+    // nextToken (the token produced by sparse prefill).
+    engine.batchedSparseCaches = raCaches
+    engine.batchedSparseTokens = sortedRids.map { rid in
+        engine.sparseSessions[rid]?.nextToken ?? 0
+    }
+    engine.batchedSparseSlots = sortedRids.enumerated().map { ($1, $0) }
+
+    // F-85 v3.1 attempted to free session.cache here, but the Swift
+    // struct copy-back pattern increased peak RSS instead of decreasing
+    // it (measured 73 GB peak vs 57 GB without). Reverted. Sessions
+    // still hold per-layer StandardKVCache after migration — wasted
+    // memory but not a crash trigger.
+
+    // Heterogeneous models (e.g. Gemma 4) show per-layer-0 dims in the log
+    // line. The full kv-head/headDim profile is available via the
+    // `sparseModel.kvHeads` array on the model.
+    let allUniform = perLayerKVH.allSatisfy { $0 < 0 || $0 == nKVH }
+        && perLayerD.allSatisfy { $0 < 0 || $0 == dHead }
+    print("[vsm] f85 batched-sparse cache built: B=\(B) T=\(commonT) "
+        + "nKVH=\(nKVH) D=\(dHead)\(allUniform ? "" : " (heterogeneous; layer-0 dims shown)") "
+        + "layers=\(nLayers) maxSeq=\(maxSeq)")
+    return true
 }
 
 /// Generic fully-batched decode runner shared across the Qwen2/Llama/Gemma3/
@@ -666,6 +1432,52 @@ public func vsm_engine_decode_all(
         guard let engine = engines[handle] else { return Int32(0) }
 
         let start = CFAbsoluteTimeGetCurrent()
+
+        // F-83 sparse decode dispatch. When any `SparseSession`s exist,
+        // walk them sequentially (per-request) UNLESS VSM_SPARSE_BATCHED=1
+        // is set AND we have ≥2 sparse sessions — then go through F-85
+        // batched-sparse path (ONE forward per token).
+        // At B=1 the serial fallback equals the batched path so we stay
+        // on serial (no migration overhead, same per-step cost).
+        //
+        // F-85 v2 — within the batched-sparse path,
+        // VSM_SPARSE_BATCHED_KERNEL selects the SDPA backend (read once
+        // at module load in BatchedRetrievalAttentionKVCache.envBatchedKernel):
+        //   "f73"     (default) — batched F-73 mask kernel + MLXFast SDPA
+        //   "f73loop"           — Swift loop over single-batch F-73 mask + SDPA
+        //   "f71b"              — original v1 fused F-71b sparse SDPA
+        if !engine.sparseSessions.isEmpty,
+           let sparseModel = engine.model as? BatchedSparseLLM {
+            let envBatched = ProcessInfo.processInfo.environment["VSM_SPARSE_BATCHED"] == "1"
+            let sparseCount = engine.sparseSessions.count
+            if envBatched && sparseCount >= 2 {
+                let count = batchedSparseDecodeAll(
+                    engine: engine, sparseModel: sparseModel,
+                    reqIds: reqIds, outTokens: outTokens,
+                    maxReqs: Int(maxReqs))
+                let elapsed = CFAbsoluteTimeGetCurrent() - start
+                engine.totalDecodeTokens += count
+                engine.totalDecodeTime += elapsed
+                return count
+            }
+            let sparseRids = Array(engine.sparseSessions.keys.prefix(Int(maxReqs)))
+            var count: Int32 = 0
+            for rid in sparseRids {
+                guard var sparse = engine.sparseSessions[rid] else { continue }
+                let prev = sparseDecodeStep(
+                    sparseModel: sparseModel, session: &sparse,
+                    stream: engine.decodeStream)
+                engine.sparseSessions[rid] = sparse
+                reqIds[Int(count)] = strdup(rid)
+                outTokens[Int(count)] = prev
+                count += 1
+            }
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            engine.totalDecodeTokens += count
+            engine.totalDecodeTime += elapsed
+            return count
+        }
+
         // Pull active rids from sessions, falling back to batchSlots when the
         // batched-prefill path was used (it skips per-request session setup
         // because RequestSession requires a TokenIterator we don't have).
@@ -847,6 +1659,20 @@ public func vsm_engine_decode_all(
                 (engine.sessions[rid]?.temperature ?? 0) == 0
             }
 
+            // F-85: if sparseEnabled AND model is BatchedHybridSparseLLM AND
+            // hybrid cache has at least one .sparseAttention layer, dispatch
+            // to fullyBatchedSparseDecode. Else fall through to dense
+            // fullyBatchedDecode below.
+            let sparseHybrid: (any BatchedHybridSparseLLM)? = {
+                guard engine.sparseEnabled,
+                      let s = engine.model as? any BatchedHybridSparseLLM,
+                      hCaches.layers.contains(where: {
+                          if case .sparseAttention = $0 { return true } else { return false }
+                      })
+                else { return nil }
+                return s
+            }()
+
             // ASYNC-PIPELINED FAST PATH (greedy + stable B + pending from
             // prior step). Same pattern as the Qwen2/Qwen3 paths above.
             if allGreedy,
@@ -855,7 +1681,12 @@ public func vsm_engine_decode_all(
             {
                 let newSampled: MLXArray = MLX.Stream.withStream(engine.decodeStream) {
                     let inputBatch = pending.reshaped(B, 1)
-                    let logitsBatch = hybridModel.fullyBatchedDecode(inputBatch, caches: hCaches)
+                    let logitsBatch: MLXArray
+                    if let sparseHybrid {
+                        logitsBatch = sparseHybrid.fullyBatchedSparseDecode(inputBatch, caches: hCaches)
+                    } else {
+                        logitsBatch = hybridModel.fullyBatchedDecode(inputBatch, caches: hCaches)
+                    }
                     let lastLogits = logitsBatch.reshaped(B, -1)
                     let s = argMax(lastLogits, axis: -1).asType(.int32)
                     asyncEval(s)
@@ -884,7 +1715,12 @@ public func vsm_engine_decode_all(
             // SYNC PATH — first call, B changed, or non-greedy.
             let tokens = engine.batchTokens
             let inputBatch = MLXArray(tokens[0..<B]).reshaped(B, 1)
-            let logitsBatch = hybridModel.fullyBatchedDecode(inputBatch, caches: hCaches)
+            let logitsBatch: MLXArray
+            if let sparseHybrid {
+                logitsBatch = sparseHybrid.fullyBatchedSparseDecode(inputBatch, caches: hCaches)
+            } else {
+                logitsBatch = hybridModel.fullyBatchedDecode(inputBatch, caches: hCaches)
+            }
             let lastLogits = logitsBatch.reshaped(B, -1)
 
             let sampledTokens: MLXArray
@@ -942,6 +1778,11 @@ public func vsm_engine_decode_all(
            !engine.batchSlots.isEmpty
         {
             let B = engine.batchSlots.count
+            // TEMP DIAG B=1 long-ctx regression investigation.
+            if ProcessInfo.processInfo.environment["VSM_DIAG"] == "1" {
+                FileHandle.standardError.write(Data(
+                    "[DIAG] qwen2 fullyBatched path entered: B=\(B) active=\(bCaches[0].active) offset0=\(bCaches[0].offsets[0]) maxBatch=\(bCaches[0].maxBatch) maxSeq=\(bCaches[0].keys.dim(2))\n".utf8))
+            }
             let sortedSlots = engine.batchSlots.sorted { $0.value < $1.value }
             let allGreedy = sortedSlots.allSatisfy { (rid, _) in
                 (engine.sessions[rid]?.temperature ?? 0) == 0
@@ -1474,7 +2315,6 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
         let maxSeq = engine.maxKVSize > 0
             ? engine.maxKVSize
             : max(2048, maxPrefillOffset + decodeMargin)
-        let maxBatch = max(B, engine.maxConcurrentRequests)
 
         // Resolve a sample peek for dtype (try any layer that has populated K/V).
         var sampleDtype: DType = .bfloat16
@@ -1498,6 +2338,33 @@ public func vsm_engine_init_batched(_ handle: UnsafeMutableRawPointer?) -> Int32
             let kvHeads = firstKeys.dim(1)
             let headDim = firstKeys.dim(3)
             perLayerDims = Array(repeating: (kvHeads, headDim), count: numLayers)
+        }
+
+        // maxBatch budget. Naive `max(B, engine.maxConcurrentRequests)` (=64
+        // default) fits at short prompts (chat-style batched serving, ~7GB
+        // cache total at 14B + 18-token prompt + B=64) but catastrophic at
+        // long-ctx single-user (~211GB at 14B + 16K + maxBatch=64 → swap
+        // thrash → ~10 s/step at B=1 16K, hidden until B=1 long-ctx cell was
+        // benched 2026-05-16). Cap by an estimated cache memory budget so
+        // single-user long-ctx serves at the actual B, not at 64 empty
+        // pre-allocated slots that won't be filled.
+        //
+        // Estimate per-slot cache mem ≈ maxSeq * numLayers * avg_kvHeads *
+        //   avg_headDim * 2 (K+V) * dtypeBytes.
+        let avgKvHeads = perLayerDims.map { $0.kvHeads }.reduce(0, +) / max(numLayers, 1)
+        let avgHeadDim = perLayerDims.map { $0.headDim }.reduce(0, +) / max(numLayers, 1)
+        let dtypeBytes = (sampleDtype == .float32) ? 4 : 2
+        let cacheMemBudgetGB = Int(ProcessInfo.processInfo.environment["VSM_MAX_CACHE_GB"] ?? "32") ?? 32
+        let cacheMemBudgetBytes = cacheMemBudgetGB * 1024 * 1024 * 1024
+        let perSlotBytes = maxSeq * numLayers * max(avgKvHeads, 1) * max(avgHeadDim, 1)
+            * 2 * dtypeBytes
+        let budgetBatch = perSlotBytes > 0 ? max(1, cacheMemBudgetBytes / perSlotBytes) : Int.max
+        let maxBatch = Int(ProcessInfo.processInfo.environment["VSM_DIAG_MAXBATCH_EQ_B"] ?? "0") == 1
+            ? B
+            : max(B, min(engine.maxConcurrentRequests, budgetBatch))
+        if maxBatch < engine.maxConcurrentRequests {
+            print("[vsm] init_batched: capped maxBatch \(engine.maxConcurrentRequests)→\(maxBatch) "
+                + "(perSlot=\(perSlotBytes / 1024 / 1024)MB × budget=\(cacheMemBudgetGB)GB)")
         }
 
         // Allocate batched caches. For KV-shared layers (previousKVs[i]!=i),
@@ -1821,6 +2688,7 @@ public func vsm_engine_finish_req(
     engineQueue.sync {
         guard let engine = engines[handle] else { return }
         engine.sessions.removeValue(forKey: rid)
+        engine.sparseSessions.removeValue(forKey: rid)
     }
 }
 
@@ -1887,6 +2755,7 @@ public func vsm_engine_reset(_ handle: UnsafeMutableRawPointer?) {
     engineQueue.sync {
         guard let engine = engines[handle] else { return }
         engine.sessions.removeAll()
+        engine.sparseSessions.removeAll()
     }
 }
 
@@ -2295,6 +3164,14 @@ private func prefillBatchedUniformHybrid(
                 return -10
             }
             eval(bma.convState, bma.recState)
+        case .sparseAttention(let raCache):
+            guard let simple = transientCaches[layerIdx] as? StandardKVCache,
+                  copyBatchedAttentionLayer(src: simple, dst: raCache.inner, B: B)
+            else {
+                print("[vsm] prefill_batched_uniform hybrid: layer \(layerIdx) expected StandardKVCache (sparse)")
+                return -11
+            }
+            eval(raCache.inner.keys, raCache.inner.values)
         }
         transientCaches[layerIdx] = nil
     }
@@ -2307,6 +3184,8 @@ private func prefillBatchedUniformHybrid(
             toEval.append(c.keys); toEval.append(c.values)
         case .gdn(let c):
             toEval.append(c.convState); toEval.append(c.recState)
+        case .sparseAttention(let c):
+            toEval.append(c.inner.keys); toEval.append(c.inner.values)
         }
     }
     eval(toEval)
@@ -2432,9 +3311,23 @@ private func initBatchedHybrid(
     // Mirror the prefill_batched_uniform path: thread kvScheme into the
     // batched-hybrid cache factory so turbo* schemes actually take effect.
     let (turboKB, turboVB) = batchedTurboBits(from: engine.generateParams)
-    let hCaches = model.newBatchedHybridCache(
-        maxBatch: maxBatch, parameters: engine.generateParams,
-        turboKeyBits: turboKB, turboValueBits: turboVB)
+    let hCaches: BatchedHybridCache
+    // F-85: if sparse requested AND model is BatchedHybridSparseLLM, build
+    // hybrid cache with `.sparseAttention(BatchedRetrievalAttentionKVCache)` for
+    // attention layers (GDN/Mamba layers untouched). TurboQuant K/V bits are
+    // bypassed in the sparse cache (raw fp16 KV required for selector + sparseAttend).
+    if engine.sparseEnabled,
+       let sparseModel = model as? any BatchedHybridSparseLLM
+    {
+        let raCfg = RetrievalAttentionConfig()
+        hCaches = sparseModel.newBatchedHybridSparseCache(
+            maxBatch: maxBatch, parameters: engine.generateParams,
+            raConfig: raCfg)
+    } else {
+        hCaches = model.newBatchedHybridCache(
+            maxBatch: maxBatch, parameters: engine.generateParams,
+            turboKeyBits: turboKB, turboValueBits: turboVB)
+    }
 
     // Sanity: layer count must match the per-request cache layer count.
     guard let firstSession = engine.sessions[rids[0]] else { return Int32(0) }
@@ -2472,6 +3365,13 @@ private func initBatchedHybrid(
                     print("[vsm] init_batched_hybrid: layer \(layerIdx) expected SSMStateCache")
                     return Int32(-1)
                 }
+            case .sparseAttention(let raCache):
+                guard let simple = srcCache as? StandardKVCache,
+                      copyAttentionLayerIntoSlot(src: simple, dst: raCache.inner, slot: slotIdx)
+                else {
+                    print("[vsm] init_batched_hybrid: layer \(layerIdx) expected StandardKVCache (sparse)")
+                    return Int32(-1)
+                }
             }
         }
 
@@ -2484,6 +3384,8 @@ private func initBatchedHybrid(
                 slotEval.append(c.keys); slotEval.append(c.values)
             case .gdn(let c):
                 slotEval.append(c.convState); slotEval.append(c.recState)
+            case .sparseAttention(let c):
+                slotEval.append(c.inner.keys); slotEval.append(c.inner.values)
             }
         }
         eval(slotEval)
@@ -2498,6 +3400,8 @@ private func initBatchedHybrid(
             toEval.append(c.keys); toEval.append(c.values)
         case .gdn(let c):
             toEval.append(c.convState); toEval.append(c.recState)
+        case .sparseAttention(let c):
+            toEval.append(c.inner.keys); toEval.append(c.inner.values)
         }
     }
     eval(toEval)
@@ -2546,6 +3450,10 @@ private func addBatchSlotHybrid(
             guard let mamba = srcCache as? SSMStateCache,
                   copyMambaLayerIntoSlot(src: mamba, dst: bma, slot: slotIdx)
             else { return Int32(-1) }
+        case .sparseAttention(let raCache):
+            guard let simple = srcCache as? StandardKVCache,
+                  copyAttentionLayerIntoSlot(src: simple, dst: raCache.inner, slot: slotIdx)
+            else { return Int32(-1) }
         }
     }
 
@@ -2556,6 +3464,8 @@ private func addBatchSlotHybrid(
             toEval.append(c.keys); toEval.append(c.values)
         case .gdn(let c):
             toEval.append(c.convState); toEval.append(c.recState)
+        case .sparseAttention(let c):
+            toEval.append(c.inner.keys); toEval.append(c.inner.values)
         }
     }
     eval(toEval)
