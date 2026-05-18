@@ -384,17 +384,20 @@ public func vsm_engine_create(
     print("[vsm] Engine create: maxNumSeqs=\(engine.maxConcurrentRequests) "
           + "maxKVSize=\(engine.maxKVSize)")
 
-    // Sparse decode activation. Two equivalent triggers:
-    //   1. `VSM_SPARSE=1` env var (simplest for spike + harness).
-    //   2. `kvScheme="sparse"` (so callers that already thread kvScheme
-    //      through can opt in without touching env).
-    // Either one flips `engine.sparseEnabled`. The actual sparse routing
-    // happens in `vsm_engine_prefill_req` / `vsm_engine_decode_*` and is
-    // gated additionally on `model is Qwen2Model` — the only family with
-    // the `raContexts:` overload landed today.
+    // Sparse decode activation. One flag is enough to engage:
+    //   - `VSM_SPARSE_BATCHED=1` — recommended path (batched sparse decode
+    //     across all batch sizes including B=1, covers 10 model families).
+    //   - `VSM_SPARSE=1` — legacy single-stream sparse decode (back-compat).
+    //   - `kvScheme="sparse"` — scheme-side equivalent of `VSM_SPARSE=1`.
+    // Any of the three flips `engine.sparseEnabled`. The actual sparse
+    // routing happens in `vsm_engine_prefill_req` / `vsm_engine_decode_*`
+    // and dispatches per-model based on conformance (BatchedSparseLLM /
+    // BatchedHybridSparseLLM). VSM_SPARSE_BATCHED additionally routes
+    // through the batched dispatch when ≥2 sparse sessions exist.
     let envSparse = ProcessInfo.processInfo.environment["VSM_SPARSE"] == "1"
+    let envSparseBatched = ProcessInfo.processInfo.environment["VSM_SPARSE_BATCHED"] == "1"
     let schemeSparse = (kvScheme.map { String(cString: $0) } ?? "") == "sparse"
-    engine.sparseEnabled = envSparse || schemeSparse
+    engine.sparseEnabled = envSparse || envSparseBatched || schemeSparse
     if engine.sparseEnabled {
         // Parse rope_theta from the model's config.json so the selector
         // index's trig features track the model's positional encoding.
@@ -410,6 +413,7 @@ public func vsm_engine_create(
         }
         let sparseCompatible = engine.model is BatchedSparseLLM
         print("[vsm] sparse decode ENABLED (VSM_SPARSE=\(envSparse) "
+              + "VSM_SPARSE_BATCHED=\(envSparseBatched) "
               + "kvScheme=\(schemeSparse ? "sparse" : "other") "
               + "model=\(type(of: engine.model)) sparseCompatible=\(sparseCompatible) "
               + "ropeBase=\(engine.ropeBase))")
